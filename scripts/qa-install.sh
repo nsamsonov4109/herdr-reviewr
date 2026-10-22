@@ -6,9 +6,11 @@ set -euo pipefail
 NEW="target/release/herdr-reviewr"
 MANIFEST="herdr-plugin.toml"
 
-# Locate the managed plugin install. Exactly one is expected.
+# Locate the managed plugin install, in either herdr's older layout or its `github-installations`
+# one. Exactly one is expected.
 shopt -s nullglob
-roots=("$HOME"/.config/herdr/plugins/github/persiyanov.reviewr-*)
+roots=("$HOME"/.config/herdr/plugins/github/persiyanov.reviewr-*
+  "$HOME"/.config/herdr/plugins/github-installations/persiyanov.reviewr-*/*/checkout)
 shopt -u nullglob
 [ ${#roots[@]} -eq 1 ] || {
   echo "qa-install: expected one installed plugin, found ${#roots[@]}:" >&2
