@@ -595,15 +595,22 @@ struct LastClick {
     surface: crate::selection::Surface,
 }
 
+/// Why the `commits` scope will not open over a folder of repositories.
+const FOLDER_COMMITS: &str = "commits need one repo, not a folder of them";
+
 /// The full state of the review session.
 // The bools are independent toggles, not a hidden state machine.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct App {
     pub repo: PathBuf,
+    /// The folder's repositories when `repo` is a folder of them; empty for one repository.
+    repos: crate::repos::Repos,
     pub base: Option<String>,
     /// The `branch` scope's base, from the latest landed snapshot.
     pub branch_base: git::BaseStatus,
+    /// A folder's `branch` bases by repository, from the latest landed snapshot.
+    pub repo_bases: std::collections::BTreeMap<String, git::BaseStatus>,
     /// The `commits` scope's pick, in memory, replaced but never cleared.
     pub commit_pick: Option<CommitPick>,
     /// The pick's verdict and subject from the latest `commits` build.
@@ -846,8 +853,10 @@ impl App {
         let theme = theme::resolve(None);
         Self {
             repo,
+            repos: crate::repos::Repos::default(),
             base,
             branch_base: git::BaseStatus::default(),
+            repo_bases: std::collections::BTreeMap::new(),
             commit_pick: None,
             pick_status: None,
             commit_picker: None,
@@ -978,12 +987,31 @@ impl App {
         let previous_position =
             self.plugin_config().map(crate::config::PluginConfig::navigator_position);
         let next_position = config.navigator_position();
+        // A new `default_base` moves the `branch` scope's base: a view already built rebuilds.
+        if self.tab_visited && self.default_base() != config.default_base() {
+            self.request_world_refresh(false);
+        }
         self.config = PluginConfigState::Ready(config);
         if previous_position != Some(next_position) {
             self.cancel_divider_drag();
             self.navigator_position = next_position;
         }
         self.refresh_theme();
+    }
+
+    /// The repositories under review: a folder's, or none when `repo` is the one repository.
+    pub fn repos(&self) -> &crate::repos::Repos {
+        &self.repos
+    }
+
+    /// Review `repos`, the folder's repositories as found now; the next build reads them.
+    pub fn set_repos(&mut self, repos: crate::repos::Repos) {
+        self.repos = repos;
+    }
+
+    /// The config's `default_base`, none while the config is blocked.
+    fn default_base(&self) -> &[String] {
+        self.plugin_config().map_or(&[], crate::config::PluginConfig::default_base)
     }
 
     /// The validated plugin configuration snapshot normal work currently uses.
@@ -1066,6 +1094,7 @@ impl App {
                 self.changeset = std::mem::take(&mut old.changeset);
                 // The header describes the carried list, so it carries too.
                 self.branch_base = std::mem::take(&mut old.branch_base);
+                self.repo_bases = std::mem::take(&mut old.repo_bases);
                 self.pick_status = old.pick_status.take();
                 self.diff = std::mem::take(&mut old.diff);
                 self.visible = std::mem::take(&mut old.visible);
@@ -1161,8 +1190,11 @@ impl App {
 
     /// Rebuild the flattened tree from `entries` and the toggled-directory set.
     fn rebuild_file_rows(&mut self) {
-        self.file_rows =
-            file_list::build(&self.entries, &self.toggled_dirs, self.default_expanded());
+        self.file_rows = if self.repos.is_folder() {
+            file_list::build_folder(&self.entries, &self.toggled_dirs, self.default_expanded())
+        } else {
+            file_list::build(&self.entries, &self.toggled_dirs, self.default_expanded())
+        };
     }
 
     /// What the cursor points at, by path.
@@ -1199,7 +1231,7 @@ impl App {
             return Ok(());
         }
         // Outside a git repo, show an empty state rather than failing.
-        if !git::is_repo(&self.repo) {
+        if !self.repos.is_folder() && !git::is_repo(&self.repo) {
             self.entries.clear();
             self.changeset = Changeset::default();
             self.file_rows.clear();
@@ -1219,9 +1251,11 @@ impl App {
     pub fn world_input(&self) -> crate::world::WorldInput {
         crate::world::WorldInput {
             repo: self.repo.clone(),
+            repos: self.repos.clone(),
             tab: self.tab,
             scope: self.scope,
             base: self.base.clone(),
+            default_base: self.default_base().to_vec(),
             base_epoch: self.base_epoch,
             turn_baseline: self.herdr.last_turn.tree().map(str::to_string),
             commit_pick: self.commit_pick.clone(),
@@ -1235,9 +1269,14 @@ impl App {
     }
 
     /// Adopt a build's base, which only the `branch` scope owns.
-    fn adopt_branch_base(&mut self, base: git::BaseStatus) {
+    fn adopt_branch_base(
+        &mut self,
+        base: git::BaseStatus,
+        repo_bases: std::collections::BTreeMap<String, git::BaseStatus>,
+    ) {
         if self.scope == Scope::Branch {
             self.branch_base = base;
+            self.repo_bases = repo_bases;
         }
     }
 
@@ -1262,8 +1301,11 @@ impl App {
         });
         self.changeset = snapshot.changeset;
         self.entries = snapshot.entries;
-        self.adopt_branch_base(snapshot.branch_base);
+        self.adopt_branch_base(snapshot.branch_base, snapshot.repo_bases);
         self.adopt_pick_status(snapshot.pick_status);
+        if let Some((name, why)) = snapshot.failed.first() {
+            self.status = format!("refresh failed in {name}: {why}");
+        }
         self.rebuild_file_rows();
         self.file_cursor = anchor
             .and_then(|a| self.row_of_anchor(&a))
@@ -1777,7 +1819,8 @@ impl App {
     fn content_sides(&self, path: &str) -> Result<(String, String), crate::diff::Notice> {
         use crate::diff::Notice;
         // A path outside the landed changeset is a stale row: empty until the next reconcile.
-        let (Some(annotation), Some(ends)) = (self.changeset.files.get(path), &self.changeset.ends)
+        let (Some(annotation), Some((name, inner, ends))) =
+            (self.changeset.files.get(path), self.changeset.ends_of(&self.repos, path))
         else {
             return Ok((String::new(), String::new()));
         };
@@ -1796,8 +1839,13 @@ impl App {
         if crate::diff::over_byte_budget(usize::try_from(total).unwrap_or(usize::MAX)) {
             return Err(Notice::TooLarge);
         }
-        let source = annotation.previous_path.as_deref();
-        match git::diff_sides(&self.repo, &ends.old, ends.new.as_deref(), path, source) {
+        // A folder's file diffs in its own repository, by the path inside it.
+        let root = name.map_or_else(|| self.repo.clone(), |name| self.repo.join(name));
+        let source = match (name, annotation.previous_path.as_deref()) {
+            (Some(name), Some(from)) => crate::repos::inside(name, from),
+            (_, from) => from,
+        };
+        match git::diff_sides(&root, &ends.old, ends.new.as_deref(), inner, source) {
             Ok(git::DiffSides::Text { old, new }) => Ok((old, new)),
             Ok(git::DiffSides::Binary) => Err(Notice::Binary),
             Err(error) => {
@@ -1842,6 +1890,9 @@ impl App {
 
     /// The message for an [`Self::awaiting_turn`] frame; "no agent" only once a sample looked.
     pub fn turn_wait_message(&self) -> &'static str {
+        if self.repos.is_folder() {
+            return "last turn needs one repo, not a folder of them";
+        }
         if self.herdr.too_old {
             return "last-turn needs a newer herdr";
         }
@@ -1937,6 +1988,17 @@ impl App {
 
     /// The branch scope's local base as a full ref, whose moves the watcher reports too.
     pub fn watched_refs(&self) -> std::collections::BTreeSet<String> {
+        // A folder's, behind each repository's name.
+        if self.repos.is_folder() {
+            let bases = self.repo_bases.iter().filter(|_| self.scope == Scope::Branch);
+            let local = bases.filter_map(|(name, status)| match &status.winner {
+                Some(git::ResolvedBase::Branch { name: base, .. }) => {
+                    Some(format!("{name}/refs/heads/{base}"))
+                }
+                _ => None,
+            });
+            return local.collect();
+        }
         let base = self.branch_base.winner.as_ref().filter(|_| self.scope == Scope::Branch);
         let local = base.filter(|b| matches!(b, git::ResolvedBase::Branch { .. }));
         local.map(|b| format!("refs/heads/{}", b.name())).into_iter().collect()
@@ -2651,7 +2713,7 @@ impl App {
             self.stash.cursor_line = None;
             // `All files` keeps its tree; only the changed set rebuilds now.
             let build = crate::world::build_changed(&self.world_input())?;
-            self.adopt_branch_base(build.branch_base);
+            self.adopt_branch_base(build.branch_base, build.repo_bases);
             self.adopt_pick_status(build.pick_status);
             self.changeset = build.changeset;
             // Re-mark the badges in place, so none belongs to the old base.
@@ -3150,9 +3212,9 @@ impl App {
         let Some(path) = self.dir_under_cursor() else { return };
         // Flip its membership in the toggled set (toggled = flipped from the tab's default).
         if !self.toggled_dirs.remove(&path) {
-            self.toggled_dirs.insert(path);
+            self.toggled_dirs.insert(path.clone());
         }
-        self.apply_dir_change();
+        self.apply_dir_change(&path);
     }
 
     /// Whether directory `path` is currently expanded under the active tab's resting state.
@@ -3191,7 +3253,7 @@ impl App {
         if let Some(path) = self.dir_under_cursor()
             && self.set_dir_expanded(&path, true)
         {
-            self.apply_dir_change();
+            self.apply_dir_change(&path);
         }
     }
 
@@ -3203,7 +3265,7 @@ impl App {
         if let Some(path) = self.dir_under_cursor()
             && self.set_dir_expanded(&path, false)
         {
-            self.apply_dir_change();
+            self.apply_dir_change(&path);
         }
     }
 
@@ -3212,14 +3274,24 @@ impl App {
         self.file_rows.get(self.file_cursor).and_then(|r| r.dir_path()).map(str::to_string)
     }
 
-    /// Rebuild the tree after a directory's expansion changed, keeping the cursor in range.
-    fn apply_dir_change(&mut self) {
-        // An expanded ignored directory loads its children first.
-        if self.tab == Tab::AllFiles
-            && let Ok(entries) =
-                crate::world::all_files_entries(&self.world_input(), &self.changeset.files)
-        {
-            self.entries = entries;
+    /// Rebuild the tree after directory `dir`'s expansion changed, keeping the cursor in range.
+    fn apply_dir_change(&mut self, dir: &str) {
+        // An expanded ignored directory loads its children first; a folder lists only its repository.
+        if self.tab == Tab::AllFiles {
+            let input = self.world_input();
+            let changed = &self.changeset.files;
+            if !self.repos.is_folder() {
+                if let Ok(entries) = crate::world::all_files_entries(&input, changed) {
+                    self.entries = entries;
+                }
+            } else if let Some(name) = dir.split('/').next().filter(|n| self.repos.contains(n))
+                && let Ok(fresh) = crate::world::repo_files(&input, changed, name)
+            {
+                let inside = format!("{name}/");
+                self.entries.retain(|e| !e.path.starts_with(&inside));
+                self.entries.extend(fresh);
+                self.entries.sort_by(|a, b| a.path.cmp(&b.path));
+            }
         }
         self.rebuild_file_rows();
         self.file_cursor = self.file_cursor.min(self.file_rows.len().saturating_sub(1));
@@ -3644,6 +3716,13 @@ impl App {
         if bp.query.is_empty() || bp.query_is_listed() {
             if let Some(bp) = self.base_picker.as_mut() {
                 bp.probe = BaseProbe::Idle;
+            }
+            return;
+        }
+        // A folder picks only the branches it listed: a revision names one repository's commit.
+        if self.repos.is_folder() {
+            if let Some(bp) = self.base_picker.as_mut() {
+                bp.probe = BaseProbe::Miss;
             }
             return;
         }
@@ -4427,7 +4506,16 @@ impl App {
         use crate::search::SearchOutcome;
         let Some(s) = self.search.as_mut() else { return };
         match completion.outcome {
-            SearchOutcome::Ready(results) => {
+            SearchOutcome::Ready(mut results) => {
+                // A folder's files beside its repositories are in no tab, so no pick reaches one.
+                if self.repos.is_folder() {
+                    let held = |path: &str| self.repos.locate(path).is_some();
+                    let listed = results.files.len();
+                    results.files.retain(|f| held(&f.path));
+                    results.file_total =
+                        results.file_total.saturating_sub(listed - results.files.len());
+                    results.code.retain(|c| held(&c.path));
+                }
                 s.results = results;
                 s.phase = SearchPhase::Ready;
                 s.pick = 0;
@@ -4891,15 +4979,23 @@ impl App {
         if !self.base_pick_available() || self.mode != Mode::Normal {
             return;
         }
+        if self.repos.is_folder() {
+            self.open_folder_base_picker();
+            return;
+        }
         // Re-resolved: `branch_base` lands only under `branch`.
-        let resolution = match git::resolve_base(&self.repo, self.base.as_deref()) {
+        let preferred = self.default_base().to_vec();
+        let resolution = match git::resolve_base_with(&self.repo, self.base.as_deref(), &preferred)
+        {
             Ok(r) => r,
             Err(e) => {
                 self.status = e.0;
                 return;
             }
         };
-        let (winner, default) = (resolution.status.winner, resolution.default);
+        // Picking what the chain falls back to clears the pick, so that row is the default.
+        let default = resolution.preferred.or(resolution.default);
+        let winner = resolution.status.winner;
         let listed = git::list_branches(&self.repo).and_then(|rows| {
             let current = git::checked_out_branch(&self.repo)?;
             Ok((rows, current))
@@ -4944,6 +5040,71 @@ impl App {
         self.mode = Mode::BasePick;
     }
 
+    /// The base picker over a folder: every repository's branches by name, newest tip first. A
+    /// pick reaches each repository that has the branch; one without it falls back.
+    fn open_folder_base_picker(&mut self) {
+        let root = self.repo.clone();
+        let listed =
+            crate::repos::par_map(self.repos.names(), |name| git::list_branches(&root.join(name)));
+        let mut newest: HashMap<String, u64> = HashMap::new();
+        for rows in listed {
+            // One repository that cannot list keeps nobody from picking for the rest.
+            for row in rows.unwrap_or_default() {
+                let tip = newest.entry(row.name).or_default();
+                *tip = (*tip).max(row.tip_secs);
+            }
+        }
+        let preferred = self.default_base();
+        let mut rows: Vec<BaseChoice> = newest
+            .into_iter()
+            .map(|(name, tip_secs)| BaseChoice::Branch {
+                is_default: preferred.contains(&name),
+                pr_base: false,
+                current: false,
+                tip_secs,
+                name,
+            })
+            .collect();
+        rows.sort_by(|a, b| b.tip_secs().cmp(&a.tip_secs()).then_with(|| a.name().cmp(b.name())));
+        rows.sort_by_key(|r| !r.is_default());
+        let shown = self.folder_base().map(|(name, _)| name);
+        let cursor = shown.and_then(|c| rows.iter().position(|r| r.name() == c)).unwrap_or(0);
+        self.base_picker = Some(BasePicker {
+            rows,
+            cursor,
+            query: String::new(),
+            caret: 0,
+            probe: BaseProbe::Idle,
+        });
+        self.mode = Mode::BasePick;
+    }
+
+    /// The folder's `branch` base as the header names it: the one most repositories with a change
+    /// diff against, and how many of those diff against another.
+    #[must_use]
+    pub fn folder_base(&self) -> Option<(String, usize)> {
+        let changed: HashSet<&str> = self
+            .changeset
+            .files
+            .keys()
+            .filter_map(|p| self.repos.locate(p).map(|(name, _)| name))
+            .collect();
+        let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        let mut total = 0;
+        for (name, status) in &self.repo_bases {
+            if !changed.is_empty() && !changed.contains(name.as_str()) {
+                continue;
+            }
+            if let Some(winner) = &status.winner {
+                *counts.entry(winner.name()).or_default() += 1;
+                total += 1;
+            }
+        }
+        // The most used, ties to the first by name.
+        let (name, count) = counts.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0)))?;
+        Some((name.to_string(), total - count))
+    }
+
     pub fn close_base_picker(&mut self) {
         if self.mode == Mode::BasePick {
             self.mode = Mode::Normal;
@@ -4984,7 +5145,22 @@ impl App {
         };
         let Some(choice) = choice else { return Ok(()) };
         self.close_base_picker();
-        let write = git::write_base_pick(&self.repo, choice.name());
+        let preferred = self.default_base().to_vec();
+        let write = if self.repos.is_folder() {
+            let (root, name) = (self.repo.clone(), choice.name().to_string());
+            let wrote = crate::repos::par_map(self.repos.names(), |repo| {
+                let at = root.join(repo);
+                // A repository without the branch drops its pick, falling back as with none.
+                if git::has_base_branch(&at, &name)? {
+                    git::write_base_pick_with(&at, &name, &preferred)
+                } else {
+                    git::delete_base_pick(&at)
+                }
+            });
+            wrote.into_iter().find(Result::is_err).unwrap_or(Ok(()))
+        } else {
+            git::write_base_pick_with(&self.repo, choice.name(), &preferred)
+        };
         if let Err(e) = write {
             self.status = e.0;
             return Ok(());
@@ -5001,6 +5177,10 @@ impl App {
     /// Open the commit picker with the current pick highlighted and anchored.
     pub fn open_commit_picker(&mut self) {
         if !self.tab.is_file_tab() || self.mode != Mode::Normal {
+            return;
+        }
+        if self.repos.is_folder() {
+            self.status = FOLDER_COMMITS.to_string();
             return;
         }
         let mut picker = match self.list_commit_rows() {
@@ -5030,7 +5210,7 @@ impl App {
     /// The commit picker's rows and title, the last 50 without a merge-base.
     fn list_commit_rows(&self) -> Result<CommitPicker, String> {
         let head = git::head_oid(&self.repo);
-        let base = git::resolve_base(&self.repo, self.base.as_deref())
+        let base = git::resolve_base_with(&self.repo, self.base.as_deref(), self.default_base())
             .map_err(|e| e.0)?
             .status
             .winner

@@ -1332,6 +1332,9 @@ fn base_label(app: &App) -> Option<(String, String, String, String)> {
     if app.scope != crate::model::Scope::Branch {
         return None;
     }
+    if app.repos().is_folder() {
+        return Some(folder_base_label(app));
+    }
     let tail = match &app.branch_base.skipped {
         Some(missing) => format!(" · {missing} missing"),
         None => String::new(),
@@ -1346,6 +1349,18 @@ fn base_label(app: &App) -> Option<(String, String, String, String)> {
         }
         None => (String::new(), "no base".to_string(), String::new(), tail),
     })
+}
+
+/// A folder's base label: the base most changed repositories diff against, and how many don't.
+fn folder_base_label(app: &App) -> (String, String, String, String) {
+    match app.folder_base() {
+        Some((name, 0)) => ("vs ".to_string(), name, String::new(), String::new()),
+        Some((name, others)) => {
+            let repos = if others == 1 { "repo" } else { "repos" };
+            ("vs ".to_string(), name, String::new(), format!(" · {others} {repos} vs another"))
+        }
+        None => (String::new(), "no base".to_string(), String::new(), String::new()),
+    }
 }
 
 /// The pick label: `1a2b3c4 <subject>` or `896626a..a49ed7b (N)`, plus any verdict.
@@ -3453,8 +3468,9 @@ fn render_base_picker(frame: &mut Frame, app: &App, area: Rect) {
     let prefix = " ";
     // One cell of right margin keeps the scrolled query off the popup's border.
     let avail = (inner.width as usize).saturating_sub(prefix.width() + 1);
-    let (filter_spans, caret_cell_col) =
-        input_line(&bp.query, bp.caret, avail, "Filter or type a revision…", p);
+    // A folder picks a listed branch: a revision names one repository's commit.
+    let hint = if app.repos().is_folder() { "Filter…" } else { "Filter or type a revision…" };
+    let (filter_spans, caret_cell_col) = input_line(&bp.query, bp.caret, avail, hint, p);
     let mut filter = Line::from(filter_spans);
     filter.spans.insert(0, Span::styled(prefix, text_style(p, Fill::Base)));
     frame.render_widget(Paragraph::new(filter), Rect { height: 1, ..inner });
@@ -4785,7 +4801,12 @@ fn pr_read_content(app: &App, inner: Rect) -> PrReadContent {
     } else {
         // The empty-state remedy can outgrow a narrow pane; wrap it rather than clip it.
         let refresh = app.keymap().hint(crate::keymap::Action::Refresh);
-        for piece in wrap_text(&pr_empty_msg(&app.pr, app.pr_forge, refresh), width.max(1)) {
+        let message = if app.repos().is_folder() {
+            FOLDER_PR.to_string()
+        } else {
+            pr_empty_msg(&app.pr, app.pr_forge, refresh)
+        };
+        for piece in wrap_text(&message, width.max(1)) {
             lines.push(Line::from(Span::styled(
                 piece,
                 Style::default().fg(p.ink(Ink::TextMuted, Fill::Base)),
@@ -4849,6 +4870,10 @@ fn render_pr_read(frame: &mut Frame, app: &App, area: Rect) {
         p,
     );
 }
+
+/// The `PR` tab over a folder of repositories, which have one each.
+const FOLDER_PR: &str =
+    "Each repository here has its own pull request: open reviewr inside one to see it.";
 
 /// The message for a PR view with nothing to show, in the forge's noun.
 fn pr_empty_msg(

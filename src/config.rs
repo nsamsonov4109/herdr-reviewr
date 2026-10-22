@@ -60,9 +60,10 @@ impl Config {
     }
 }
 
-const PLUGIN_CONFIG_KEYS: [&str; 15] = [
+const PLUGIN_CONFIG_KEYS: [&str; 16] = [
     "theme",
     "default_scope",
+    "default_base",
     "markdown_view",
     "diff_view",
     "navigator_position",
@@ -173,6 +174,8 @@ impl ToggleDirection {
 pub struct PluginConfig {
     theme: String,
     default_scope: crate::model::Scope,
+    /// The bases the `branch` scope tries before the default branch, the first a repository has.
+    default_base: Vec<String>,
     markdown_view: MarkdownView,
     diff_view: DiffView,
     navigator_position: NavigatorPosition,
@@ -193,6 +196,7 @@ impl Default for PluginConfig {
         Self {
             theme: crate::theme::DEFAULT.to_owned(),
             default_scope: crate::model::Scope::Uncommitted,
+            default_base: Vec::new(),
             markdown_view: MarkdownView::Source,
             diff_view: DiffView::Unified,
             navigator_position: NavigatorPosition::Right,
@@ -218,6 +222,11 @@ impl PluginConfig {
     /// A fresh pane's scope; a reread never switches a running one.
     pub fn default_scope(&self) -> crate::model::Scope {
         self.default_scope
+    }
+
+    /// The branches a repository's `branch` scope tries, in order, before its default branch.
+    pub fn default_base(&self) -> &[String] {
+        &self.default_base
     }
 
     /// How a fresh pane shows markdown; only `m` flips a running one.
@@ -377,6 +386,9 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
                 ));
             }
         };
+    }
+    if let Some(value) = table.get("default_base") {
+        config.default_base = parse_default_base(path, value)?;
     }
     if let Some(value) = table.get("markdown_view") {
         config.markdown_view =
@@ -664,6 +676,26 @@ fn unknown_placeholder(command: &str, known: &[&str]) -> Option<String> {
     None
 }
 
+/// Parse `default_base`: one branch name, or several in the order a repository tries them.
+fn parse_default_base(path: &Path, value: &toml::Value) -> Result<Vec<String>, PluginConfigError> {
+    let expected = "a branch name or a non-empty array of branch names";
+    let items: Vec<&toml::Value> = match value {
+        toml::Value::String(_) => vec![value],
+        toml::Value::Array(items) if !items.is_empty() => items.iter().collect(),
+        _ => return Err(value_error(path, value, "default_base", expected)),
+    };
+    // `origin/main` names the branch `main`, as `--base` reads it.
+    items
+        .into_iter()
+        .map(|item| {
+            item.as_str()
+                .map(crate::git::strip_base_prefix)
+                .filter(|name| crate::git::is_branch_label(name))
+                .ok_or_else(|| value_error(path, item, "default_base", expected))
+        })
+        .collect()
+}
+
 /// Parse a self-hosted forge key: a bare hostname that no built-in forge already claims.
 fn parse_forge_host(
     path: &Path,
@@ -849,6 +881,19 @@ mod tests {
     }
 
     #[test]
+    fn default_base_takes_one_branch_or_several_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "default_base = \"develop\"\n").unwrap();
+        assert_eq!(super::plugin_config_in(dir.path()).unwrap().default_base(), ["develop"]);
+        // `origin/` names the branch, as `--base` reads it.
+        std::fs::write(&path, "default_base = [\"origin/team/dev\", \"main\"]\n").unwrap();
+        let config = super::plugin_config_in(dir.path()).unwrap();
+        assert_eq!(config.default_base(), ["team/dev", "main"]);
+        assert!(PluginConfig::default().default_base().is_empty(), "none unless set");
+    }
+
+    #[test]
     fn the_url_opener_reaches_the_resolved_config() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -909,6 +954,12 @@ mod tests {
             ("review_prefix = \"\"\n", "`review_prefix`"),
             ("review_prefix = \"\"\"\n  \n\"\"\"\n", "`review_prefix`"),
             ("review_prefix = 42\n", "`review_prefix`"),
+            ("default_base = []\n", "`default_base`"),
+            ("default_base = 42\n", "`default_base`"),
+            ("default_base = \"\"\n", "`default_base`"),
+            ("default_base = [\"main\", 7]\n", "`default_base`"),
+            ("default_base = \"HEAD\"\n", "`default_base`"),
+            ("default_base = \"a..b\"\n", "`default_base`"),
             ("github_host = \"github.com\"\n", "`github_host`"),
             ("github_host = \"gitlab.com\"\n", "`github_host`"),
             ("gitlab_host = \"gitlab.com\"\n", "`gitlab_host`"),

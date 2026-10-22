@@ -1374,6 +1374,27 @@ fn a_toggle_open_falls_back_when_the_live_cwd_is_not_a_repo() {
 }
 
 #[test]
+fn an_open_reviews_a_folder_that_holds_repositories_directly() {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = tempfile::tempdir().unwrap();
+    let api = folder.path().join("api");
+    fs::create_dir(&api).unwrap();
+    let init = Command::new("git").arg("-C").arg(&api).args(["init", "-q"]).output().unwrap();
+    assert!(init.status.success());
+    let context = json!({"focused_pane_id": "w1:p1"}).to_string();
+    pane_with_cwd(dir.path(), "w1:p1", folder.path());
+
+    let output = run_with_context("open", dir.path(), &context);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        open_call(dir.path()).contains(&format!("--cwd {}", folder.path().display())),
+        "the folder itself is reviewed: {}",
+        herdr_calls(dir.path())
+    );
+}
+
+#[test]
 fn open_takes_the_focused_panes_cwd_not_another_panes() {
     let dir = tempfile::tempdir().unwrap();
     // The lookup keys on the focused pane's id, not the first entry.
@@ -1409,7 +1430,10 @@ fn a_refusal_names_the_rejected_live_cwd_too() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         stderr(&output),
-        format!("reviewr: no repo to review: '{}' (not a git repo)\n", dir.path().display())
+        format!(
+            "reviewr: no repo to review: '{}' (not a git repo, nor a folder of them)\n",
+            dir.path().display()
+        )
     );
 }
 

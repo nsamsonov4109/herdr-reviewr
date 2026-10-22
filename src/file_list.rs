@@ -84,13 +84,41 @@ pub fn build<S: BuildHasher>(
     toggled: &HashSet<String, S>,
     default_expanded: bool,
 ) -> Vec<Row> {
+    build_rows(entries, toggled, default_expanded, false)
+}
+
+/// [`build`] over a folder of repositories: each top-level directory, a repository, keeps its row.
+pub fn build_folder<S: BuildHasher>(
+    entries: &[Entry],
+    toggled: &HashSet<String, S>,
+    default_expanded: bool,
+) -> Vec<Row> {
+    build_rows(entries, toggled, default_expanded, true)
+}
+
+fn build_rows<S: BuildHasher>(
+    entries: &[Entry],
+    toggled: &HashSet<String, S>,
+    default_expanded: bool,
+    repos: bool,
+) -> Vec<Row> {
     let mut root = Dir::default();
     for (i, e) in entries.iter().enumerate() {
         insert(&mut root, e, i);
     }
     let mut rows = Vec::new();
-    flatten(&mut rows, &root, "", 0, toggled, default_expanded, entries);
+    let tree = Tree { toggled, default_expanded, entries, repos };
+    flatten(&mut rows, &root, "", 0, &tree);
     rows
+}
+
+/// What every level of one flatten reads.
+struct Tree<'a, S> {
+    toggled: &'a HashSet<String, S>,
+    default_expanded: bool,
+    entries: &'a [Entry],
+    /// The top level is a folder's repositories, each its own row.
+    repos: bool,
 }
 
 /// Insert `entry` into the tree, creating its directories; a placeholder marks its node ignored.
@@ -120,17 +148,21 @@ fn flatten<S: BuildHasher>(
     dir: &Dir,
     prefix: &str,
     depth: usize,
-    toggled: &HashSet<String, S>,
-    default_expanded: bool,
-    entries: &[Entry],
+    tree: &Tree<'_, S>,
 ) {
     for (name, sub) in &dir.dirs {
-        let (display, path, node) = compress(name, join(prefix, name), sub);
-        if let Some((fname, &index)) = lone_file(node) {
-            // A single-child chain ending in one file folds into a file row, e.g. `a/b/x.rs`.
-            rows.push(file_row(depth, format!("{display}/{fname}"), index, entries));
+        // A repository never folds into its one file, so its name always shows.
+        let held = tree.repos && depth == 0;
+        let (display, path, node) = if held {
+            (name.clone(), join(prefix, name), sub)
         } else {
-            let expanded = default_expanded ^ toggled.contains(&path);
+            compress(name, join(prefix, name), sub)
+        };
+        if let Some((fname, &index)) = lone_file(node).filter(|_| !held) {
+            // A single-child chain ending in one file folds into a file row, e.g. `a/b/x.rs`.
+            rows.push(file_row(depth, format!("{display}/{fname}"), index, tree.entries));
+        } else {
+            let expanded = tree.default_expanded ^ tree.toggled.contains(&path);
             rows.push(Row {
                 depth,
                 name: display,
@@ -138,12 +170,12 @@ fn flatten<S: BuildHasher>(
                 ignored: node.ignored,
             });
             if expanded {
-                flatten(rows, node, &path, depth + 1, toggled, default_expanded, entries);
+                flatten(rows, node, &path, depth + 1, tree);
             }
         }
     }
     for (fname, &index) in &dir.files {
-        rows.push(file_row(depth, fname.clone(), index, entries));
+        rows.push(file_row(depth, fname.clone(), index, tree.entries));
     }
 }
 
@@ -235,6 +267,17 @@ mod tests {
         let files = [file("a/b/c/one.rs"), file("a/b/c/two.rs")];
         let rows = shape(&files, &HashSet::new());
         assert_eq!(rows, ["0:dir:a/b/c", "1:file:one.rs", "1:file:two.rs"]);
+    }
+
+    #[test]
+    fn a_folder_keeps_each_repository_its_own_row() {
+        let files = [file("api/src/a.rs"), file("web/b.rs"), file("web/c.rs")];
+        let rows = shape_rows(&super::build_folder(&entries(&files), &HashSet::new(), true));
+        assert_eq!(
+            rows,
+            ["0:dir:api", "1:file:src/a.rs", "0:dir:web", "1:file:b.rs", "1:file:c.rs"],
+            "a repository's lone file or chain stays under its row"
+        );
     }
 
     #[test]

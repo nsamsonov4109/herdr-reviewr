@@ -47,6 +47,8 @@ pub struct Batch {
     /// The same changes by the paths themselves, inside nested repositories too: what search indexes.
     pub files: BTreeSet<String>,
     pub git: BTreeSet<GitChange>,
+    /// A folder's repositories by name, with each one's git changes; `git` holds them all too.
+    pub repo_git: BTreeMap<String, BTreeSet<GitChange>>,
     /// Events were lost: only a full rebuild is safe.
     pub rescan: bool,
     /// The plugin config changed: the config is read again.
@@ -164,6 +166,8 @@ impl Default for Kept {
 /// How one watching stretch ended.
 enum Ended {
     Stop,
+    /// A folder's repositories changed: watch the new set at once.
+    Restart,
     /// It failed; `retry` is false when it never can work here (a network filesystem).
     Failed {
         reason: String,
@@ -193,6 +197,10 @@ impl Thread {
             }));
             let (reason, retry) = match watched {
                 Ok(Ended::Stop) => return,
+                Ok(Ended::Restart) => {
+                    restarted = true;
+                    continue;
+                }
                 Ok(Ended::Failed { reason, retry }) => (reason, retry),
                 Err(_) => ("the watcher crashed".to_string(), true),
             };
@@ -257,9 +265,13 @@ impl Thread {
             let reason = format!("{}: git did not name its git dir", root.display());
             return Ended::Failed { reason, retry: true };
         }
-        let excludes = git.as_ref().and_then(|_| crate::git::global_excludes(&root));
+        // A folder no repository holds watches the repositories directly inside it.
+        let repos = if git.is_none() { folder_repos(&root) } else { Vec::new() };
+        let reads_rules = git.is_some() || !repos.is_empty();
+        let excludes = reads_rules.then(|| crate::git::global_excludes(&root)).flatten();
         let layout = Layout {
             git,
+            repos,
             config: self.config.as_deref().map(ConfigFiles::locate),
             excludes: excludes.map(|e| canonical_beside(&e)),
             root,
@@ -280,6 +292,7 @@ impl Thread {
             ignored: HashMap::new(),
             nested: HashMap::new(),
             present: HashSet::new(),
+            moved: false,
             #[cfg(target_os = "linux")]
             watches: placed,
         };
@@ -287,8 +300,8 @@ impl Thread {
         {
             let mut failed = None;
             let none = BTreeSet::new();
-            let root = &state.layout.root;
-            state.watches.show(&mut watcher, root, &none, &self.kept.shown, &mut failed);
+            let layout = &state.layout;
+            state.watches.show(&mut watcher, layout, &none, &self.kept.shown, &mut failed);
             if let Some(reason) = failed {
                 return Ended::Failed { reason, retry: true };
             }
@@ -328,10 +341,9 @@ impl Thread {
                     #[cfg(target_os = "linux")]
                     {
                         let mut failed = None;
-                        let root = &state.layout.root;
                         state.watches.show(
                             &mut watcher,
-                            root,
+                            &state.layout,
                             &self.kept.shown,
                             &shown,
                             &mut failed,
@@ -356,6 +368,9 @@ impl Thread {
                     }
                     if !batch.is_empty() && self.tx.send(WatchEvent::Batch(batch)).is_err() {
                         return Ended::Stop;
+                    }
+                    if state.moved {
+                        return Ended::Restart;
                     }
                     // What the batch saw still went out; a watch it could not place fails the watcher.
                     if let Some(reason) = failed {
@@ -415,9 +430,48 @@ struct Layout {
     root: PathBuf,
     /// The worktree's git directory and the common directory, when `root` is a repository.
     git: Option<(PathBuf, PathBuf)>,
+    /// A folder's repositories by name, sorted, when `root` is a folder of them.
+    repos: Vec<RepoDirs>,
     config: Option<ConfigFiles>,
     /// The global ignore file git reads.
     excludes: Option<PathBuf>,
+}
+
+/// A folder's repository as the watcher reads it: its name and git directories.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RepoDirs {
+    name: String,
+    dir: PathBuf,
+    common: PathBuf,
+}
+
+/// The repositories directly inside `root` and the git directories each names; one git cannot
+/// name goes unwatched, as it goes unbuilt.
+fn folder_repos(root: &Path) -> Vec<RepoDirs> {
+    let repos = crate::repos::Repos::discover(root);
+    let dirs = |name: &String| {
+        let (dir, common) = crate::git::git_dirs(&root.join(name))?;
+        Some(RepoDirs { name: name.clone(), dir, common })
+    };
+    repos.names().iter().filter_map(dirs).collect()
+}
+
+impl Layout {
+    /// The trees whose files are reviewed: a folder's repositories, else the root.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn trees(&self) -> Vec<PathBuf> {
+        if self.repos.is_empty() {
+            return vec![self.root.clone()];
+        }
+        self.repos.iter().map(|repo| self.root.join(&repo.name)).collect()
+    }
+
+    /// The folder's repository a root-relative path lies in, by index, and the path inside it.
+    fn repo_of<'a>(&self, rel: &'a str) -> Option<(usize, &'a str)> {
+        let (name, inner) = rel.split_once('/')?;
+        let at = self.repos.binary_search_by(|repo| repo.name.as_str().cmp(name)).ok()?;
+        Some((at, inner))
+    }
 }
 
 /// One raw path, classified.
@@ -428,6 +482,11 @@ enum Class {
     Git(GitChange),
     /// A ref by full name (`refs/heads/main`), kept or dropped once the batch knows `HEAD`.
     Ref(String),
+    /// A folder's repository, by index, and what changed in its git directories.
+    RepoGit(usize, GitChange),
+    RepoRef(usize, String),
+    /// An entry of a folder itself, or a `.git` beside its repositories: one may have come or gone.
+    Beside(String),
     Drop,
 }
 
@@ -455,8 +514,37 @@ fn classify(layout: &Layout, path: &Path) -> Class {
             return classify_common_dir(rel);
         }
     }
+    for (at, repo) in layout.repos.iter().enumerate() {
+        let class = if let Ok(rel) = path.strip_prefix(&repo.dir) {
+            let class = classify_git_dir(rel);
+            if class == Class::Drop && repo.dir == repo.common {
+                classify_common_dir(rel)
+            } else {
+                class
+            }
+        } else if let Ok(rel) = path.strip_prefix(&repo.common) {
+            classify_common_dir(rel)
+        } else {
+            continue;
+        };
+        return match class {
+            Class::Git(change) => Class::RepoGit(at, change),
+            Class::Ref(name) => Class::RepoRef(at, name),
+            _ => Class::Drop,
+        };
+    }
     let Ok(rel) = path.strip_prefix(&layout.root) else { return Class::Drop };
     let rel = slash(rel);
+    if !layout.repos.is_empty() {
+        let first = rel.split('/').next().unwrap_or_default();
+        let held = layout.repos.binary_search_by(|repo| repo.name.as_str().cmp(first)).is_ok();
+        if !rel.is_empty() && (rel == first || (!held && rel == format!("{first}/.git"))) {
+            return Class::Beside(first.to_string());
+        }
+        if !held {
+            return Class::Drop;
+        }
+    }
     // The root itself, anything inside a nested repository's `.git`, and watchman's cookies.
     let name = rel.rsplit('/').next().unwrap_or_default();
     if rel.is_empty() || rel.split('/').any(|c| c == ".git") || name.starts_with(WATCHMAN_COOKIE) {
@@ -568,6 +656,8 @@ struct State {
     /// Ignored entries now there, so one shows only when it appears: macOS can flag a plain edit
     /// as a creation.
     present: HashSet<String>,
+    /// A folder's repositories are no longer the ones watched: the stretch starts over.
+    moved: bool,
     #[cfg(target_os = "linux")]
     watches: linux::Watches,
 }
@@ -626,6 +716,8 @@ impl State {
         let mut wrote: Option<Wrote> = None;
         let mut paths: Vec<(String, bool, Instant)> = Vec::new();
         let mut moved_refs: BTreeSet<String> = BTreeSet::new();
+        let mut repo_refs: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
+        let mut beside: BTreeSet<String> = BTreeSet::new();
         for (at, event) in events {
             if event.need_rescan() {
                 batch.rescan = true;
@@ -641,18 +733,39 @@ impl State {
                 }
                 match classify(&self.layout, path) {
                     Class::Worktree(rel) => paths.push((rel, structural, *at)),
+                    // In a folder, the global excludes file: a rule every repository reads.
                     Class::Git(change) => {
                         batch.git.insert(change);
+                        for at in 0..self.layout.repos.len() {
+                            self.repo_change(&mut batch, at, change);
+                        }
                     }
                     Class::Config => batch.config = true,
                     Class::Ref(name) => {
                         moved_refs.insert(name);
                     }
-                    Class::Drop => {}
+                    Class::RepoGit(at, change) => self.repo_change(&mut batch, at, change),
+                    Class::RepoRef(at, name) => {
+                        repo_refs.entry(at).or_default().insert(name);
+                    }
+                    Class::Beside(entry) if structural => {
+                        beside.insert(entry);
+                    }
+                    Class::Beside(_) | Class::Drop => {}
                 }
             }
         }
         self.refs_into(&moved_refs, &kept.refs, &mut batch);
+        self.repo_refs_into(&repo_refs, &kept.refs, &mut batch);
+        // A repository came or went beside the others: the watcher starts over on the new set.
+        if !beside.is_empty() && folder_repos(&self.layout.root) != self.layout.repos {
+            self.moved = true;
+        }
+        // A folder that appeared beside them is watched, so a `.git` made inside it is heard.
+        #[cfg(target_os = "linux")]
+        for entry in &beside {
+            linux::watch_beside_dir(watcher, &self.layout.root.join(entry), failed);
+        }
         // A new config watch restarts the stream on macOS, dropping what it gathered: read it all.
         if batch.config && self.follow_config(watcher, failed) {
             batch.rescan = true;
@@ -676,20 +789,37 @@ impl State {
             self.ignored.clear();
         }
         #[cfg(target_os = "linux")]
-        if batch.git.contains(&GitChange::Index) {
+        if self.layout.repos.is_empty() && batch.git.contains(&GitChange::Index) {
             linux::watch_tracked(watcher, &self.layout.root, failed);
+        }
+        #[cfg(target_os = "linux")]
+        for (name, git) in &batch.repo_git {
+            if git.contains(&GitChange::Index) {
+                linux::watch_tracked(watcher, &self.layout.root.join(name), failed);
+            }
         }
         self.query_ignored(paths.iter().map(|(p, ..)| p.as_str()));
         // A `.gitignore` outside every ignored directory can flip any verdict: ask again under it.
-        if !from_git && paths.iter().any(|(p, ..)| named(p, ".gitignore") && !self.under_ignored(p))
-        {
-            batch.git.insert(GitChange::IgnoreRules);
+        let rule_files: Vec<String> = paths
+            .iter()
+            .filter(|(p, ..)| named(p, ".gitignore") && !self.under_ignored(p))
+            .map(|(p, ..)| p.clone())
+            .collect();
+        // In a folder one repository's rule change leaves the others' files to be read.
+        let unruled = !from_git || !self.layout.repos.is_empty();
+        if unruled && !rule_files.is_empty() {
+            self.rule_change(&mut batch, &rule_files, GitChange::IgnoreRules);
             self.ignored.clear();
             self.query_ignored(paths.iter().map(|(p, ..)| p.as_str()));
         }
         let ignored = |p: &str| self.under_ignored(p) || self.is_ignored(p);
-        if paths.iter().any(|(p, ..)| named(p, ".gitattributes") && !ignored(p)) {
-            batch.git.insert(GitChange::Attributes);
+        let attributes: Vec<String> = paths
+            .iter()
+            .filter(|(p, ..)| named(p, ".gitattributes") && !ignored(p))
+            .map(|(p, ..)| p.clone())
+            .collect();
+        if !attributes.is_empty() {
+            self.rule_change(&mut batch, &attributes, GitChange::Attributes);
         }
         #[cfg(target_os = "linux")]
         if batch.git.contains(&GitChange::IgnoreRules) {
@@ -795,6 +925,53 @@ impl State {
         }
     }
 
+    /// Keep the refs each of a folder's repositories reads; a local base by `<name>/refs/heads/..`.
+    fn repo_refs_into(
+        &self,
+        moved: &BTreeMap<usize, BTreeSet<String>>,
+        extra: &BTreeSet<String>,
+        batch: &mut Batch,
+    ) {
+        for (&at, names) in moved {
+            let repo = &self.layout.repos[at];
+            let head = head_branch(&repo.dir);
+            let inside = format!("{}/", repo.name);
+            let extra: BTreeSet<String> =
+                extra.iter().filter_map(|r| r.strip_prefix(&inside)).map(str::to_string).collect();
+            for name in names {
+                if name.starts_with("refs/worktree/reviewr/") {
+                    let value = std::fs::read_to_string(repo.dir.join(name)).ok();
+                    let value = value.as_deref().map(str::trim);
+                    if !crate::git::is_own_ref_write(&repo.dir, name, value) {
+                        self.repo_change(batch, at, GitChange::ReviewrRefs);
+                    }
+                } else if ref_matters(name, head.as_deref(), &extra) {
+                    self.repo_change(batch, at, GitChange::Refs);
+                }
+            }
+        }
+    }
+
+    /// Note `change` in the folder's repository at `at`, and in the union `git` holds.
+    fn repo_change(&self, batch: &mut Batch, at: usize, change: GitChange) {
+        batch.git.insert(change);
+        let name = self.layout.repos[at].name.clone();
+        batch.repo_git.entry(name).or_default().insert(change);
+    }
+
+    /// A rule file among `paths` changed: in a folder, a change of the repositories holding one.
+    fn rule_change(&self, batch: &mut Batch, paths: &[String], change: GitChange) {
+        if self.layout.repos.is_empty() {
+            batch.git.insert(change);
+            return;
+        }
+        for path in paths {
+            if let Some((at, _)) = self.layout.repo_of(path) {
+                self.repo_change(batch, at, change);
+            }
+        }
+    }
+
     /// The global excludes file may have moved with git's config: watch where it lives now.
     /// Whether it moved.
     fn follow_excludes(
@@ -840,7 +1017,9 @@ impl State {
         }
         let mut ancestors = ancestors_and_self(path);
         ancestors.pop();
-        for prefix in ancestors {
+        // A folder's repository is no nested one: what nests inside it starts a level down.
+        let held = usize::from(!self.layout.repos.is_empty());
+        for prefix in ancestors.into_iter().skip(held) {
             if self.ignored.get(&format!("{prefix}/")) == Some(&true) {
                 break;
             }
@@ -859,7 +1038,7 @@ impl State {
     /// Fill the ignore cache for `paths` that exist and their folders in one `check-ignore`. A
     /// failed run caches nothing, so the paths count as not ignored for now.
     fn query_ignored<'a>(&mut self, paths: impl Iterator<Item = &'a str>) {
-        if self.layout.git.is_none() {
+        if self.layout.git.is_none() && self.layout.repos.is_empty() {
             return;
         }
         if self.ignored.len() > CACHE_CAP {
@@ -883,6 +1062,10 @@ impl State {
         if unknown.is_empty() {
             return;
         }
+        if !self.layout.repos.is_empty() {
+            self.query_folder(unknown);
+            return;
+        }
         let root = &self.layout.root;
         let answers: Vec<(String, bool)> =
             match crate::git::check_ignore(root, unknown.iter().map(String::as_str)) {
@@ -896,6 +1079,37 @@ impl State {
                 None => one_at_a_time(root, &unknown),
             };
         self.ignored.extend(answers);
+    }
+
+    /// A folder's [`Self::query_ignored`]: each spelling asked of its own repository, by the path
+    /// inside it, and cached by the folder's spelling.
+    fn query_folder(&mut self, unknown: BTreeSet<String>) {
+        let mut by_repo: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
+        for spelling in unknown {
+            match self.layout.repo_of(&spelling) {
+                // A repository's own root is never ignored, and git cannot be asked about it.
+                Some((_, "")) => {
+                    self.ignored.insert(spelling, false);
+                }
+                Some((at, _)) => {
+                    by_repo.entry(at).or_default().insert(spelling);
+                }
+                None => {}
+            }
+        }
+        for (at, spellings) in by_repo {
+            let name = &self.layout.repos[at].name;
+            let repo = self.layout.root.join(name);
+            let inside: BTreeSet<String> =
+                spellings.iter().map(|s| s[name.len() + 1..].to_string()).collect();
+            let answers = match crate::git::check_ignore(&repo, inside.iter().map(String::as_str)) {
+                Some(ignored) => inside.iter().map(|p| (p.clone(), ignored.contains(p))).collect(),
+                None => one_at_a_time(&repo, &inside),
+            };
+            let name = name.clone();
+            self.ignored
+                .extend(answers.into_iter().map(|(p, v)| (crate::repos::join(&name, &p), v)));
+        }
     }
 
     /// How git is asked about a path: as what it is now; a gone path is not asked.
@@ -1031,7 +1245,8 @@ fn place_watches(
         // One batch: `FSEvents` restarts its stream on every change of paths, losing writes meanwhile.
         let ops = |outside: bool| {
             let mut ops = vec![notify::PathOp::watch_recursive(&layout.root)];
-            if let Some((dir, common)) = &layout.git {
+            let repos = layout.repos.iter().map(|repo| (&repo.dir, &repo.common));
+            for (dir, common) in layout.git.as_ref().map(|(d, c)| (d, c)).into_iter().chain(repos) {
                 for extra in [dir, common].into_iter().filter(|d| !d.starts_with(&layout.root)) {
                     ops.push(notify::PathOp::watch_recursive(extra));
                 }
@@ -1156,7 +1371,7 @@ mod linux {
     ) -> notify::Result<Watches> {
         let mut failed = None;
         let mut walked = BTreeSet::new();
-        for dir in walk_dirs(&layout.root) {
+        for dir in layout.trees().iter().flat_map(|tree| walk_dirs(tree)) {
             if watch(watcher, &dir, &mut failed) {
                 walked.insert(dir);
             }
@@ -1164,7 +1379,11 @@ mod linux {
                 return Err(notify::Error::generic(&reason));
             }
         }
-        if let Some((dir, common)) = &layout.git {
+        if !layout.repos.is_empty() {
+            watch_beside(watcher, layout, &mut failed);
+        }
+        let repos = layout.repos.iter().map(|repo| (&repo.dir, &repo.common));
+        for (dir, common) in layout.git.as_ref().map(|(d, c)| (d, c)).into_iter().chain(repos) {
             watcher.watch(dir, RecursiveMode::NonRecursive)?;
             let reftables = [dir.join("reftable"), common.join("reftable")];
             for sub in [dir.join("refs"), common.join("refs")].into_iter().chain(reftables) {
@@ -1178,10 +1397,42 @@ mod linux {
             }
         }
         super::watch_outside(watcher, layout)?;
-        watch_tracked(watcher, &layout.root, &mut failed);
+        for tree in layout.trees() {
+            watch_tracked(watcher, &tree, &mut failed);
+        }
         match failed {
             Some(reason) => Err(notify::Error::generic(&reason)),
             None => Ok(Watches { walked }),
+        }
+    }
+
+    /// A folder itself and each folder beside its repositories, so a repository coming or going
+    /// beside the others is heard.
+    fn watch_beside(
+        watcher: &mut notify::RecommendedWatcher,
+        layout: &Layout,
+        failed: &mut Option<String>,
+    ) {
+        watch(watcher, &layout.root, failed);
+        let Ok(entries) = std::fs::read_dir(&layout.root) else { return };
+        for entry in entries.flatten() {
+            let held = entry.file_name().to_str().is_some_and(|name| {
+                layout.repos.binary_search_by(|repo| repo.name.as_str().cmp(name)).is_ok()
+            });
+            if !held && entry.file_type().is_ok_and(|t| t.is_dir()) {
+                watch(watcher, &entry.path(), failed);
+            }
+        }
+    }
+
+    /// A folder that appeared beside a folder's repositories.
+    pub(super) fn watch_beside_dir(
+        watcher: &mut notify::RecommendedWatcher,
+        dir: &Path,
+        failed: &mut Option<String>,
+    ) {
+        if dir.is_dir() {
+            watch(watcher, dir, failed);
         }
     }
 
@@ -1208,7 +1459,8 @@ mod linux {
             shown: &BTreeSet<String>,
             failed: &mut Option<String>,
         ) {
-            let now: BTreeSet<PathBuf> = walk_dirs(&layout.root).collect();
+            let now: BTreeSet<PathBuf> =
+                layout.trees().iter().flat_map(|tree| walk_dirs(tree)).collect();
             let on_screen = |dir: &Path| shown.iter().any(|s| layout.root.join(s) == dir);
             for gone in self.walked.difference(&now).filter(|d| !on_screen(d)) {
                 let _ = watcher.unwatch(gone);
@@ -1222,7 +1474,9 @@ mod linux {
                 }
             }
             // A tracked file's folder the walk now skips keeps its watch.
-            watch_tracked(watcher, &layout.root, failed);
+            for tree in layout.trees() {
+                watch_tracked(watcher, &tree, failed);
+            }
         }
 
         /// A directory that appeared: watch it and everything non-ignored inside, and report what
@@ -1255,11 +1509,12 @@ mod linux {
         pub(super) fn show(
             &self,
             watcher: &mut notify::RecommendedWatcher,
-            root: &Path,
+            layout: &Layout,
             old: &BTreeSet<String>,
             new: &BTreeSet<String>,
             failed: &mut Option<String>,
         ) {
+            let root = &layout.root;
             // An unshown folder's watch goes unless the walk placed it; an unshown file's stays.
             let gone = old.difference(new).map(|g| root.join(g)).filter(|g| !g.is_file());
             for gone in gone.filter(|g| !self.walked.contains(g)) {
@@ -1274,7 +1529,9 @@ mod linux {
                 }
             }
             // A tracked file's folder keeps its watch when it leaves the screen.
-            watch_tracked(watcher, root, failed);
+            for tree in layout.trees() {
+                watch_tracked(watcher, &tree, failed);
+            }
         }
     }
 }
@@ -1334,6 +1591,7 @@ mod tests {
         Layout {
             root: "/w".into(),
             git: Some(("/w/.git".into(), "/w/.git".into())),
+            repos: Vec::new(),
             config: None,
             excludes: None,
         }
@@ -1343,6 +1601,7 @@ mod tests {
         Layout {
             root: "/wt".into(),
             git: Some(("/main/.git/worktrees/feature".into(), PathBuf::from("/main/.git"))),
+            repos: Vec::new(),
             config: None,
             excludes: None,
         }

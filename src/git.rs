@@ -695,6 +695,8 @@ pub struct BaseResolution {
     pub status: BaseStatus,
     /// The default branch this pass ran against.
     pub default: Option<String>,
+    /// The first `default_base` name this repository has, which stands before `default`.
+    pub preferred: Option<String>,
     candidates: Vec<ResolvedBase>,
     recorded: Vec<String>,
 }
@@ -707,6 +709,15 @@ impl BaseResolution {
 
 /// The base chain: `--base`, then the pick, then the default branch; unresolved sources skip.
 pub fn resolve_base(repo: &Path, base_flag: Option<&str>) -> Result<BaseResolution, GitFail> {
+    resolve_base_with(repo, base_flag, &[])
+}
+
+/// [`resolve_base`] with the config's `default_base` before the default branch: the first it has.
+pub fn resolve_base_with(
+    repo: &Path,
+    base_flag: Option<&str>,
+    preferred: &[String],
+) -> Result<BaseResolution, GitFail> {
     let mut candidates: Vec<ResolvedBase> = Vec::new();
     let mut recorded: Vec<String> = Vec::new();
     let mut skipped: Option<String> = None;
@@ -740,6 +751,12 @@ pub fn resolve_base(repo: &Path, base_flag: Option<&str>) -> Result<BaseResoluti
             None => {}
         }
     }
+    // A preference list, not a choice: a name this repository lacks is no skip.
+    let preferred = first_base_entry(repo, preferred)?;
+    if let Some((name, oid)) = &preferred {
+        record(name.clone(), &mut recorded);
+        push(ResolvedBase::branch(name.clone(), oid.clone()), &mut candidates);
+    }
     if let Some(name) = &default {
         record(name.clone(), &mut recorded);
         if let Some(oid) = resolve_base_entry(repo, name)? {
@@ -747,7 +764,24 @@ pub fn resolve_base(repo: &Path, base_flag: Option<&str>) -> Result<BaseResoluti
         }
     }
     let winner = candidates.first().cloned();
-    Ok(BaseResolution { status: BaseStatus { winner, skipped }, default, candidates, recorded })
+    let preferred = preferred.map(|(name, _)| name);
+    let status = BaseStatus { winner, skipped };
+    Ok(BaseResolution { status, default, preferred, candidates, recorded })
+}
+
+/// Whether this repository has the branch `name`, origin's or its own.
+pub fn has_base_branch(repo: &Path, name: &str) -> Result<bool, GitFail> {
+    Ok(resolve_base_entry(repo, name)?.is_some())
+}
+
+/// The first of `names` this repository has as a branch, and its tip.
+fn first_base_entry(repo: &Path, names: &[String]) -> Result<Option<(String, String)>, GitFail> {
+    for name in names {
+        if let Some(oid) = resolve_base_entry(repo, name)? {
+            return Ok(Some((name.clone(), oid)));
+        }
+    }
+    Ok(None)
 }
 
 /// `origin/HEAD`'s branch, else the first existing of `init.defaultBranch`, `main`, `master`.
@@ -1543,8 +1577,18 @@ fn branch_name_shaped(value: &str) -> bool {
 
 /// Record `name` as this worktree's pick; the default branch deletes the pick instead.
 pub fn write_base_pick(repo: &Path, name: &str) -> Result<(), GitFail> {
+    write_base_pick_with(repo, name, &[])
+}
+
+/// [`write_base_pick`] where the config's `default_base` stands before the default branch: what
+/// the chain falls back to with no pick deletes the pick.
+pub fn write_base_pick_with(repo: &Path, name: &str, preferred: &[String]) -> Result<(), GitFail> {
     // Read here, never from the picker's rows, which a fetch can leave stale.
-    if Some(name) == default_branch_name(repo)?.as_deref() {
+    let fallback = match first_base_entry(repo, preferred)? {
+        Some((preferred, _)) => Some(preferred),
+        None => default_branch_name(repo)?,
+    };
+    if Some(name) == fallback.as_deref() {
         return delete_base_pick(repo);
     }
     let blob = git_stdin(repo, &["hash-object", "-w", "--stdin"], name)?;

@@ -24,6 +24,7 @@ pub(crate) mod marks;
 pub mod model;
 pub mod proc;
 pub(crate) mod rendered;
+pub mod repos;
 pub mod roles;
 pub mod schedule;
 pub mod search;
@@ -238,9 +239,15 @@ fn invalidate_screen(terminal: &mut DefaultTerminal) -> Result<()> {
     Ok(())
 }
 
-/// The reviewed repository's top level, one spelling for the app and the worker; else as given.
-fn repo_root(cfg: &Config) -> std::path::PathBuf {
-    git::toplevel(&cfg.repo).unwrap_or_else(|| cfg.repo.clone())
+/// The reviewed repository's top level, one spelling for the app and the worker; else as given,
+/// with the repositories directly inside it.
+fn repo_root(cfg: &Config) -> (std::path::PathBuf, crate::repos::Repos) {
+    if let Some(top) = git::toplevel(&cfg.repo) {
+        return (top, crate::repos::Repos::default());
+    }
+    let root = std::path::absolute(&cfg.repo).unwrap_or_else(|_| cfg.repo.clone());
+    let repos = crate::repos::Repos::discover(&root);
+    (root, repos)
 }
 
 /// The startup app for one config snapshot: ready, or blocked on its error.
@@ -248,7 +255,9 @@ fn app_for(cfg: &Config, initial_config: &Result<PluginConfig, config::PluginCon
     match initial_config {
         Ok(plugin_config) => ready_app(cfg, plugin_config.clone()),
         Err(error) => {
-            let mut app = App::blocked(repo_root(cfg), Scope::Uncommitted, cfg.base.clone());
+            let (root, repos) = repo_root(cfg);
+            let mut app = App::blocked(root, Scope::Uncommitted, cfg.base.clone());
+            app.set_repos(repos);
             app.set_config_error(error.to_string());
             app
         }
@@ -257,10 +266,17 @@ fn app_for(cfg: &Config, initial_config: &Result<PluginConfig, config::PluginCon
 
 /// Build a fresh working reviewr pane only after the plugin configuration has validated.
 fn ready_app(cfg: &Config, plugin_config: PluginConfig) -> App {
-    let repo = repo_root(cfg);
+    let (repo, repos) = repo_root(cfg);
     let scope = plugin_config.default_scope();
-    logln!("start repo={} base={:?} scope={}", repo.display(), cfg.base, scope.name());
+    logln!(
+        "start repo={} repos={} base={:?} scope={}",
+        repo.display(),
+        repos.names().len(),
+        cfg.base,
+        scope.name()
+    );
     let mut app = App::new(repo, scope, cfg.base.clone());
+    app.set_repos(repos);
     app.seed_from_config(&plugin_config);
     app.set_plugin_config(plugin_config);
     app.set_cli_theme(cfg.theme.clone());
@@ -708,7 +724,7 @@ pub fn land_world_completion(
 /// config must be read again.
 fn land_watch_event(
     event: crate::watch::WatchEvent,
-    app: &App,
+    app: &mut App,
     pacer: &mut crate::schedule::Pacer,
     pr: &mut PrCoordinator,
     search: Option<&mpsc::Sender<crate::search::SearchJob>>,
@@ -718,6 +734,10 @@ fn land_watch_event(
     match event {
         // Whatever changed before the stream went live was never seen: catch up once.
         WatchEvent::Ready => {
+            // A folder's watcher restarts when a repository comes or goes; it found them afresh.
+            if app.repos().is_folder() {
+                app.set_repos(crate::repos::Repos::discover(&app.repo));
+            }
             pacer.set_watcher_down(false, now);
             pacer.on_batch(crate::world::Refresh::Full, now);
             true
@@ -743,7 +763,12 @@ fn land_watch_event(
             if let (Some(search), Some(job)) = (search, job) {
                 let _ = search.send(job);
             }
-            pacer.on_batch(crate::world::Refresh::from_batch(&batch), now);
+            let refresh = if app.repos().is_folder() {
+                crate::world::Refresh::from_folder_batch(&batch, app.repos())
+            } else {
+                crate::world::Refresh::from_batch(&batch)
+            };
+            pacer.on_batch(refresh, now);
             batch.config
         }
         WatchEvent::Unavailable(reason) => {
@@ -838,7 +863,8 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
     let (recovery_tx, recovery_rx) = crate::wake::channel::<(u64, PluginConfig, App)>(&waker);
     let mut recovery_inflight = false;
     let (pr_tx, pr_rx) = crate::wake::channel::<TaggedPr>(&waker);
-    let mut pr = PrCoordinator::new(app.plugin_config().is_some());
+    // A folder of repositories has no one pull request: its `PR` tab says so and fetches nothing.
+    let mut pr = PrCoordinator::new(app.plugin_config().is_some() && !app.repos().is_folder());
     // The world worker builds input-tagged jobs; the loop reconciles their completions.
     let (world_tx, world_job_rx) = mpsc::channel::<crate::world::WorldJob>();
     let (world_res_tx, world_rx) = crate::wake::channel::<crate::world::WorldCompletion>(&waker);
@@ -892,7 +918,11 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
                         Recovery::Swap => {
                             recovered.carry_authored_state_from(app);
                             *app = recovered;
-                            pr.recover();
+                            if app.repos().is_folder() {
+                                pr.stop();
+                            } else {
+                                pr.recover();
+                            }
                         }
                         Recovery::Again => config_dirty = true,
                         Recovery::Invalid(error) => {
@@ -1148,7 +1178,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
                 && last_pr_poll.elapsed() >= PR_POLL;
             let pending = if app.pane_visible() { app.pr_pending.take() } else { None };
             let refresh = pending.or(fallback_poll.then_some(crate::app::RefreshKind::Ambient));
-            if let Some(kind) = refresh {
+            if let Some(kind) = refresh.filter(|_| !app.repos().is_folder()) {
                 last_pr_poll = Instant::now();
                 pr.request_refresh(kind);
             }
@@ -1210,7 +1240,11 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
                 }
             }
 
-            if app.pane_visible() && pr.can_start_probe(app.plugin_config().is_some()) {
+            // A folder of repositories has no one pull request to probe for.
+            if app.pane_visible()
+                && !app.repos().is_folder()
+                && pr.can_start_probe(app.plugin_config().is_some())
+            {
                 pr.probe_pending = false;
                 let (tx, repo, base, plugin_config, epoch) = (
                     probe_tx.clone(),
@@ -1270,7 +1304,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
                 timeout = timeout.min(due.saturating_duration_since(Instant::now()));
             }
             // The PR tab refetches every minute while it is on screen.
-            if app.pane_visible() && app.tab == crate::app::Tab::Pr {
+            if app.pane_visible() && app.tab == crate::app::Tab::Pr && !app.repos().is_folder() {
                 timeout = timeout.min(PR_POLL.saturating_sub(last_pr_poll.elapsed()));
             }
             // Workers wake the loop when their results land, so nothing in flight needs a timer,

@@ -38,6 +38,15 @@ impl Watched {
     }
 
     fn start_at(root: &std::path::Path, config: Option<&std::path::Path>) -> Self {
+        Self::start_probing(root, config, ".watch-probe")
+    }
+
+    /// Start, probing liveness by writes to `probe`, a path under `root` the watcher reports.
+    fn start_probing(
+        root: &std::path::Path,
+        config: Option<&std::path::Path>,
+        probe_at: &str,
+    ) -> Self {
         let turn = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (tx, rx) = channel(&Waker::detached());
         let wrote = Arc::new(Mutex::new(Vec::new()));
@@ -50,11 +59,11 @@ impl Watched {
         let watch = Watch::start(root, config, tx, Some(turns));
         let watched = Self { watch, rx, wrote, _turn: turn };
         // A stream starts live some time after `start`: probe until a write arrives, then drain.
-        let probe = root.join(".watch-probe");
+        let probe = root.join(probe_at);
         let deadline = Instant::now() + Duration::from_secs(20);
         for n in 0.. {
             std::fs::write(&probe, format!("{n}\n")).unwrap();
-            if watched.next().worktree.contains(".watch-probe") {
+            if watched.next().worktree.contains(probe_at) {
                 break;
             }
             assert!(Instant::now() < deadline, "the watcher never went live");
@@ -74,6 +83,9 @@ impl Watched {
                     merged.worktree.extend(b.worktree);
                     merged.files.extend(b.files);
                     merged.git.extend(b.git);
+                    for (name, git) in b.repo_git {
+                        merged.repo_git.entry(name).or_default().extend(git);
+                    }
                     merged.rescan |= b.rescan;
                     merged.config |= b.config;
                 }
@@ -759,6 +771,95 @@ fn a_watcher_out_of_inotify_watches_reports_itself_unavailable() {
         match rx.recv_timeout(Duration::from_secs(5)).expect("an event") {
             WatchEvent::Unavailable(_) => break,
             _ => assert!(Instant::now() < deadline, "the watcher never gave up"),
+        }
+    }
+}
+
+/// `git -C <at> <args>` with an identity, asserting success.
+fn git_in(at: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@t", "-C"])
+        .arg(at)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A repository at `at` holding `a.txt`, committed.
+fn repo_in(at: &std::path::Path) {
+    std::fs::create_dir_all(at).unwrap();
+    git_in(at, &["init", "-q", "-b", "main"]);
+    std::fs::write(at.join("a.txt"), "one\n").unwrap();
+    git_in(at, &["add", "-A"]);
+    git_in(at, &["commit", "-q", "-m", "init"]);
+}
+
+#[test]
+fn a_folders_repositories_report_their_files_and_git_changes_by_name() {
+    let folder = tempfile::tempdir().unwrap();
+    let root = folder.path();
+    for name in ["api", "web"] {
+        repo_in(&root.join(name));
+    }
+    std::fs::write(root.join("api/.gitignore"), "*.log\n").unwrap();
+    git_in(&root.join("api"), &["add", "-A"]);
+    git_in(&root.join("api"), &["commit", "-q", "-m", "rules"]);
+    let w = Watched::start_probing(root, None, "api/.watch-probe");
+
+    std::fs::write(root.join("web/a.txt"), "two\n").unwrap();
+    assert_eq!(paths(&w.next()), ["web/a.txt"].into(), "spelled from the folder");
+
+    std::fs::write(root.join("api/x.log"), "x\n").unwrap();
+    let _ = w.next();
+    std::fs::write(root.join("api/x.log"), "y\n").unwrap();
+    std::fs::write(root.join("notes.txt"), "x\n").unwrap();
+    let quiet = w.next();
+    assert!(paths(&quiet).is_empty(), "ignored by its repository, or beside them: {quiet:?}");
+
+    git_in(&root.join("web"), &["commit", "-q", "--allow-empty", "-m", "two"]);
+    let commit = w.next();
+    let web = commit.repo_git.get("web").expect("a change of web's");
+    assert!(web.contains(&GitChange::Refs) || web.contains(&GitChange::Head), "{commit:?}");
+    assert!(!commit.repo_git.contains_key("api"), "api's git is untouched: {commit:?}");
+
+    std::fs::write(root.join("api/.git/info/exclude"), "*.tmp\n").unwrap();
+    let rules = w.next();
+    assert_eq!(
+        rules.repo_git.get("api"),
+        Some(&[GitChange::IgnoreRules].into()),
+        "one repository's rules: {rules:?}"
+    );
+}
+
+#[test]
+fn a_repository_made_beside_the_others_restarts_the_watcher_on_the_new_set() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let folder = tempfile::tempdir().unwrap();
+    let root = folder.path();
+    repo_in(&root.join("api"));
+    let (tx, rx) = channel(&Waker::detached());
+    let _watch = Watch::start(root, None, tx, None);
+    let ready = rx.recv_timeout(Duration::from_secs(10)).expect("the start");
+    assert!(matches!(ready, WatchEvent::Ready), "{ready:?}");
+    // A folder appears first, as `git clone` makes it, and its `.git` after.
+    std::fs::create_dir(root.join("web")).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    repo_in(&root.join("web"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match rx.recv_timeout(Duration::from_secs(5)).expect("the restart") {
+            WatchEvent::Ready => break,
+            WatchEvent::Unavailable(reason) => panic!("a new repository is no failure: {reason}"),
+            WatchEvent::Batch(_) => assert!(Instant::now() < deadline, "no restart"),
+        }
+    }
+    std::fs::write(root.join("web/a.txt"), "two\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match rx.recv_timeout(Duration::from_secs(5)).expect("the new repository's write") {
+            WatchEvent::Batch(b) if b.worktree.contains("web/a.txt") => break,
+            _ => assert!(Instant::now() < deadline, "the new repository is not watched"),
         }
     }
 }

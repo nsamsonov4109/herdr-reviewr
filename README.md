@@ -177,6 +177,16 @@ comment. Click files, tabs, and links. Scroll with the wheel.
 reviewr starts in **uncommitted** (`default_scope` changes that). Git-ignored files never show
 in **Changes**.
 
+## A folder of repositories
+
+Start reviewr in a folder that isn't a repo but holds repos directly, like a workspace of
+clones, and it reviews all of them at once. Each repo is a folder in the file list. Paths start
+at the folder, so the agent working there can open any file a comment names. Toggle opens
+reviewr on such a folder too.
+
+Each repo diffs against its own last commit and its own base. The **PR** tab, **last turn**,
+and **commits** need one repo: open reviewr inside it for those.
+
 ## Configuration
 
 Flags on the pane command:
@@ -193,6 +203,7 @@ it applies at once. An invalid file blocks the pane with the error until you fix
 ```toml
 theme = "tokyo-night"
 default_scope = "branch"            # uncommitted | branch | last-turn
+default_base = ["develop", "main"]  # the first one each repo has
 markdown_view = "rendered"          # source | rendered
 diff_view = "split"                 # unified | split
 navigator_position = "bottom"       # right | bottom | left | top
@@ -237,6 +248,12 @@ reviewr zoomed or as an overlay. A narrower pane shows unified until it widens.
 The branch scope compares against the repo's default branch. To pick another, press `B` or click
 the base name in the header. Type to filter, or type any commit reference like `HEAD~2`. The
 pick holds for this worktree until you change it. `--base` overrides it.
+
+`default_base` names branches to try before the default branch. Each repo uses the first one it
+has, so one line covers repos with different trunks. A pick still wins over it.
+
+In a folder of repositories, a pick goes to every repo that has that branch. The header names
+the base most changed repos use, and counts any that use another.
 
 ### Editor
 
@@ -333,6 +350,8 @@ On Windows, point it at the plugin's own `bin` folder.
 - **Comments live only in the pane.** Closing it loses unsent ones. Send delivers all or none.
 - **Comments don't follow moved code.** reviewr marks them stale instead of dropping them.
 - **Files over 2 MB or 50,000 lines** aren't diffed. Neither are binary files.
+- **A folder of repositories** reviews only the repos directly inside it, and no file beside
+  them. Its PR tab, **last turn**, and **commits** don't work yet.
 
 ## Building from source
 

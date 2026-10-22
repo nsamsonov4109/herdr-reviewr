@@ -370,7 +370,7 @@ fn open(
         let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| PathBuf::from(dir));
         managed.iter().any(|plugin| dir.starts_with(plugin))
     };
-    let Some(&cwd) = candidates.iter().find(|dir| !in_plugin(dir) && has_worktree(dir)) else {
+    let Some(&cwd) = candidates.iter().find(|dir| !in_plugin(dir) && reviewable(dir)) else {
         // Name every rejected candidate.
         if candidates.is_empty() {
             return Err(refused("no repo to review: no cwd"));
@@ -378,7 +378,11 @@ fn open(
         let rejected: Vec<String> = candidates
             .iter()
             .map(|dir| {
-                let why = if in_plugin(dir) { "a plugin's checkout" } else { "not a git repo" };
+                let why = if in_plugin(dir) {
+                    "a plugin's checkout"
+                } else {
+                    "not a git repo, nor a folder of them"
+                };
                 format!("'{dir}' ({why})")
             })
             .collect();
@@ -423,9 +427,11 @@ fn open(
     }
 }
 
-/// Whether `dir` sits in a worktree; a `.git` dir or bare repository does not.
-fn has_worktree(dir: &str) -> bool {
-    crate::git::toplevel(Path::new(dir)).is_some()
+/// Whether `dir` sits in a worktree, or holds repositories directly; a `.git` dir or bare
+/// repository does neither.
+fn reviewable(dir: &str) -> bool {
+    let dir = Path::new(dir);
+    crate::git::toplevel(dir).is_some() || crate::repos::Repos::discover(dir).is_folder()
 }
 
 /// What an opened pane showed within [`VISIBLE_BOUND`].

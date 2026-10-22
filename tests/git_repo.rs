@@ -9,8 +9,9 @@ use common::Repo;
 use herdr_reviewr::git::{
     DiffSides, ResolvedBase, abbreviate_oid, all_files, changed_between, changed_from,
     checked_out_branch, default_branch_name, delete_base_pick, diff_sides, list_branches,
-    merge_base as merge_base_oid, read_base_pick, read_baseline_ref, resolve_base, resolve_commit,
-    snapshot_worktree, write_base_pick, write_baseline_ref,
+    merge_base as merge_base_oid, read_base_pick, read_baseline_ref, resolve_base,
+    resolve_base_with, resolve_commit, snapshot_worktree, write_base_pick, write_base_pick_with,
+    write_baseline_ref,
 };
 use herdr_reviewr::model::{ChangeKind, ChangedFile, Scope};
 use herdr_reviewr::world::{WorldInput, build_changed};
@@ -41,9 +42,11 @@ fn changed_against_tree(repo: &Path, tree: &str) -> anyhow::Result<Vec<ChangedFi
 fn world_input(repo: &Path, scope: Scope, base: Option<&str>, turn: Option<&str>) -> WorldInput {
     WorldInput {
         repo: repo.to_path_buf(),
+        repos: herdr_reviewr::repos::Repos::default(),
         tab: herdr_reviewr::app::Tab::Changes,
         scope,
         base: base.map(str::to_string),
+        default_base: Vec::new(),
         base_epoch: 0,
         turn_baseline: turn.map(str::to_string),
         commit_pick: None,
@@ -434,6 +437,57 @@ fn picking_the_default_name_deletes_the_pick_so_a_re_default_is_followed() {
     );
     write_base_pick(r.path(), "dev").unwrap();
     assert_eq!(read_base_pick(r.path()).unwrap().as_deref(), Some("dev"));
+}
+
+#[test]
+fn default_base_stands_between_the_pick_and_the_default_branch() {
+    let r = Repo::init();
+    r.write("base.rs", "1\n");
+    r.commit_all("base");
+    r.set_origin_default("main", "HEAD");
+    r.git(&["branch", "dev"]);
+    r.git(&["branch", "trunk"]);
+    let preferred = ["missing".to_string(), "dev".to_string(), "trunk".to_string()];
+    let winner = |flag: Option<&str>| {
+        let resolution = resolve_base_with(r.path(), flag, &preferred).unwrap();
+        (resolution.status.winner.unwrap().name().to_string(), resolution.status.skipped)
+    };
+    // The first name this repo has; one it lacks is no skip.
+    assert_eq!(winner(None), ("dev".to_string(), None));
+    assert_eq!(
+        resolve_base_with(r.path(), None, &preferred).unwrap().preferred.as_deref(),
+        Some("dev")
+    );
+    write_base_pick(r.path(), "trunk").unwrap();
+    assert_eq!(winner(None).0, "trunk", "a pick wins over it");
+    assert_eq!(winner(Some("main")).0, "main", "and `--base` over both");
+    // With no name it has, the default branch.
+    let none = ["missing".to_string()];
+    delete_base_pick(r.path()).unwrap();
+    assert_eq!(
+        resolve_base_with(r.path(), None, &none).unwrap().status.winner.unwrap().name(),
+        "main"
+    );
+}
+
+#[test]
+fn picking_the_name_default_base_falls_back_to_deletes_the_pick() {
+    let r = Repo::init();
+    r.write("base.rs", "1\n");
+    r.commit_all("base");
+    r.set_origin_default("main", "HEAD");
+    r.git(&["branch", "dev"]);
+    let preferred = ["dev".to_string()];
+    write_base_pick_with(r.path(), "main", &preferred).unwrap();
+    assert_eq!(
+        read_base_pick(r.path()).unwrap().as_deref(),
+        Some("main"),
+        "main is no fallback now"
+    );
+    let winner = resolve_base_with(r.path(), None, &preferred).unwrap().status.winner.unwrap();
+    assert_eq!(winner.name(), "main");
+    write_base_pick_with(r.path(), "dev", &preferred).unwrap();
+    assert_eq!(read_base_pick(r.path()).unwrap(), None, "the fallback's own name is no pick");
 }
 
 #[test]

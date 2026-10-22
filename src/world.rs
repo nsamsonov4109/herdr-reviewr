@@ -4,21 +4,26 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::app::Tab;
 use crate::file_list::Entry;
 use crate::git;
 use crate::model::{ChangeKind, ChangedFile, CommitPick, Scope};
+use crate::repos::Repos;
 
 /// Everything the build reads; a snapshot lands only while the view still matches it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct WorldInput {
     pub repo: PathBuf,
+    /// A folder's repositories, each built as its own; empty when `repo` is the one repository.
+    pub repos: Repos,
     pub tab: Tab,
     pub scope: Scope,
     /// The `--base` flag. The pick is read at build time, so another pane's pick lands as content.
     pub base: Option<String>,
+    /// The config's `default_base`, tried before the default branch.
+    pub default_base: Vec<String>,
     /// Bumped by this pane's pick, so a build of the previous pick never lands.
     pub base_epoch: u64,
     /// The `last-turn` baseline tree the changed set diffs against; `None` before a turn.
@@ -27,6 +32,26 @@ pub struct WorldInput {
     pub commit_pick: Option<CommitPick>,
     /// Expanded ignored directories whose children the `All files` tree loads.
     pub toggled_dirs: HashSet<String>,
+}
+
+impl WorldInput {
+    /// The input of the folder's repository `name`, its expanded directories spelled inside it.
+    fn of_repo(&self, name: &str) -> Self {
+        let inside = format!("{name}/");
+        let toggled = self.toggled_dirs.iter().filter_map(|d| d.strip_prefix(&inside));
+        Self {
+            repo: self.repo.join(name),
+            repos: Repos::default(),
+            tab: self.tab,
+            scope: self.scope,
+            base: self.base.clone(),
+            default_base: self.default_base.clone(),
+            base_epoch: self.base_epoch,
+            turn_baseline: self.turn_baseline.clone(),
+            commit_pick: self.commit_pick.clone(),
+            toggled_dirs: toggled.map(str::to_string).collect(),
+        }
+    }
 }
 
 /// One refresh's result; the base rides along so the header and its changeset land together.
@@ -41,6 +66,10 @@ pub struct WorldSnapshot {
     pub head: Option<String>,
     /// The paths a path-limited build re-read; `None` for a full build, which re-read everything.
     pub touched: Option<BTreeSet<String>>,
+    /// A folder's `branch` bases by repository; `branch_base` then stays empty.
+    pub repo_bases: BTreeMap<String, git::BaseStatus>,
+    /// The folder's repositories whose build failed, with why; the worker shows its last build of each.
+    pub failed: Vec<(String, String)>,
 }
 
 /// What one build found the commit pick to be.
@@ -76,6 +105,23 @@ pub struct Changeset {
     pub files: BTreeMap<String, ChangedFile>,
     /// `None` when the scope has nothing to diff: no baseline, base, or live pick.
     pub ends: Option<DiffEnds>,
+    /// A folder's ends by repository, one with nothing to diff absent; `ends` then stays `None`.
+    pub repo_ends: BTreeMap<String, DiffEnds>,
+}
+
+impl Changeset {
+    /// The repository `path`'s diff reads in, the path inside it, and the ends it reads.
+    pub fn ends_of<'s, 'r, 'a>(
+        &'s self,
+        repos: &'r Repos,
+        path: &'a str,
+    ) -> Option<(Option<&'r str>, &'a str, &'s DiffEnds)> {
+        if !repos.is_folder() {
+            return self.ends.as_ref().map(|ends| (None, path, ends));
+        }
+        let (name, inner) = repos.locate(path)?;
+        self.repo_ends.get(name).map(|ends| (Some(name), inner, ends))
+    }
 }
 
 /// A build's changeset and the base or pick it diffs against, landed together.
@@ -84,10 +130,25 @@ pub struct ScopeBuild {
     pub branch_base: git::BaseStatus,
     pub pick_status: Option<PickStatus>,
     pub changeset: Changeset,
+    /// A folder's `branch` bases by repository.
+    pub repo_bases: BTreeMap<String, git::BaseStatus>,
 }
 
 /// Build the snapshot for `input`; the changeset is built on every tab.
 pub fn build(input: &WorldInput) -> Result<WorldSnapshot> {
+    if input.repos.is_folder() {
+        let names = input.repos.names();
+        let built = crate::repos::par_map(names, |name| build(&input.of_repo(name)));
+        let mut parts = BTreeMap::new();
+        let mut failed = Vec::new();
+        for (name, built) in names.iter().zip(built) {
+            match built {
+                Ok(snapshot) => drop(parts.insert(name.clone(), snapshot)),
+                Err(e) => failed.push((name.clone(), format!("{e:#}"))),
+            }
+        }
+        return Ok(compose(&parts, None, failed));
+    }
     // Outside a repo, paint the quiet empty state, not an error every refresh.
     if !git::is_repo(&input.repo) {
         return Ok(WorldSnapshot {
@@ -97,22 +158,97 @@ pub fn build(input: &WorldInput) -> Result<WorldSnapshot> {
             pick_status: None,
             head: None,
             touched: None,
+            repo_bases: BTreeMap::new(),
+            failed: Vec::new(),
         });
     }
     // One read of HEAD serves the snapshot and the uncommitted diff's old end.
     let head = git::head_oid(&input.repo);
-    let ScopeBuild { branch_base, pick_status, changeset } = scope_build(input, head.clone())?;
+    let ScopeBuild { branch_base, pick_status, changeset, .. } = scope_build(input, head.clone())?;
     let entries = match input.tab {
         // The whole worktree (ignored included), with expanded ignored dirs loaded lazily.
         Tab::AllFiles => all_files_entries(input, &changeset.files)?,
         // `Changes` (the `PR` tab never builds a snapshot).
         _ => changeset.files.values().map(Entry::from_changed).collect(),
     };
-    Ok(WorldSnapshot { changeset, entries, branch_base, pick_status, head, touched: None })
+    Ok(WorldSnapshot {
+        changeset,
+        entries,
+        branch_base,
+        pick_status,
+        head,
+        touched: None,
+        repo_bases: BTreeMap::new(),
+        failed: Vec::new(),
+    })
+}
+
+/// Merge a folder's repository builds into one, every path spelled from the folder.
+fn compose(
+    parts: &BTreeMap<String, WorldSnapshot>,
+    touched: Option<BTreeSet<String>>,
+    failed: Vec<(String, String)>,
+) -> WorldSnapshot {
+    let mut changeset = Changeset::default();
+    let mut entries = Vec::new();
+    let mut repo_bases = BTreeMap::new();
+    for (name, part) in parts {
+        let file = |f: &ChangedFile| ChangedFile {
+            path: crate::repos::join(name, &f.path),
+            previous_path: f.previous_path.as_deref().map(|p| crate::repos::join(name, p)),
+            ..f.clone()
+        };
+        changeset.files.extend(part.changeset.files.values().map(|f| {
+            let f = file(f);
+            (f.path.clone(), f)
+        }));
+        if let Some(ends) = &part.changeset.ends {
+            changeset.repo_ends.insert(name.clone(), ends.clone());
+        }
+        entries.extend(part.entries.iter().map(|e| Entry {
+            path: crate::repos::join(name, &e.path),
+            annotation: e.annotation.as_ref().map(file),
+            ..e.clone()
+        }));
+        repo_bases.insert(name.clone(), part.branch_base.clone());
+    }
+    // `a-b/` sorts before `a/`, so the repositories' sorted lists need one more sort.
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    WorldSnapshot {
+        changeset,
+        entries,
+        branch_base: git::BaseStatus::default(),
+        pick_status: None,
+        head: None,
+        touched,
+        repo_bases,
+        failed,
+    }
 }
 
 /// The active scope's changeset and, on `branch`, its base.
 pub fn build_changed(input: &WorldInput) -> Result<ScopeBuild> {
+    if input.repos.is_folder() {
+        let names = input.repos.names();
+        let parts = crate::repos::par_map(names, |name| build_changed(&input.of_repo(name)));
+        let mut build = ScopeBuild::default();
+        for (name, part) in names.iter().zip(parts) {
+            let part = part.with_context(|| name.clone())?;
+            for f in part.changeset.files.into_values() {
+                let path = crate::repos::join(name, &f.path);
+                let previous_path = f.previous_path.as_deref().map(|p| crate::repos::join(name, p));
+                build
+                    .changeset
+                    .files
+                    .insert(path.clone(), ChangedFile { path, previous_path, ..f });
+            }
+            if let Some(ends) = part.changeset.ends {
+                build.changeset.repo_ends.insert(name.clone(), ends);
+            }
+            build.repo_bases.insert(name.clone(), part.branch_base);
+        }
+        return Ok(build);
+    }
     if !git::is_repo(&input.repo) {
         return Ok(ScopeBuild::default());
     }
@@ -135,7 +271,8 @@ fn scope_build(input: &WorldInput, head: Option<String>) -> Result<ScopeBuild> {
         }
         Scope::Branch => {
             // A resolve failure fails the build, keeping the stale frame.
-            let resolution = git::resolve_base(&input.repo, input.base.as_deref())?;
+            let resolution =
+                git::resolve_base_with(&input.repo, input.base.as_deref(), &input.default_base)?;
             let merge_base = resolution
                 .status
                 .winner
@@ -162,7 +299,8 @@ fn at_ends(repo: &Path, ends: DiffEnds) -> Result<ScopeBuild> {
         Some(new) => git::changed_between(repo, &ends.old, new)?,
     };
     let files = changed.into_iter().map(|f| (f.path.clone(), f)).collect();
-    Ok(ScopeBuild { changeset: Changeset { files, ends: Some(ends) }, ..ScopeBuild::default() })
+    let changeset = Changeset { files, ends: Some(ends), ..Changeset::default() };
+    Ok(ScopeBuild { changeset, ..ScopeBuild::default() })
 }
 
 /// The pick's changeset, verdict and ends in one pass; a `gone` pick has neither.
@@ -201,6 +339,16 @@ pub(crate) fn all_files_entries(
     input: &WorldInput,
     changed: &BTreeMap<String, ChangedFile>,
 ) -> Result<Vec<Entry>> {
+    if input.repos.is_folder() {
+        let names = input.repos.names();
+        let listed = crate::repos::par_map(names, |name| repo_files(input, changed, name));
+        let mut entries = Vec::new();
+        for (name, listed) in names.iter().zip(listed) {
+            entries.extend(listed.with_context(|| name.clone())?);
+        }
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        return Ok(entries);
+    }
     let to_entry = |w: git::WorktreeEntry| {
         let annotation = changed.get(&w.path).cloned();
         Entry::from_worktree(w, annotation)
@@ -219,6 +367,24 @@ pub(crate) fn all_files_entries(
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     entries.dedup_by(|a, b| a.path == b.path);
     Ok(entries)
+}
+
+/// The folder's repository `name`'s `All files` entries, spelled from the folder; `changed` is
+/// the folder's, its annotations kept as they are.
+pub(crate) fn repo_files(
+    input: &WorldInput,
+    changed: &BTreeMap<String, ChangedFile>,
+    name: &str,
+) -> Result<Vec<Entry>> {
+    let inside = format!("{name}/");
+    let changed: BTreeMap<String, ChangedFile> = changed
+        .range(inside.clone()..)
+        .take_while(|(path, _)| path.starts_with(&inside))
+        .map(|(path, f)| (path[inside.len()..].to_string(), f.clone()))
+        .collect();
+    let entries = all_files_entries(&input.of_repo(name), &changed)?;
+    let spelled = |e: Entry| Entry { path: crate::repos::join(name, &e.path), ..e };
+    Ok(entries.into_iter().map(spelled).collect())
 }
 
 /// What a narrow re-read must also cover so git pairs renames as a full build would: both sides
@@ -345,12 +511,14 @@ fn merge_paths(
         _ => files.values().map(Entry::from_changed).collect(),
     };
     Ok(WorldSnapshot {
-        changeset: Changeset { files, ends },
+        changeset: Changeset { files, ends, ..Changeset::default() },
         entries,
         branch_base: last.branch_base.clone(),
         pick_status: last.pick_status.clone(),
         head: last.head.clone(),
         touched: Some(paths.clone()),
+        repo_bases: BTreeMap::new(),
+        failed: Vec::new(),
     })
 }
 
@@ -361,6 +529,8 @@ pub enum Refresh {
     Full,
     /// Some worktree paths; with `index`, a full build too if what the index stages changed.
     Paths { paths: BTreeSet<String>, index: bool },
+    /// A folder's repositories, each by name with what it re-reads; one not named re-reads nothing.
+    Repos(BTreeMap<String, Refresh>),
 }
 
 impl Default for Refresh {
@@ -377,18 +547,22 @@ impl Refresh {
 
     /// Whether it re-reads nothing.
     pub fn is_empty(&self) -> bool {
-        matches!(self, Self::Paths { paths, index: false } if paths.is_empty())
+        match self {
+            Self::Full => false,
+            Self::Paths { paths, index } => paths.is_empty() && !index,
+            Self::Repos(each) => each.values().all(Self::is_empty),
+        }
     }
 
     pub fn is_full(&self) -> bool {
         matches!(self, Self::Full)
     }
 
-    /// The paths it re-reads; `None` for a full build.
+    /// The paths it re-reads; `None` for a full build or a folder's.
     pub fn named_paths(&self) -> Option<&BTreeSet<String>> {
         match self {
             Self::Paths { paths, .. } => Some(paths),
-            Self::Full => None,
+            Self::Full | Self::Repos(_) => None,
         }
     }
 
@@ -403,23 +577,73 @@ impl Refresh {
         Self::Paths { paths: batch.worktree.clone(), index }.settled()
     }
 
-    /// Fold a later request in: anything full stays full.
+    /// What one watcher batch asks of a folder: each repository what [`Self::from_batch`] would
+    /// ask of it alone. A path beside the repositories asks nothing.
+    pub fn from_folder_batch(batch: &crate::watch::Batch, repos: &Repos) -> Self {
+        use crate::watch::GitChange;
+        if batch.rescan {
+            return Self::Full;
+        }
+        let mut each: BTreeMap<String, Refresh> = BTreeMap::new();
+        for (name, git) in &batch.repo_git {
+            let refresh = if git.iter().any(|g| *g != GitChange::Index) {
+                Self::Full
+            } else {
+                Self::Paths { paths: BTreeSet::new(), index: git.contains(&GitChange::Index) }
+            };
+            each.entry(name.clone()).or_default().absorb(refresh);
+        }
+        for path in &batch.worktree {
+            if let Some((name, inner)) = repos.locate(path) {
+                let refresh = Self::Paths { paths: [inner.to_string()].into(), index: false };
+                each.entry(name.to_string()).or_default().absorb(refresh);
+            }
+        }
+        Self::Repos(each).settled()
+    }
+
+    /// Fold a later request in: anything full stays full, and a folder's merge by repository.
     pub fn absorb(&mut self, other: Refresh) {
         let merged = match (std::mem::take(self), other) {
             (Self::Paths { mut paths, index }, Self::Paths { paths: more, index: also }) => {
                 paths.extend(more);
                 Self::Paths { paths, index: index || also }
             }
+            (Self::Repos(mut each), Self::Repos(more)) => {
+                for (name, refresh) in more {
+                    each.entry(name).or_default().absorb(refresh);
+                }
+                Self::Repos(each)
+            }
+            // The default asks nothing, so it gives way to a folder's request either side.
+            (empty, other @ Self::Repos(_)) | (other @ Self::Repos(_), empty)
+                if empty.is_empty() =>
+            {
+                other
+            }
             _ => Self::Full,
         };
         *self = merged.settled();
     }
 
-    /// Paths past the command-line cap make it full.
+    /// Paths past the command-line cap make it full, in a folder each repository's on its own.
     fn settled(self) -> Self {
         match self {
             Self::Paths { paths, .. } if !git::fits_command_line(&paths) => Self::Full,
+            Self::Repos(each) => {
+                Self::Repos(each.into_iter().map(|(name, r)| (name, r.settled())).collect())
+            }
             other => other,
+        }
+    }
+
+    /// What it asks of the folder's repository `name`.
+    fn of_repo(&self, name: &str) -> Self {
+        match self {
+            Self::Full => Self::Full,
+            Self::Repos(each) => each.get(name).cloned().unwrap_or_default(),
+            // A lone repository's request names no repository of a folder.
+            Self::Paths { .. } => Self::default(),
         }
     }
 }
@@ -501,6 +725,8 @@ pub fn spawn(
 struct Worker {
     last: Option<(WorldInput, WorldSnapshot)>,
     staged: Option<u64>,
+    /// A folder's repositories by name: each one's own worker and its last good build.
+    repos: BTreeMap<String, (Worker, Option<WorldSnapshot>)>,
 }
 
 impl Worker {
@@ -511,6 +737,9 @@ impl Worker {
         input: &WorldInput,
         mut refresh: Refresh,
     ) -> Option<Result<WorldSnapshot>> {
+        if input.repos.is_folder() {
+            return self.refresh_folder(input, &refresh);
+        }
         // A pick reads committed trees: on `Changes`, a worktree or index change moves nothing in it.
         let pick_only = input.scope == Scope::Commits && input.tab == Tab::Changes;
         if refresh.is_empty() || (pick_only && !refresh.is_full()) {
@@ -559,6 +788,84 @@ impl Worker {
         }
         Some(built)
     }
+
+    /// Refresh a folder: each repository re-reads only what `refresh` asks of it, on a few threads.
+    fn refresh_folder(
+        &mut self,
+        input: &WorldInput,
+        refresh: &Refresh,
+    ) -> Option<Result<WorldSnapshot>> {
+        // A repository that left the folder takes its files with it.
+        let left = self.repos.keys().any(|name| !input.repos.contains(name));
+        self.repos.retain(|name, _| input.repos.contains(name));
+        let slots: Vec<std::sync::Mutex<(String, Worker, Option<WorldSnapshot>)>> = input
+            .repos
+            .names()
+            .iter()
+            .map(|name| {
+                let (worker, good) = self.repos.remove(name).unwrap_or_default();
+                std::sync::Mutex::new((name.clone(), worker, good))
+            })
+            .collect();
+        let read = crate::repos::par_map(&slots, |slot| {
+            let mut slot = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (name, worker, good) = &mut *slot;
+            let input = input.of_repo(name);
+            // One never built for this input, or whose last build failed, reads everything.
+            let fresh = good.is_some() && worker.last.as_ref().is_some_and(|(of, _)| *of == input);
+            let refresh = if fresh { refresh.of_repo(name) } else { Refresh::Full };
+            if worker.repos.is_empty() && worker.last.is_none() && good.is_none() {
+                git::sweep_dead_copies(&input.repo);
+            }
+            match worker.refresh(&input, refresh) {
+                Some(Ok(built)) => {
+                    let touched = built.touched.clone();
+                    *good = Some(built);
+                    Some(Ok(touched))
+                }
+                Some(Err(e)) => Some(Err(format!("{e:#}"))),
+                None => None,
+            }
+        });
+        let mut parts = BTreeMap::new();
+        let mut touched = Some(BTreeSet::new());
+        let mut failed = Vec::new();
+        let mut any = left;
+        for (slot, read) in slots.into_iter().zip(read) {
+            let (name, worker, good) =
+                slot.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+            match read {
+                Some(Ok(Some(paths))) => {
+                    if let Some(all) = touched.as_mut() {
+                        all.extend(paths.iter().map(|p| crate::repos::join(&name, p)));
+                    }
+                    any = true;
+                }
+                // A full build touched the whole repository, which its name covers.
+                Some(Ok(None)) => {
+                    if let Some(all) = touched.as_mut() {
+                        all.insert(name.clone());
+                    }
+                    any = true;
+                }
+                Some(Err(why)) => {
+                    failed.push((name.clone(), why));
+                    any = true;
+                }
+                None => {}
+            }
+            if let Some(built) = &good {
+                parts.insert(name.clone(), built.clone());
+            }
+            self.repos.insert(name, (worker, good));
+        }
+        if !any {
+            return None;
+        }
+        // A full refresh re-read everything, which `None` says.
+        let touched = touched.filter(|_| !refresh.is_full());
+        Some(Ok(compose(&parts, touched, failed)))
+    }
 }
 
 #[cfg(test)]
@@ -601,5 +908,65 @@ mod tests {
         for (name, batch, expected) in rows {
             assert_eq!(Refresh::from_batch(&batch), expected, "{name}");
         }
+    }
+
+    fn each(rows: &[(&str, Refresh)]) -> Refresh {
+        Refresh::Repos(rows.iter().map(|(n, r)| ((*n).to_string(), r.clone())).collect())
+    }
+
+    fn some(paths: &[&str], index: bool) -> Refresh {
+        Refresh::Paths { paths: paths.iter().map(|p| (*p).to_string()).collect(), index }
+    }
+
+    #[test]
+    fn a_folder_batch_asks_each_repository_for_what_moved_in_it() {
+        let repos = crate::repos::Repos::of(&["api", "web"]);
+        let with_git = |git: &[(&str, &[GitChange])], worktree: &[&str]| Batch {
+            repo_git: git
+                .iter()
+                .map(|(n, g)| ((*n).to_string(), g.iter().copied().collect()))
+                .collect(),
+            ..batch(&[], worktree, false)
+        };
+        let rows = [
+            (
+                "paths in two repositories, one beside them",
+                with_git(&[], &["api/a.rs", "web/b/c.rs", "notes.txt"]),
+                each(&[("api", some(&["a.rs"], false)), ("web", some(&["b/c.rs"], false))]),
+            ),
+            (
+                "a stage in one",
+                with_git(&[("web", &[GitChange::Index])], &["web/b.rs"]),
+                each(&[("web", some(&["b.rs"], true))]),
+            ),
+            (
+                "a commit in one",
+                with_git(&[("web", &[GitChange::Head, GitChange::Index])], &["api/a.rs"]),
+                each(&[("api", some(&["a.rs"], false)), ("web", Refresh::Full)]),
+            ),
+            ("lost events", Batch { rescan: true, ..with_git(&[], &["api/a.rs"]) }, Refresh::Full),
+        ];
+        for (name, batch, expected) in rows {
+            assert_eq!(Refresh::from_folder_batch(&batch, &repos), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_folders_requests_merge_by_repository_and_anything_full_stays_full() {
+        let mut merged = each(&[("api", some(&["a"], false))]);
+        merged.absorb(each(&[("api", some(&["b"], true)), ("web", Refresh::Full)]));
+        assert_eq!(merged, each(&[("api", some(&["a", "b"], true)), ("web", Refresh::Full)]));
+        // The default asks nothing, so it gives way either side.
+        let mut from_default = Refresh::default();
+        from_default.absorb(each(&[("api", some(&["a"], false))]));
+        assert_eq!(from_default, each(&[("api", some(&["a"], false))]));
+        let mut into_default = each(&[("api", some(&["a"], false))]);
+        into_default.absorb(Refresh::default());
+        assert_eq!(into_default, each(&[("api", some(&["a"], false))]));
+        let mut full = Refresh::Full;
+        full.absorb(each(&[("api", some(&["a"], false))]));
+        assert_eq!(full, Refresh::Full);
+        assert!(each(&[]).is_empty() && each(&[("api", Refresh::default())]).is_empty());
+        assert!(!each(&[("api", some(&[], true))]).is_empty(), "a stage re-reads");
     }
 }

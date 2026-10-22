@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **A folder of repositories**: started in a folder that holds repositories directly, like a workspace of clones, reviewr shows all their changes at once. Each repository is a folder in the file list and diffs against its own base, and toggle opens reviewr on such a folder. The PR tab, last turn and commits still need one repository.
+- **`default_base`**: branches the branch scope tries before the default branch, in order, each repository taking the first it has. `default_base = ["develop", "main"]` covers repositories with different trunks, and a pick still wins over it.
+
 ## [0.48.0] — 2026-10-19
 
 ### Added
