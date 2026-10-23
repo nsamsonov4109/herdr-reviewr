@@ -190,6 +190,13 @@ When the agent edits a file, its comments move with their lines. A comment whose
 rewritten or deleted stays where they were, and its title says `code changed`: on a sent comment,
 usually the agent acting on it. A draft like that goes out marked so.
 
+A comment shows in every view that reads its lines, not only the one it was made in. Made on a
+commit, it shows on a later commit that rewrote those lines, on the removed side, and in
+**uncommitted** or **All files** while the worktree still reads them. A view that reads them
+nowhere, or in several places, leaves it to the comments list. Shown from another version, its
+title says so, `from 1a2b3c4` or `from the worktree`, and a send names the commit a comment was
+made on.
+
 The agent can comment too, on any line of the review, and each send tells it how:
 
 ```text
@@ -197,8 +204,20 @@ herdr-reviewr --comment src/app.rs:120-124 "This retry is new; it covers the fla
 ```
 
 Its comment opens a thread marked `new comment`, which `A` goes to. You reply, resolve or delete
-it, but don't edit it. In the agent's tab, the command finds the pane without `--to`, and
-`herdr-reviewr --help` lists both commands.
+it, but don't edit it.
+
+The agent can also point you at commits to review together, by sha, `a..b` for a run, or a list:
+
+```text
+herdr-reviewr --suggest 1a2b3c4,5d6e7f8 "The retry step, in both repos."
+```
+
+Nothing moves: the footer offers `G suggested commits`, and `G` opens the commit picker with
+them selected and the agent's reason as its title. Your next pick, whichever it is, answers the
+suggestion. A review in steps arrives as one suggestion per step, and they wait in the order
+sent: `G` opens the first, titled `(1 of 3)`, and each pick moves on to the next. In the
+agent's tab, these commands find the pane without `--to`, and `herdr-reviewr --help` lists all
+three.
 
 ## Viewed marks
 
@@ -221,7 +240,9 @@ inside. Marks live in the pane, like comments.
 - **since send** — what changed after your last send: your next review round. `i` again goes
   back to the scope you came from, so one key flips between the round and all the changes.
 - **last turn** — changes since the agent's latest turn started.
-- **commits** — one commit or a range, picked with `G`.
+- **commits** — one commit or a range, picked with `G`. In a folder of repositories, the
+  picker lists every repo's commits over its base, newest first ([A folder of
+  repositories](#a-folder-of-repositories)).
 
 reviewr starts in **uncommitted** (`default_scope` changes that). Git-ignored files never show
 in **Changes**.
@@ -233,8 +254,15 @@ clones, and it reviews all of them at once. Each repo is a folder in the file li
 at the folder, so the agent working there can open any file a comment names. Toggle opens
 reviewr on such a folder too.
 
-Each repo diffs against its own last commit and its own base. The **PR** tab, **last turn**,
-and **commits** need one repo: open reviewr inside it for those.
+Each repo diffs against its own last commit and its own base. **last turn** covers them all: a
+turn starts from a snapshot of every repo, and shows what it changed in any of them. The **PR**
+tab needs one repo: open reviewr inside it for that.
+
+`G` lists every repo's commits over its base, newest first, each with its repo. A change made in
+several repos at once usually lands as one commit title in each, so `enter` opens the
+highlighted commit together with the newest commit of that title in every other repo. `v`
+selects that step instead, and then adds or drops the highlighted row; `esc` clears the
+selection. Two commits picked in one repo open as the run between them.
 
 ## Configuration
 
@@ -408,7 +436,7 @@ On Windows, point it at the plugin's own `bin` folder.
   common to tell apart, they leave it where they were, marked `code changed`.
 - **Files over 2 MB or 50,000 lines** aren't diffed. Neither are binary files.
 - **A folder of repositories** reviews only the repos directly inside it, and no file beside
-  them. Its PR tab, **last turn**, and **commits** don't work yet.
+  them. Its PR tab doesn't work yet.
 
 ## Building from source
 

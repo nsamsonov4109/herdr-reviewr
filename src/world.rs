@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use crate::app::Tab;
 use crate::file_list::Entry;
 use crate::git;
-use crate::model::{ChangeKind, ChangedFile, CommitPick, Scope};
+use crate::model::{ChangeKind, ChangedFile, CommitPick, Picks, Scope};
 use crate::repos::Repos;
 
 /// Everything the build reads; a snapshot lands only while the view still matches it.
@@ -27,13 +27,14 @@ pub struct WorldInput {
     pub default_base: Vec<String>,
     /// Bumped by this pane's pick, so a build of the previous pick never lands.
     pub base_epoch: u64,
-    /// The `last-turn` baseline tree the changed set diffs against; `None` before a turn.
-    pub turn_baseline: Option<String>,
+    /// The trees the repositories held as the last turn started, by name (`""` for a lone
+    /// repository): what `last turn` diffs against; empty before a turn.
+    pub turn_baselines: BTreeMap<String, String>,
     /// The trees the repositories held at the reviewer's last send, by name (`""` for a lone
     /// repository): what `since send` diffs against.
     pub send_baselines: BTreeMap<String, String>,
-    /// The `commits` scope's pick, so a build of a replaced pick never lands.
-    pub commit_pick: Option<CommitPick>,
+    /// The `commits` scope's picks by repository, so a build of a replaced pick never lands.
+    pub commit_picks: Picks,
     /// Expanded ignored directories whose children the `All files` tree loads.
     pub toggled_dirs: HashSet<String>,
 }
@@ -51,12 +52,18 @@ impl WorldInput {
             base: self.base.clone(),
             default_base: self.default_base.clone(),
             base_epoch: self.base_epoch,
-            turn_baseline: self.turn_baseline.clone(),
+            turn_baselines: self
+                .turn_baselines
+                .get(name)
+                .map_or_else(BTreeMap::new, |tree| BTreeMap::from([(String::new(), tree.clone())])),
             send_baselines: self
                 .send_baselines
                 .get(name)
                 .map_or_else(BTreeMap::new, |tree| BTreeMap::from([(String::new(), tree.clone())])),
-            commit_pick: self.commit_pick.clone(),
+            commit_picks: self
+                .commit_picks
+                .get(name)
+                .map_or_else(BTreeMap::new, |pick| BTreeMap::from([(String::new(), pick.clone())])),
             toggled_dirs: toggled.map(str::to_string).collect(),
         }
     }
@@ -246,12 +253,31 @@ fn compose(
         changeset,
         entries,
         branch_base: git::BaseStatus::default(),
-        pick_status: None,
+        pick_status: combined_status(parts.values().filter_map(|p| p.pick_status.as_ref())),
         head: None,
         touched,
         repo_bases,
         failed,
     }
+}
+
+/// One verdict for a folder's picks: any gone is gone, any off its branch is off; counts add up.
+fn combined_status<'a>(statuses: impl IntoIterator<Item = &'a PickStatus>) -> Option<PickStatus> {
+    let statuses: Vec<&PickStatus> = statuses.into_iter().collect();
+    statuses.first()?;
+    let gone = statuses.iter().find(|s| matches!(s.verdict, PickVerdict::Gone(_)));
+    let off = statuses.iter().any(|s| s.verdict == PickVerdict::OffBranch);
+    let verdict = match gone {
+        Some(s) => s.verdict.clone(),
+        None if off => PickVerdict::OffBranch,
+        None => PickVerdict::Live,
+    };
+    // A subject only when every repository's commit carries it: one step under one title.
+    let subject = statuses[0].subject.as_str();
+    let shared = statuses.iter().all(|s| s.subject == subject);
+    let subject = if shared { subject.to_string() } else { String::new() };
+    let count = statuses.iter().map(|s| s.count).sum();
+    Some(PickStatus { verdict, subject, count })
 }
 
 /// The active scope's changeset and, on `branch`, its base.
@@ -260,8 +286,10 @@ pub fn build_changed(input: &WorldInput) -> Result<ScopeBuild> {
         let names = input.repos.names();
         let parts = crate::repos::par_map(names, |name| build_changed(&input.of_repo(name)));
         let mut build = ScopeBuild::default();
+        let mut statuses = Vec::new();
         for (name, part) in names.iter().zip(parts) {
             let part = part.with_context(|| name.clone())?;
+            statuses.extend(part.pick_status.clone());
             for f in part.changeset.files.into_values() {
                 let path = crate::repos::join(name, &f.path);
                 let previous_path = f.previous_path.as_deref().map(|p| crate::repos::join(name, p));
@@ -275,6 +303,7 @@ pub fn build_changed(input: &WorldInput) -> Result<ScopeBuild> {
             }
             build.repo_bases.insert(name.clone(), part.branch_base);
         }
+        build.pick_status = combined_status(&statuses);
         return Ok(build);
     }
     if !git::is_repo(&input.repo) {
@@ -286,10 +315,10 @@ pub fn build_changed(input: &WorldInput) -> Result<ScopeBuild> {
 /// [`build_changed`] against `head`, as the caller read it, inside a repo.
 fn scope_build(input: &WorldInput, head: Option<String>) -> Result<ScopeBuild> {
     match input.scope {
-        Scope::LastTurn => match input.turn_baseline.as_deref() {
+        Scope::LastTurn => match input.turn_baselines.get("") {
             Some(t) => {
                 let now = git::snapshot_worktree(&input.repo)?;
-                at_ends(&input.repo, DiffEnds { old: t.to_string(), new: Some(now) })
+                at_ends(&input.repo, DiffEnds { old: t.clone(), new: Some(now) })
             }
             None => Ok(ScopeBuild::default()),
         },
@@ -321,7 +350,7 @@ fn scope_build(input: &WorldInput, head: Option<String>) -> Result<ScopeBuild> {
         }
         Scope::Commits => {
             // A tag without a pick builds the empty changeset.
-            let Some(pick) = &input.commit_pick else { return Ok(ScopeBuild::default()) };
+            let Some(pick) = input.commit_picks.get("") else { return Ok(ScopeBuild::default()) };
             build_pick(&input.repo, pick)
         }
     }

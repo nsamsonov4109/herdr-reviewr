@@ -1622,7 +1622,9 @@ fn the_send_says_how_to_answer_while_the_channel_listens() {
     assert!(sent.contains("herdr-reviewr --reply <number> --to 1f2e \"<answer>\"\n"), "{sent}");
     let own = "herdr-reviewr --comment <path>:<line> --to 1f2e \"<comment>\".";
     assert!(sent.contains(own), "the agent learns it can comment too: {sent}");
-    assert!(sent.ends_with("herdr-reviewr --help explains both."), "{sent}");
+    let suggest = "herdr-reviewr --suggest <sha>[,<sha>...] --to 1f2e \"<why>\".";
+    assert!(sent.contains(suggest), "and point at commits: {sent}");
+    assert!(sent.ends_with("herdr-reviewr --help explains all three."), "{sent}");
 }
 
 #[test]
@@ -2824,7 +2826,10 @@ fn write_in_turn(
 /// The raw temp path would split them: macOS resolves `/var` to `/private/var`.
 fn turn_setup(r: &Repo) -> (App, herdr_reviewr::turn::TurnHost) {
     let root = herdr_reviewr::git::toplevel(r.path()).expect("a repo");
-    (App::new(root.clone(), Scope::LastTurn, None), herdr_reviewr::turn::TurnHost::open(root))
+    (
+        App::new(root.clone(), Scope::LastTurn, None),
+        herdr_reviewr::turn::TurnHost::open(root, herdr_reviewr::repos::Repos::default()),
+    )
 }
 
 /// The single-agent case the older tests drive: one agent at the worktree root.
@@ -3163,7 +3168,8 @@ fn only_a_net_change_promotes_a_turn() {
     r.write("a.rs", "one\ntwo\n");
     assert!(fed(&mut host, later(), &["a.rs"]), "a real change promotes");
     assert!(host.baseline().is_some());
-    assert_eq!(herdr_reviewr::git::read_baseline_ref(r.path()).as_deref(), host.baseline());
+    let lone = host.baseline().and_then(|t| t.get("")).map(String::as_str);
+    assert_eq!(herdr_reviewr::git::read_baseline_ref(r.path()).as_deref(), lone);
 }
 
 #[test]
@@ -3209,14 +3215,14 @@ fn a_question_only_turns_snapshot_expires_at_its_end() {
     r.commit_all("init");
     let (mut app, mut host) = started_turn(&r);
     write_in_turn(&mut app, &mut host, &r, "a.rs", "one\ntwo\n");
-    let turn_a = host.baseline().map(str::to_string);
+    let turn_a = host.baseline().cloned();
     observe_turn(&mut app, &mut host, r.path(), Some(Status::Idle));
     // Turn B asks a question and ends; the reviewer then edits.
     observe_turn(&mut app, &mut host, r.path(), Some(Status::Working));
     observe_turn(&mut app, &mut host, r.path(), Some(Status::Idle));
     r.write("a.rs", "reviewer\n");
     assert!(!fed(&mut host, later(), &["a.rs"]), "the reviewer's edit is not turn B's");
-    assert_eq!(host.baseline().map(str::to_string), turn_a, "turn A's diff stays");
+    assert_eq!(host.baseline().cloned(), turn_a, "turn A's diff stays");
 }
 
 #[test]
@@ -3234,11 +3240,11 @@ fn a_turn_the_watcher_missed_is_judged_at_its_end() {
     assert!(host.baseline().is_some(), "promoted at its end");
 
     // Another down turn that wrote nothing drops its snapshot.
-    let turn_a = host.baseline().map(str::to_string);
+    let turn_a = host.baseline().cloned();
     observe_turn(&mut app, &mut host, r.path(), Some(Status::Working));
     host.watcher_down(true);
     observe_turn(&mut app, &mut host, r.path(), Some(Status::Idle));
-    assert_eq!(host.baseline().map(str::to_string), turn_a, "nothing changed, nothing moved");
+    assert_eq!(host.baseline().cloned(), turn_a, "nothing changed, nothing moved");
 }
 
 #[test]
@@ -3680,8 +3686,8 @@ fn switching_to_an_empty_file_view_focuses_the_tree() {
 }
 
 #[test]
-fn a_diff_comment_does_not_render_in_the_file_view() {
-    use herdr_reviewr::app::Tab;
+fn a_diff_comment_shows_in_the_file_view_where_the_worktree_reads_its_line() {
+    use herdr_reviewr::app::{CardPlace, Tab};
     use herdr_reviewr::diff::View;
     let r = Repo::init();
     r.write("a.rs", "alpha\nbeta\ngamma\n");
@@ -3693,18 +3699,25 @@ fn a_diff_comment_does_not_render_in_the_file_view() {
     app.start_comment();
     app.input_push('x');
     app.submit_comment();
+    app.diff_cursor = row_with(&app, '-'); // the removed beta
+    app.start_comment();
+    app.input_push('y');
+    app.submit_comment();
     assert!(app.store.get(0).unwrap().diff_anchored, "made in the Changes diff");
-    assert!(!app.comment_marks().1.is_empty(), "renders in its own diff view");
+    assert_eq!(app.card_rows().len(), 2, "both render in their own diff view");
 
-    // In All files, open a.rs as content: the diff-anchored comment must not bleed in.
-    enter_tab(&mut app, Tab::AllFiles);
+    // In All files the worktree reads BETA on line 2, and the removed line nowhere: on the
+    // first open, read from the diff's view, and on any after.
+    app.set_tab(Tab::AllFiles).unwrap();
+    assert_eq!((app.diff_path.as_deref(), app.diff.view), (Some("a.rs"), View::File));
+    let shown = |app: &App| app.card_rows().iter().map(|&(_, ci)| ci).collect::<Vec<_>>();
+    assert_eq!(shown(&app), [0]);
+    common::land_world(&mut app);
     let row = file_row_of(&app, "a.rs").expect("a.rs listed");
     app.select_file(row).unwrap();
-    assert_eq!(app.diff.view, View::File);
-    assert!(
-        app.comment_marks().1.is_empty(),
-        "a diff-anchored comment does not render in the File view"
-    );
+    assert_eq!(shown(&app), [0]);
+    let place = CardPlace { side: Side::New, start: 2, end: 2, native: false, from: None };
+    assert_eq!(app.card_place(0), Some(place), "the same worktree, so nothing to name");
 }
 
 #[test]
@@ -4930,11 +4943,11 @@ fn a_turn_report_moves_the_baseline_and_rebuilds_last_turn() {
     let turn = |baseline: &str, agents_present| TurnReport {
         ended: true,
         agents_present,
-        last: herdr_reviewr::turn::LastTurn::At(baseline.into()),
+        last: herdr_reviewr::turn::LastTurn::At(lone_tree(baseline)),
     };
     let landed =
         herdr_reviewr::land_herdr_event(&mut app, HerdrEvent::Turn(turn("cafe", Some(true))));
-    assert_eq!(app.world_input().turn_baseline.as_deref(), Some("cafe"));
+    assert_eq!(app.world_input().turn_baselines, lone_tree("cafe"));
     assert_eq!(app.agents_present(), Some(true));
     assert!(app.pr_pending.is_some(), "a turn's end schedules the PR refetch");
     assert!(landed.rebuild, "a new baseline rebuilds last-turn, paced");
@@ -7737,7 +7750,10 @@ fn enter_picks_the_highlight_and_switches_to_the_commits_scope() {
     press(&mut app, &keymap, KeyCode::Enter);
     assert_eq!(app.mode, Mode::Normal);
     assert_eq!(app.scope, Scope::Commits);
-    assert_eq!(app.commit_pick, Some(herdr_reviewr::model::CommitPick::single(&shas[2])));
+    assert_eq!(
+        app.commit_pick().cloned(),
+        Some(herdr_reviewr::model::CommitPick::single(&shas[2]))
+    );
     assert_eq!(changed_paths(&app), ["two.rs"], "the commit alone, no worktree edit");
     let status = app.pick_status.as_ref().expect("the verdict lands with the changeset");
     assert_eq!(status.verdict, herdr_reviewr::world::PickVerdict::Live);
@@ -7791,7 +7807,7 @@ fn v_anchors_a_run_in_either_direction_and_esc_clears_it_first() {
     assert_eq!(picker(&app).run_len(), 3);
     press(&mut app, &keymap, KeyCode::Enter);
     assert_eq!(app.scope, Scope::Commits);
-    let pick = app.commit_pick.clone().unwrap();
+    let pick = app.commit_pick().cloned().unwrap();
     assert_eq!((pick.oldest.as_str(), pick.newest.as_str()), (shas[1].as_str(), shas[3].as_str()));
     assert_eq!(changed_paths(&app), ["one.rs", "three.rs", "two.rs"]);
     assert_eq!(app.pick_status.as_ref().unwrap().count, 3);
@@ -7815,13 +7831,19 @@ fn a_single_pick_reopens_without_an_anchor_so_k_enter_steps() {
     press(&mut app, &keymap, KeyCode::Char('j'));
     press(&mut app, &keymap, KeyCode::Char('j'));
     press(&mut app, &keymap, KeyCode::Enter);
-    assert_eq!(app.commit_pick, Some(herdr_reviewr::model::CommitPick::single(&shas[1])));
+    assert_eq!(
+        app.commit_pick().cloned(),
+        Some(herdr_reviewr::model::CommitPick::single(&shas[1]))
+    );
     press(&mut app, &keymap, KeyCode::Char('G'));
     assert_eq!(picker(&app).cursor, 2, "the highlight opens on the pick");
     assert!(picker(&app).anchor.is_none(), "a run of one reopens with no anchor");
     press(&mut app, &keymap, KeyCode::Char('k'));
     press(&mut app, &keymap, KeyCode::Enter);
-    assert_eq!(app.commit_pick, Some(herdr_reviewr::model::CommitPick::single(&shas[2])));
+    assert_eq!(
+        app.commit_pick().cloned(),
+        Some(herdr_reviewr::model::CommitPick::single(&shas[2]))
+    );
     assert_eq!(changed_paths(&app), ["two.rs"]);
 }
 
@@ -7886,7 +7908,10 @@ fn an_off_branch_pick_keeps_painting_as_a_row_above_the_list() {
     let keymap = Keymap::default();
     press(&mut app, &keymap, KeyCode::Char('G'));
     press(&mut app, &keymap, KeyCode::Enter);
-    assert_eq!(app.commit_pick, Some(herdr_reviewr::model::CommitPick::single(&shas[3])));
+    assert_eq!(
+        app.commit_pick().cloned(),
+        Some(herdr_reviewr::model::CommitPick::single(&shas[3]))
+    );
     // Rewrite the tip under the pick.
     r.git(&["reset", "-q", "--hard", &shas[2]]);
     r.write("three.rs", "rewritten\n");
@@ -7901,7 +7926,7 @@ fn an_off_branch_pick_keeps_painting_as_a_row_above_the_list() {
 
     press(&mut app, &keymap, KeyCode::Char('G'));
     let cp = picker(&app);
-    assert_eq!(cp.pick_row.as_ref(), app.commit_pick.as_ref(), "the pick is a row above the list");
+    assert_eq!(cp.pick_row.as_ref(), app.commit_pick(), "the pick is a row above the list");
     assert_eq!(cp.cursor, 0);
     assert_eq!(cp.rows.len(), 4);
     assert!(cp.is_pick_row(0));
@@ -7913,9 +7938,16 @@ fn an_off_branch_pick_keeps_painting_as_a_row_above_the_list() {
     press(&mut app, &keymap, KeyCode::Char('k'));
     assert_eq!(picker(&app).run_len(), 1, "the pick row sits outside every run");
     assert!(!picker(&app).in_run(0) && !picker(&app).in_run(1), "so no row wears the bar");
-    assert_eq!(picker(&app).picked(), app.commit_pick, "and enter on the pick row re-picks it");
+    assert_eq!(
+        picker(&app).picked(),
+        app.commit_pick().cloned(),
+        "and enter on the pick row re-picks it"
+    );
     press(&mut app, &keymap, KeyCode::Enter);
-    assert_eq!(app.commit_pick, Some(herdr_reviewr::model::CommitPick::single(&shas[3])));
+    assert_eq!(
+        app.commit_pick().cloned(),
+        Some(herdr_reviewr::model::CommitPick::single(&shas[3]))
+    );
     assert_eq!(app.scope, Scope::Commits);
 
     // A base change marks nothing.
@@ -8084,7 +8116,10 @@ fn a_stale_build_for_a_replaced_pick_is_discarded() {
     press(&mut app, &keymap, KeyCode::Char('G'));
     press(&mut app, &keymap, KeyCode::Char('j'));
     press(&mut app, &keymap, KeyCode::Enter);
-    assert_eq!(app.commit_pick, Some(herdr_reviewr::model::CommitPick::single(&shas[2])));
+    assert_eq!(
+        app.commit_pick().cloned(),
+        Some(herdr_reviewr::model::CommitPick::single(&shas[2]))
+    );
     let landing = herdr_reviewr::land_world_completion(&mut app, stale, &live(3));
     assert!(
         matches!(landing, herdr_reviewr::Landing::Discarded(_)),
@@ -8153,7 +8188,7 @@ fn a_poll_moves_the_pick_between_the_pick_row_and_the_list() {
     press(&mut app, &keymap, KeyCode::Char('j'));
     press(&mut app, &keymap, KeyCode::Enter);
     let run = herdr_reviewr::model::CommitPick { oldest: shas[1].clone(), newest: shas[2].clone() };
-    assert_eq!(app.commit_pick, Some(run.clone()));
+    assert_eq!(app.commit_pick().cloned(), Some(run.clone()));
     // Reset below the run: the picker opens with the pick row above the one listed commit.
     r.git(&["reset", "-q", "--hard", &shas[0]]);
     common::land_world(&mut app);
@@ -8174,11 +8209,11 @@ fn a_poll_moves_the_pick_between_the_pick_row_and_the_list() {
     assert_eq!(picker(&app).pick_row, Some(run));
     assert_eq!(picker(&app).list_row(picker(&app).cursor).unwrap().sha, shas[0]);
     press(&mut app, &keymap, KeyCode::Enter);
-    assert_eq!(app.commit_pick.as_ref().map(|p| p.newest.as_str()), Some(shas[0].as_str()));
+    assert_eq!(app.commit_pick().map(|p| p.newest.as_str()), Some(shas[0].as_str()));
 }
 
 #[test]
-fn a_commit_comment_renders_only_while_the_scope_reads_that_commit() {
+fn a_commit_comment_shows_under_every_pick_that_reads_its_lines() {
     let (r, shas) = commits_repo();
     let mut app = app_on(&r);
     let keymap = Keymap::default();
@@ -8200,7 +8235,7 @@ fn a_commit_comment_renders_only_while_the_scope_reads_that_commit() {
     );
     assert_eq!(app.comment_marks().1.len(), 1, "only the commit comment renders here");
 
-    // Another run is another diff: the comment hides until its pick returns.
+    // Another run that reads its lines shows it too.
     press(&mut app, &keymap, KeyCode::Char('G'));
     press(&mut app, &keymap, KeyCode::Char('k'));
     press(&mut app, &keymap, KeyCode::Char('v'));
@@ -8208,20 +8243,23 @@ fn a_commit_comment_renders_only_while_the_scope_reads_that_commit() {
     press(&mut app, &keymap, KeyCode::Char('j'));
     press(&mut app, &keymap, KeyCode::Enter);
     assert_eq!(
-        app.commit_pick,
+        app.commit_pick().cloned(),
         Some(herdr_reviewr::model::CommitPick { oldest: shas[1].clone(), newest: shas[3].clone() })
     );
     app.select_file(file_row(&app, "two.rs")).unwrap();
-    assert!(app.comment_marks().1.is_empty(), "another run's diff carries no card");
+    assert_eq!(app.comment_marks().1.len(), 1, "the run reads `two`'s line as it was");
     press(&mut app, &keymap, KeyCode::Char('G'));
     press(&mut app, &keymap, KeyCode::Esc);
     press(&mut app, &keymap, KeyCode::Char('j'));
     press(&mut app, &keymap, KeyCode::Enter);
-    assert_eq!(app.commit_pick, Some(herdr_reviewr::model::CommitPick::single(&shas[2])));
+    assert_eq!(
+        app.commit_pick().cloned(),
+        Some(herdr_reviewr::model::CommitPick::single(&shas[2]))
+    );
     app.select_file(file_row(&app, "two.rs")).unwrap();
     assert_eq!(app.comment_marks().1.len(), 1, "its own pick shows the card again");
 
-    // Back on a worktree scope, the worktree comment renders and the commit one hides.
+    // Back on a worktree scope, the worktree comment renders.
     app.set_scope(Scope::Uncommitted).unwrap();
     app.select_file(0).unwrap();
     assert_eq!(app.diff_path.as_deref(), Some("root.rs"));
@@ -8239,13 +8277,156 @@ fn a_commit_comment_renders_only_while_the_scope_reads_that_commit() {
 }
 
 #[test]
+fn a_suggestion_waits_for_g_and_any_pick_answers_it() {
+    use herdr_reviewr::model::{CommitPick, Picks};
+    let (r, shas) = commits_repo();
+    let mut app = app_on(&r);
+    let (scope, open) = (app.scope, app.diff_path.clone());
+    let run = CommitPick { oldest: shas[1].clone(), newest: shas[2].clone() };
+    let picks = Picks::from([(String::new(), run.clone())]);
+    app.receive_suggestion(picks, "the two\nadds", Some("claude".into()));
+    let said = format!("claude suggests {}..{} · G opens them", &shas[1][..7], &shas[2][..7]);
+    assert_eq!(app.status, said);
+    assert_eq!((app.scope, app.diff_path.clone(), app.mode.clone()), (scope, open, Mode::Normal));
+    let bands = app.footer_bands();
+    assert!(bands.contains(&(FooterAction::CommitPick, Band::Send)), "{bands:?}");
+    app.open_commit_picker();
+    let cp = picker(&app);
+    assert_eq!(cp.title, "claude suggests: the two adds");
+    assert_eq!(cp.picked(), Some(run.clone()), "the run is the highlight's");
+    // esc keeps it waiting; a pick, any pick, answers it.
+    app.commit_picker_escape();
+    app.commit_picker_escape();
+    assert_eq!(app.suggestions.len(), 1);
+    app.open_commit_picker();
+    app.commit_picker_escape();
+    app.commit_picker_pick().unwrap();
+    assert_eq!(app.commit_pick().cloned(), Some(CommitPick::single(&shas[2])));
+    assert!(app.suggestions.is_empty());
+    app.open_commit_picker();
+    assert_eq!(picker(&app).title, "commits · last 50");
+}
+
+#[test]
+fn suggestions_wait_in_the_order_sent_and_each_pick_answers_the_first() {
+    use herdr_reviewr::model::{CommitPick, Picks};
+    let (r, shas) = commits_repo();
+    let mut app = app_on(&r);
+    let one = |sha: &str| Picks::from([(String::new(), CommitPick::single(sha))]);
+    app.receive_suggestion(one(&shas[1]), "Step 1: one", Some("claude".into()));
+    app.receive_suggestion(one(&shas[3]), "Step 2: three", Some("claude".into()));
+    let said = format!("claude suggests {} · 2 waiting · G opens the first", &shas[3][..7]);
+    assert_eq!(app.status, said);
+    app.open_commit_picker();
+    assert_eq!(picker(&app).title, "claude suggests (1 of 2): Step 1: one");
+    assert_eq!(picker(&app).picked(), Some(CommitPick::single(&shas[1])));
+    app.commit_picker_pick().unwrap();
+    assert_eq!(app.commit_pick().cloned(), Some(CommitPick::single(&shas[1])));
+    app.open_commit_picker();
+    assert_eq!(picker(&app).title, "claude suggests: Step 2: three");
+    app.commit_picker_pick().unwrap();
+    assert_eq!(app.commit_pick().cloned(), Some(CommitPick::single(&shas[3])));
+    assert!(app.suggestions.is_empty(), "both steps answered");
+}
+
+/// `lib.rs` grows a distinct line in `add`, which `fix` rewrites; the worktree adds a header
+/// above it. The shas root first.
+fn threads_repo() -> (Repo, Vec<String>) {
+    let r = Repo::init();
+    r.write("lib.rs", "fn one() {}\n");
+    r.commit_all("root");
+    r.write("lib.rs", "fn one() {}\nfn total(items: &[u32]) -> u32 { 0 }\n");
+    r.commit_all("add");
+    r.write("lib.rs", "fn one() {}\nfn total(items: &[u32]) -> u32 { items.iter().sum() }\n");
+    r.commit_all("fix");
+    r.write(
+        "lib.rs",
+        "// header\nfn one() {}\nfn total(items: &[u32]) -> u32 { items.iter().sum() }\n",
+    );
+    let shas: Vec<String> =
+        r.git(&["rev-list", "--reverse", "HEAD"]).lines().map(str::to_string).collect();
+    (r, shas)
+}
+
+/// Pick commit `sha` alone and open `lib.rs` on it.
+fn pick_commit(app: &mut App, sha: &str) {
+    app.open_commit_picker();
+    let at = picker(app).index_of(sha).expect("the commit is listed");
+    app.commit_picker_goto(at);
+    app.commit_picker_pick().unwrap();
+    app.select_file(file_row(app, "lib.rs")).unwrap();
+}
+
+/// Comment `text` on the open diff's row reading `line`.
+fn comment_on_line(app: &mut App, line: &str, text: &str) {
+    app.focus = Focus::Diff;
+    app.diff_cursor = app.visible.iter().position(|v| v.text() == line).expect("a row reading it");
+    app.start_comment();
+    for ch in text.chars() {
+        app.input_push(ch);
+    }
+    app.submit_comment();
+}
+
+/// The open view's cards: each comment's text and where its card sits.
+fn cards(app: &App) -> Vec<(String, herdr_reviewr::app::CardPlace)> {
+    let text = |ci: usize| app.store.get(ci).unwrap().text.clone();
+    app.card_rows().iter().map(|&(_, ci)| (text(ci), app.card_place(ci).unwrap())).collect()
+}
+
+#[test]
+fn a_comment_shows_in_every_view_that_reads_its_lines() {
+    use herdr_reviewr::app::CardPlace;
+    let (r, shas) = threads_repo();
+    let mut app = app_on(&r);
+    let short = |sha: &str| sha[..7].to_string();
+    let at = |side, line, native, from: Option<String>| CardPlace {
+        side,
+        start: line,
+        end: line,
+        native,
+        from,
+    };
+    pick_commit(&mut app, &shas[1]);
+    comment_on_line(&mut app, "fn total(items: &[u32]) -> u32 { 0 }", "why zero?");
+    assert_eq!(cards(&app), [("why zero?".into(), at(Side::New, 2, true, None))]);
+    // `fix` rewrote the line: the card sits on it as it was, naming the commit it was made on.
+    pick_commit(&mut app, &shas[2]);
+    let from_add = Some(short(&shas[1]));
+    assert_eq!(cards(&app), [("why zero?".into(), at(Side::Old, 2, false, from_add))]);
+    // The worktree reads it nowhere: the diff shows no card, the list keeps the comment.
+    app.set_scope(Scope::Uncommitted).unwrap();
+    app.select_file(file_row(&app, "lib.rs")).unwrap();
+    assert!(cards(&app).is_empty());
+    comment_on_line(
+        &mut app,
+        "fn total(items: &[u32]) -> u32 { items.iter().sum() }",
+        "sum is fine",
+    );
+    assert_eq!(app.store.get(1).unwrap().start, 3);
+    // `fix` reads the worktree's line one line up.
+    pick_commit(&mut app, &shas[2]);
+    let worktree = Some("the worktree".to_string());
+    assert!(cards(&app).contains(&("sum is fine".into(), at(Side::New, 2, false, worktree))));
+    pick_commit(&mut app, &shas[1]);
+    assert!(!cards(&app).iter().any(|(text, _)| text == "sum is fine"), "`add` never read it");
+    // Neither moved: each still sits where it was made, and the send names the commit.
+    let location = app.store.get(0).unwrap().location();
+    assert_eq!(location, format!("lib.rs:2 (in commit {})", short(&shas[1])));
+    assert_eq!(app.store.get(1).unwrap().location(), "lib.rs:3");
+}
+
+#[test]
 fn all_files_marks_the_run_and_lists_the_worktree() {
     let (r, shas) = commits_repo();
     let mut app = app_on(&r);
     let keymap = Keymap::default();
     press(&mut app, &keymap, KeyCode::Char('G'));
     press(&mut app, &keymap, KeyCode::Enter);
-    assert_eq!(app.commit_pick, Some(herdr_reviewr::model::CommitPick::single(&shas[3])));
+    assert_eq!(
+        app.commit_pick().cloned(),
+        Some(herdr_reviewr::model::CommitPick::single(&shas[3]))
+    );
     enter_tab(&mut app, herdr_reviewr::app::Tab::AllFiles);
     let marked: Vec<&str> =
         app.entries.iter().filter(|e| e.annotation.is_some()).map(|e| e.path.as_str()).collect();
@@ -10140,7 +10321,7 @@ fn the_diff_agrees_with_git_diff_under_any_line_ending_rule() {
         // `last-turn` reads the baseline against its changeset's snapshot.
         enter_tab(&mut app, herdr_reviewr::app::Tab::Changes);
         app.sync_turn(herdr_reviewr::turn::TurnReport {
-            last: herdr_reviewr::turn::LastTurn::At(baseline),
+            last: herdr_reviewr::turn::LastTurn::At(lone_tree(&baseline)),
             ..Default::default()
         });
         app.set_scope(Scope::LastTurn).unwrap();
@@ -10191,7 +10372,7 @@ fn a_last_turn_diff_of_an_untracked_file_shows_the_turns_edit() {
 
     let mut app = app_on(&r);
     app.sync_turn(herdr_reviewr::turn::TurnReport {
-        last: herdr_reviewr::turn::LastTurn::At(baseline),
+        last: herdr_reviewr::turn::LastTurn::At(lone_tree(&baseline)),
         ..Default::default()
     });
     app.set_scope(Scope::LastTurn).unwrap();
@@ -10212,7 +10393,7 @@ fn a_file_diff_reads_the_trees_its_counts_came_from() {
     r.write("b.txt", "two\n");
     let mut app = app_on(&r);
     app.sync_turn(herdr_reviewr::turn::TurnReport {
-        last: herdr_reviewr::turn::LastTurn::At(first),
+        last: herdr_reviewr::turn::LastTurn::At(lone_tree(&first)),
         ..Default::default()
     });
     app.set_scope(Scope::LastTurn).unwrap();
@@ -10221,7 +10402,7 @@ fn a_file_diff_reads_the_trees_its_counts_came_from() {
     r.write("b.txt", "three\n");
     let second = herdr_reviewr::git::snapshot_worktree(r.path()).unwrap();
     app.sync_turn(herdr_reviewr::turn::TurnReport {
-        last: herdr_reviewr::turn::LastTurn::At(second),
+        last: herdr_reviewr::turn::LastTurn::At(lone_tree(&second)),
         ..Default::default()
     });
     app.select_file(1).unwrap();
@@ -12259,4 +12440,9 @@ fn an_agents_comment_on_an_unchanged_file_reads_with_its_content() {
     assert!(
         app.store.thread(0).is_some_and(|t| t.opener != herdr_reviewr::model::Author::Reviewer)
     );
+}
+
+/// A lone repository's turn baseline, as turn tracking reports it.
+fn lone_tree(tree: &str) -> herdr_reviewr::turn::Trees {
+    herdr_reviewr::turn::Trees::from([(String::new(), tree.to_string())])
 }

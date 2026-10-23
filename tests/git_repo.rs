@@ -48,9 +48,11 @@ fn world_input(repo: &Path, scope: Scope, base: Option<&str>, turn: Option<&str>
         base: base.map(str::to_string),
         default_base: Vec::new(),
         base_epoch: 0,
-        turn_baseline: turn.map(str::to_string),
+        turn_baselines: turn
+            .map(|tree| std::collections::BTreeMap::from([(String::new(), tree.to_string())]))
+            .unwrap_or_default(),
         send_baselines: std::collections::BTreeMap::new(),
-        commit_pick: None,
+        commit_picks: std::collections::BTreeMap::new(),
         toggled_dirs: std::collections::HashSet::default(),
     }
 }

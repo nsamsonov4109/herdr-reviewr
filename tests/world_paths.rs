@@ -3,7 +3,7 @@
 
 mod common;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc;
 
 use common::Repo;
@@ -144,7 +144,7 @@ fn input_for(r: &Repo, scope: Scope, tab: Tab) -> WorldInput {
     input.tab = tab;
     if scope == Scope::Commits {
         let head = r.git(&["rev-parse", "HEAD"]).trim().to_string();
-        input.commit_pick = Some(CommitPick::single(&head));
+        input.commit_picks = BTreeMap::from([(String::new(), CommitPick::single(&head))]);
     }
     input
 }

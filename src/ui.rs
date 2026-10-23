@@ -22,7 +22,7 @@ use crate::git;
 use crate::herdr::AgentChoice;
 use crate::keymap::Keymap;
 use crate::model::Side;
-use crate::model::{Author, ChangeKind, ChangedFile, Comment, CommentStore};
+use crate::model::{Author, ChangeKind, ChangedFile, CommentStore, CommitPick};
 use crate::roles::Palette;
 use crate::roles::{Fill, Ink};
 use crate::snippet::{snippet_caption_sign, snippet_row_is_comment};
@@ -346,7 +346,7 @@ pub fn diff_row_heights(app: &App, area: Rect) -> Vec<usize> {
             let card: usize = cards
                 .iter()
                 .filter(|&&(row, ci)| row == i && Some(ci) != editing)
-                .map(|&(_, ci)| comment_card_lines(&app.store, ci, width, p).len())
+                .map(|&(_, ci)| comment_card_lines(app, ci, width, p).len())
                 .sum();
             base + card
         })
@@ -398,7 +398,7 @@ fn read_layout(app: &App, inner: Rect, cards: &[(usize, usize)]) -> Vec<Slot> {
         for &(_, ci) in cards.iter().filter(|&&(row, _)| row == i) {
             if Some(ci) != editing {
                 out.extend(
-                    (0..comment_card_lines(&app.store, ci, width, p).len())
+                    (0..comment_card_lines(app, ci, width, p).len())
                         .map(|line| Slot::Card { comment: ci, line }),
                 );
             }
@@ -958,14 +958,14 @@ fn tidy(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// Where a comment sits in its file, which its card's diff already names.
-fn line_ref(c: &Comment) -> String {
-    let lines = if c.start == c.end {
-        format!("line {}", c.start)
+/// Where a card sits in the view, which its diff already names.
+fn line_ref(place: &crate::app::CardPlace) -> String {
+    let lines = if place.start == place.end {
+        format!("line {}", place.start)
     } else {
-        format!("lines {}–{}", c.start, c.end)
+        format!("lines {}–{}", place.start, place.end)
     };
-    match c.side {
+    match place.side {
         Side::Old => format!("{lines}, removed"),
         Side::New => lines,
     }
@@ -1517,25 +1517,36 @@ fn folder_base_label(app: &App) -> (String, String, String, String) {
 /// The pick label: `1a2b3c4 <subject>` or `896626a..a49ed7b (N)`, plus any verdict.
 fn pick_label(app: &App) -> Option<(String, String, String, String)> {
     use crate::world::PickVerdict;
-    let pick = app.commit_pick.as_ref()?;
+    let pick = app.commit_pick()?;
     let status = app.pick_status.as_ref();
     // Only a `commits` build carries a current verdict.
     let verdict = status.map(|s| &s.verdict).filter(|_| app.scope == crate::model::Scope::Commits);
     let gone = app.pick_gone();
-    let tail = match verdict {
+    let mut tail = match verdict {
         Some(PickVerdict::OffBranch) => " · off branch".to_string(),
         Some(PickVerdict::Gone(_)) => " · gone".to_string(),
         Some(PickVerdict::Live) | None => String::new(),
     };
-    let shown = if pick.is_single() {
-        git::abbreviate_oid(&pick.newest)
-    } else {
-        format!("{}..{}", git::abbreviate_oid(&pick.oldest), git::abbreviate_oid(&pick.newest))
-    };
-    let marker = match status {
-        Some(s) if pick.is_single() && !s.subject.is_empty() => format!(" {}", s.subject),
-        _ if pick.is_single() || gone => String::new(),
-        _ => format!(" ({})", status.map_or(0, |s| s.count)),
+    let single = app.commit_picks.values().all(CommitPick::is_single);
+    let subject = status.map(|s| s.subject.as_str()).filter(|s| single && !s.is_empty());
+    // A step across a folder's repositories counts its commits, its subject when they share one.
+    let repos = app.commit_picks.len();
+    if app.repos().is_folder() && repos > 1 {
+        let shown = match status {
+            Some(s) => format!("{} commits in {repos} repos", s.count),
+            None => format!("commits in {repos} repos"),
+        };
+        let marker = subject.map(|s| format!(" · {s}")).unwrap_or_default();
+        return Some((String::new(), shown, marker, tail));
+    }
+    if let Some(repo) = app.commit_picks.keys().next().filter(|_| app.repos().is_folder()) {
+        tail = format!(" · {repo}{tail}");
+    }
+    let shown = pick.label();
+    let marker = match subject {
+        Some(s) => format!(" {s}"),
+        None if single || gone => String::new(),
+        None => format!(" ({})", status.map_or(0, |s| s.count)),
     };
     Some((String::new(), shown, marker, tail))
 }
@@ -1920,14 +1931,10 @@ fn elide_head(name: &str, max: usize) -> String {
 }
 
 /// A saved comment's inline card: a box titled with its number and location, holding its thread.
-fn comment_card_lines(
-    store: &CommentStore,
-    ci: usize,
-    width: usize,
-    p: &Palette,
-) -> Vec<Line<'static>> {
+fn comment_card_lines(app: &App, ci: usize, width: usize, p: &Palette) -> Vec<Line<'static>> {
     const INDENT: usize = CARD_INDENT;
-    let Some(c) = store.get(ci) else { return Vec::new() };
+    let store = &app.store;
+    let Some(place) = app.card_place(ci) else { return Vec::new() };
     let box_w = card_box_width(width);
     let text_w = box_w.saturating_sub(4).max(1); // inside "┃ " … " │"
     let ink = |ink: Ink| Style::default().fg(p.ink(ink, Fill::Base));
@@ -1938,8 +1945,14 @@ fn comment_card_lines(
     let number = format!(" #{}", store.number(ci).unwrap_or_default());
     let (state, state_ink) = card_state(store, ci);
     let room = box_w.saturating_sub(4);
-    let mut place = format!(" · {} ", line_ref(c));
-    let mut changed = if store.changed(ci) { CODE_CHANGED_NOTE.to_string() } else { String::new() };
+    let mut changed = match &place.from {
+        // Shown from another version, where its lines read as they did.
+        Some(from) => format!("· from {from} "),
+        None if place.native && store.changed(ci) => CODE_CHANGED_NOTE.to_string(),
+        None => String::new(),
+    };
+    let changed_ink = if place.from.is_some() { Ink::TextMuted } else { Ink::Warning };
+    let mut place = format!(" · {} ", line_ref(&place));
     let mut badge = format!(" {state} ");
     if number.width() + place.width() + changed.width() + badge.width() > room {
         changed.clear();
@@ -1955,7 +1968,7 @@ fn comment_card_lines(
         Span::styled("╭─", border),
         Span::styled(number, ink(Ink::Comment).add_modifier(Modifier::BOLD)),
         Span::styled(place, ink(Ink::TextSecondary)),
-        Span::styled(changed, ink(Ink::Warning)),
+        Span::styled(changed, ink(changed_ink)),
         Span::styled("─".repeat(fill), border),
         Span::styled(badge, ink(state_ink)),
         Span::styled("─╮", border),
@@ -2130,7 +2143,7 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
             }
             Slot::Card { comment, line } => {
                 if card_cache.as_ref().is_none_or(|(c, _)| *c != comment) {
-                    let lines = comment_card_lines(&app.store, comment, width, p);
+                    let lines = comment_card_lines(app, comment, width, p);
                     card_cache = Some((comment, lines));
                 }
                 card_cache.as_ref().and_then(|(_, l)| l.get(line).cloned()).unwrap_or_default()
@@ -3064,7 +3077,16 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
     let (k, l): (String, &str) = match action {
         A::Comment => (hint(K::Comment), "comment"),
         // One word for one gesture: `v` marks a range end in the diff and the commit picker alike.
-        A::Select | A::CommitAnchor => (hint(K::Select), "select"),
+        A::Select => (hint(K::Select), "select"),
+        A::CommitAnchor => {
+            // A folder's selection grows and shrinks one row at a time once made.
+            let label = match app.commit_picker.as_ref() {
+                Some(cp) if cp.is_folder() && cp.checked.contains(&cp.cursor) => "drop",
+                Some(cp) if cp.is_folder() && !cp.checked.is_empty() => "add",
+                _ => "select",
+            };
+            (hint(K::Select), label)
+        }
         A::ClearSelection => ("esc".into(), "clear"),
         A::EditComment => (hint(K::Edit), "edit"),
         A::EditFile => (hint(K::Edit), "edit file"),
@@ -3119,6 +3141,10 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         // The digits are literal; the movement keys are bound.
         A::MovePickerRow => (format!("1-9 {} {}", hint(K::Down), hint(K::Up)), "move"),
         A::BasePick => (hint(K::BasePick), "base"),
+        A::CommitPick if app.suggestions.len() > 1 => {
+            return (hint(K::CommitPick), format!("{} suggested steps", app.suggestions.len()));
+        }
+        A::CommitPick if !app.suggestions.is_empty() => (hint(K::CommitPick), "suggested commits"),
         A::CommitPick => (hint(K::CommitPick), "commits"),
         A::PickCommitRun => {
             let n = app.commit_picker.as_ref().map_or(0, crate::app::CommitPicker::run_len);
@@ -3126,7 +3152,10 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         }
         A::MoveCommitRow => (format!("{} {}", hint(K::Down), hint(K::Up)), "move"),
         A::CloseCommitPicker => {
-            let anchored = app.commit_picker.as_ref().is_some_and(|cp| cp.anchor.is_some());
+            let anchored = app
+                .commit_picker
+                .as_ref()
+                .is_some_and(|cp| cp.anchor.is_some() || !cp.checked.is_empty());
             ("esc".into(), if anchored { "clear" } else { "cancel" })
         }
         A::ScopeOther => {
@@ -3264,12 +3293,13 @@ fn footer_row1(app: &App, w: usize) -> (Vec<Span<'static>>, Vec<FooterAction>) {
     let primary = bands.iter().find(|&&(_, b)| b == Band::Primary).map(|&(a, _)| a);
     let do_acts: Vec<FooterAction> =
         bands.iter().filter(|&&(_, b)| b == Band::Do).map(|&(a, _)| a).collect();
-    let send = bands.iter().find(|&&(_, b)| b == Band::Send).map(|&(a, _)| a);
+    let sends: Vec<FooterAction> =
+        bands.iter().filter(|&&(_, b)| b == Band::Send).map(|&(a, _)| a).collect();
     let show_more = app.footer_open_ended();
     let reserve = if show_more { 2 } else { 0 }; // a gap plus the `?`
 
-    // `send` and `?` never drop, so their width is reserved first.
-    let send_w = send.map_or(0, |a| entry_width(app, a));
+    // What the agent waits on or sent back, and `?`, never drop, so their width is reserved first.
+    let send_w: usize = sends.iter().map(|&a| entry_width(app, a)).sum();
     let tail = send_w + reserve;
 
     // Open, row 1 joins the labeled grid, if the `do` gutter leaves room for what never drops.
@@ -3353,9 +3383,9 @@ fn footer_row1(app: &App, w: usize) -> (Vec<Span<'static>>, Vec<FooterAction>) {
         spans.extend(action_entry(app, a, Band::Do));
     }
 
-    // `send` closes the actions and never drops.
-    if let Some(a) = send {
-        used += send_w;
+    // `send`, new answers and suggested commits close the actions and never drop.
+    used += send_w;
+    for a in sends {
         spans.push(Span::styled(SEP, Style::default().fg(p.mark(Ink::Border, Fill::Bar))));
         spans.extend(action_entry(app, a, Band::Send));
     }
@@ -3816,12 +3846,13 @@ pub fn hit_base_picker_row(area: Rect, app: &App, col: u16, row: u16) -> Option<
 
 // --- Commit picker -------------------------------------------
 
-/// The bar column, the sha, two spaces, the subject, two spaces, the age.
+/// The bar column, a folder's repository, the sha, two spaces, the subject, two spaces, the age.
 const COMMIT_SHA_W: usize = 7;
 const COMMIT_AGE_W: usize = 3;
 
 /// One commit row's parts; the trail joins `✎ N`, `merge`, and one ref.
 struct CommitRowParts {
+    repo: String,
     sha: String,
     subject: String,
     trail: String,
@@ -3843,6 +3874,7 @@ fn commit_row_parts(app: &App, cp: &crate::app::CommitPicker) -> Vec<CommitRowPa
             if cp.is_pick_row(i) {
                 let (_, shown, marker, tail) = pick_label(app).unwrap_or_default();
                 return CommitRowParts {
+                    repo: String::new(),
                     sha: shown,
                     subject: format!("{}{tail}", marker.trim_start()),
                     trail: String::new(),
@@ -3860,6 +3892,7 @@ fn commit_row_parts(app: &App, cp: &crate::app::CommitPicker) -> Vec<CommitRowPa
             }
             trail.extend(commit_ref(app, row));
             CommitRowParts {
+                repo: cp.repo_of(i).to_string(),
                 sha: git::abbreviate_oid(&row.sha),
                 subject: row.subject.clone(),
                 trail: trail.join(" · "),
@@ -3893,19 +3926,29 @@ fn commit_author_width(parts: &[CommitRowParts]) -> usize {
     parts.iter().map(|p| p.author.width()).max().unwrap_or(0).min(CAP)
 }
 
+/// A folder's repository column with its gap: the widest name, capped; none for one repository.
+fn commit_repo_width(parts: &[CommitRowParts]) -> usize {
+    const CAP: usize = 24;
+    match parts.iter().map(|p| p.repo.width()).max().unwrap_or(0).min(CAP) {
+        0 => 0,
+        w => w + 2,
+    }
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 fn commit_picker_popup(area: Rect, app: &App, parts: &[CommitRowParts]) -> Rect {
     let Some(cp) = &app.commit_picker else { return Rect::default() };
-    let author_w = commit_author_width(parts);
+    let (author_w, repo_w) = (commit_author_width(parts), commit_repo_width(parts));
     let widest = parts
         .iter()
         .map(|p| {
             let trail_w = if p.trail.is_empty() { 0 } else { 2 + p.trail.width() };
-            // bar + sha + gap + subject + trail + gap + author + gap + age
-            2 + p.sha.width().max(COMMIT_SHA_W)
+            // bar + repo + sha + gap + subject + trail + gap + author + gap + age
+            2 + repo_w
+                + p.sha.width().max(COMMIT_SHA_W)
                 + 2
                 + p.subject.width()
                 + trail_w
@@ -3958,14 +4001,18 @@ fn render_commit_picker(frame: &mut Frame, app: &App, area: Rect) {
     let rows = commit_picker_rows(cp, inner.height as usize);
     let first = commit_picker_scroll(cp, inner.height as usize);
     let last = cp.len().min(first + rows);
-    let author_w = commit_author_width(&parts);
+    let (author_w, repo_w) = (commit_author_width(&parts), commit_repo_width(&parts));
+    // A folder's bar marks what enter opens, muted while that is only the highlight's step.
+    let opened = cp.opened();
+    let bar_ink =
+        if cp.is_folder() && cp.checked.is_empty() { Ink::TextMuted } else { Ink::Accent };
     let mut items: Vec<ListItem> = (first..last)
         .map(|i| {
             let on = cursor_fill(i == cp.cursor);
-            let CommitRowParts { sha, subject, trail, author, age } = &parts[i];
+            let CommitRowParts { repo, sha, subject, trail, author, age } = &parts[i];
             // The bar marks the run, the way the diff's selection bar marks a line range.
-            let bar = if cp.in_run(i) { "▎" } else { " " };
-            let fixed = 2 + COMMIT_SHA_W + 2 + 2 + author_w + 2 + COMMIT_AGE_W;
+            let bar = if cp.in_run(i) || opened.contains(&i) { "▎" } else { " " };
+            let fixed = 2 + repo_w + COMMIT_SHA_W + 2 + 2 + author_w + 2 + COMMIT_AGE_W;
             // The subject clips first; the trail takes only what it leaves.
             let subject = truncate_width(subject, width.saturating_sub(fixed));
             let room = width.saturating_sub(fixed + subject.width());
@@ -3979,8 +4026,16 @@ fn render_commit_picker(frame: &mut Frame, app: &App, area: Rect) {
             let pad = width.saturating_sub(fixed + subject.width() + trail.width())
                 + 2
                 + author_w.saturating_sub(author.width());
+            let repo = match repo_w {
+                0 => String::new(),
+                w => {
+                    let shown = truncate_width(repo, w - 2);
+                    format!("{shown}{}", " ".repeat(w - shown.width()))
+                }
+            };
             let spans = vec![
-                Span::styled(format!("{bar} "), Style::default().fg(p.mark(Ink::Accent, on))),
+                Span::styled(format!("{bar} "), Style::default().fg(p.mark(bar_ink, on))),
+                Span::styled(repo, Style::default().fg(p.ink(Ink::TextSecondary, on))),
                 Span::styled(
                     format!("{sha:<COMMIT_SHA_W$}  "),
                     Style::default().fg(p.ink(Ink::TextSecondary, on)),

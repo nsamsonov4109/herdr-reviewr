@@ -1,6 +1,6 @@
 //! The terminal-free review state and its transitions.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -18,7 +18,7 @@ use crate::highlight::Highlighter;
 use crate::logln;
 use crate::marks::{MarkMap, Unit, diff_lines};
 use crate::model::{
-    Author, ChangeKind, ChangedFile, Comment, CommentStore, CommitPick, Rev, Scope, Side,
+    Author, ChangeKind, ChangedFile, Comment, CommentStore, CommitPick, Picks, Rev, Scope, Side,
 };
 use crate::rendered::{Built, Content, OldMap, RenderedIndex, RenderedInput, RenderedView, RowId};
 use crate::roles::Palette;
@@ -238,6 +238,12 @@ pub struct CommitPicker {
     pub empty: String,
     /// The `HEAD` the rows were listed under: a refresh re-lists only once it moves.
     pub head: Option<String>,
+    /// Each row's repository, beside `rows`, in a folder; empty for a lone repository.
+    pub repos: Vec<String>,
+    /// A folder's selected rows, by index into `rows`: `v` adds or drops one.
+    pub checked: BTreeSet<usize>,
+    /// Opened on an agent's suggestion, whose reason is the title.
+    pub suggested: bool,
 }
 
 impl CommitPicker {
@@ -285,6 +291,9 @@ impl CommitPicker {
         if self.is_empty() {
             return 0;
         }
+        if self.is_folder() {
+            return self.opened().len();
+        }
         let (top, bottom) = self.run();
         bottom - top + 1
     }
@@ -296,6 +305,78 @@ impl CommitPicker {
         }
         let (top, bottom) = self.run();
         (top..=bottom).contains(&i)
+    }
+
+    /// Whether the rows come from a folder's repositories.
+    pub fn is_folder(&self) -> bool {
+        !self.repos.is_empty()
+    }
+
+    /// The repository of list row `i`, `""` for a lone repository.
+    pub fn repo_of(&self, i: usize) -> &str {
+        self.repos.get(i).map_or("", String::as_str)
+    }
+
+    /// What `enter` picks, by repository: a lone repository's run, a folder's chosen rows' ends.
+    pub fn picks(&self) -> Picks {
+        if !self.is_folder() {
+            return self.picked().map(|p| Picks::from([(String::new(), p)])).unwrap_or_default();
+        }
+        let pick = |(n, o): (usize, usize)| CommitPick {
+            oldest: self.rows[o].sha.clone(),
+            newest: self.rows[n].sha.clone(),
+        };
+        self.ends().into_iter().map(|(repo, ends)| (repo.to_string(), pick(ends))).collect()
+    }
+
+    /// The folder rows `enter` opens: each repository's chosen rows and those between them.
+    pub fn opened(&self) -> BTreeSet<usize> {
+        let ends = self.ends();
+        (0..self.rows.len())
+            .filter(|&i| ends.get(self.repo_of(i)).is_some_and(|&(n, o)| (n..=o).contains(&i)))
+            .collect()
+    }
+
+    /// Each repository's newest and oldest chosen row: the selection, else the highlight's step.
+    fn ends(&self) -> BTreeMap<&str, (usize, usize)> {
+        if !self.is_folder() {
+            return BTreeMap::new();
+        }
+        let chosen = if self.checked.is_empty() { self.namesakes() } else { self.checked.clone() };
+        let mut ends: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+        // Rows run newest first, so a repository's first chosen row is its newest.
+        for i in chosen {
+            ends.entry(self.repo_of(i)).and_modify(|e| e.1 = i).or_insert((i, i));
+        }
+        ends
+    }
+
+    /// Whether folder row `i` lies in `pick`'s run in its repository, newest to oldest.
+    fn runs_through(&self, i: usize, pick: &CommitPick) -> bool {
+        let repo = self.repo_of(i);
+        let at = |sha: &str| {
+            (0..self.rows.len()).find(|&j| self.rows[j].sha == sha && self.repo_of(j) == repo)
+        };
+        match (at(&pick.newest), at(&pick.oldest)) {
+            (Some(n), Some(o)) => (n..=o).contains(&i),
+            _ => pick.newest == self.rows[i].sha,
+        }
+    }
+
+    /// The highlight and each other repository's newest row of its subject: one step across them.
+    pub fn namesakes(&self) -> BTreeSet<usize> {
+        let Some(row) = self.rows.get(self.cursor) else { return BTreeSet::new() };
+        let here = self.repo_of(self.cursor);
+        let mut seen: BTreeSet<&str> = BTreeSet::from([here]);
+        let mut rows = BTreeSet::from([self.cursor]);
+        for (i, other) in self.rows.iter().enumerate() {
+            let repo = self.repo_of(i);
+            if other.subject == row.subject && !seen.contains(repo) {
+                seen.insert(repo);
+                rows.insert(i);
+            }
+        }
+        rows
     }
 
     /// The pick `enter` makes: the pick row itself, else the run's ends.
@@ -606,16 +687,35 @@ struct LastClick {
     surface: crate::selection::Surface,
 }
 
-/// Why the `commits` scope will not open over a folder of repositories.
-const FOLDER_COMMITS: &str = "commits need one repo, not a folder of them";
+/// Commits an agent suggests the reviewer look at: one run per repository, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Suggestion {
+    pub picks: Picks,
+    pub why: String,
+    pub agent: String,
+}
 
-/// The full state of the review session.
+/// Where a comment's card sits in the open view, and what its title says of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CardPlace {
+    pub side: Side,
+    pub start: u32,
+    pub end: u32,
+    /// Made in this view, where it follows its lines: only here can they change under it.
+    pub native: bool,
+    /// What it was made on, when this view shows another: `1a2b3c4`, `the worktree`.
+    pub from: Option<String>,
+}
+
 /// A viewed file's mark: still as viewed, or changed since.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewedMark {
     Viewed,
     Changed,
 }
+
+/// The side and the first and last line a comment's card sits under.
+type Span = (Side, u32, u32);
 
 /// A file's two sides as the open view read them.
 #[derive(Clone, Debug, Default)]
@@ -624,6 +724,7 @@ struct OpenText {
     new: std::sync::Arc<str>,
 }
 
+/// The full state of the review session.
 // The bools are independent toggles, not a hidden state machine.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
@@ -637,7 +738,9 @@ pub struct App {
     /// A folder's `branch` bases by repository, from the latest landed snapshot.
     pub repo_bases: std::collections::BTreeMap<String, git::BaseStatus>,
     /// The `commits` scope's pick, in memory, replaced but never cleared.
-    pub commit_pick: Option<CommitPick>,
+    pub commit_picks: Picks,
+    /// Commits agents suggested, oldest first: the commit picker opens on the first until a pick.
+    pub suggestions: std::collections::VecDeque<Suggestion>,
     /// The pick's verdict and subject from the latest `commits` build.
     pub pick_status: Option<PickStatus>,
     /// The commit picker's rows, highlight, and anchor while `Mode::CommitPick` is open
@@ -739,6 +842,8 @@ pub struct App {
     view_reload_held: bool,
     /// The open file's two sides as read: the text a new comment's lines count in.
     open_text: OpenText,
+    /// Where the open view shows the comments made in other views, by id: their lines found here.
+    placed: HashMap<u64, Span>,
     /// The files marked viewed, each with what its bytes hashed to then (`None`: no file).
     viewed: HashMap<String, Option<u64>>,
     /// What each viewed file's bytes hash to as last read.
@@ -895,7 +1000,9 @@ impl App {
     fn build(repo: PathBuf, scope: Scope, base: Option<String>, load_turn: bool) -> Self {
         // Mirror the persisted baseline; the herdr connection owns the tracker.
         let baseline = load_turn.then(|| crate::git::read_baseline_ref(&repo)).flatten();
-        let last_turn = baseline.map_or(crate::turn::LastTurn::Waiting, crate::turn::LastTurn::At);
+        let last_turn = baseline.map_or(crate::turn::LastTurn::Waiting, |tree| {
+            crate::turn::LastTurn::At(crate::turn::Trees::from([(String::new(), tree)]))
+        });
         let theme = theme::resolve(None);
         Self {
             repo,
@@ -903,7 +1010,8 @@ impl App {
             base,
             branch_base: git::BaseStatus::default(),
             repo_bases: std::collections::BTreeMap::new(),
-            commit_pick: None,
+            commit_picks: Picks::new(),
+            suggestions: std::collections::VecDeque::new(),
             pick_status: None,
             commit_picker: None,
             base_epoch: 0,
@@ -957,6 +1065,7 @@ impl App {
             last_click: None,
             view_reload_held: false,
             open_text: OpenText::default(),
+            placed: HashMap::new(),
             viewed: HashMap::new(),
             viewed_now: HashMap::new(),
             select_anchor: None,
@@ -1126,7 +1235,8 @@ impl App {
         self.send_round = old.send_round;
         self.scope_before_send = old.scope_before_send.take();
         // The commit pick is session memory like the comments: replaced, never cleared
-        self.commit_pick = old.commit_pick.take();
+        self.commit_picks = std::mem::take(&mut old.commit_picks);
+        self.suggestions = std::mem::take(&mut old.suggestions);
         self.navigator_side_pct = old.navigator_side_pct;
         self.navigator_stack_pct = old.navigator_stack_pct;
         self.navigator_hidden = old.navigator_hidden;
@@ -1324,9 +1434,9 @@ impl App {
             base: self.base.clone(),
             default_base: self.default_base().to_vec(),
             base_epoch: self.base_epoch,
-            turn_baseline: self.herdr.last_turn.tree().map(str::to_string),
+            turn_baselines: self.herdr.last_turn.trees().cloned().unwrap_or_default(),
             send_baselines: self.send_baselines.clone(),
-            commit_pick: self.commit_pick.clone(),
+            commit_picks: self.commit_picks.clone(),
             // `Changes` never reads the toggled set, so a toggle there invalidates nothing.
             toggled_dirs: if self.tab == Tab::AllFiles {
                 self.toggled_dirs.clone()
@@ -1429,6 +1539,7 @@ impl App {
     fn clear_open_view(&mut self) {
         self.diff = FileDiff::empty();
         self.diff_path = None;
+        self.placed.clear();
         self.rendered.clear();
         self.visible.clear();
         self.drop_read_marks();
@@ -1479,6 +1590,7 @@ impl App {
             }
         };
         self.open_text = OpenText { old: old.as_str().into(), new: new.as_str().into() };
+        self.place_foreign();
         // The new side is the render input, the old side the marks' base; a notice holds none.
         let renders = self.markdown_file() && self.diff.notice.is_none();
         self.rendered.content = if renders { self.content(new, Some(old)) } else { None };
@@ -1505,6 +1617,8 @@ impl App {
         let renders = self.markdown_file() && diff.notice.is_none();
         self.rendered.content = if renders { self.content(content, None) } else { None };
         self.diff = diff;
+        // Which comments are this view's own reads the view just set.
+        self.place_foreign();
         self.rebuild_visible();
         self.settle_read();
     }
@@ -1710,14 +1824,10 @@ impl App {
         } else {
             Vec::new()
         };
-        if let Some(file) = self.diff_path.as_deref() {
-            for c in self.store.iter().filter(|c| c.file == file && self.comment_in_view(c)) {
-                match c.side {
-                    Side::New => spots.push((c.start, c.end)),
-                    Side::Old => {
-                        spots.extend(crate::marks::old_range_spots(&lines, c.start, c.end));
-                    }
-                }
+        for (side, start, end) in (0..self.store.len()).filter_map(|i| self.view_span(i)) {
+            match side {
+                Side::New => spots.push((start, end)),
+                Side::Old => spots.extend(crate::marks::old_range_spots(&lines, start, end)),
             }
         }
         crate::marks::open_details(disclosures, &self.rendered.details, &spots)
@@ -1936,7 +2046,7 @@ impl App {
         let Some(file) = self.changeset.files.get(path) else { return };
         let has_old = !matches!(file.kind, ChangeKind::Added | ChangeKind::Untracked);
         let has_new = file.kind != ChangeKind::Deleted;
-        let rev = self.current_rev();
+        let rev = self.rev_of(path);
         if has_new {
             self.store.follow(|c| c.file == path && c.side == Side::New && c.rev == rev, new);
         }
@@ -1945,6 +2055,30 @@ impl App {
                 c.file == path && c.side == Side::Old && c.diff_anchored && c.rev == rev
             };
             self.store.follow(ours, old);
+        }
+    }
+
+    /// Find where the open view reads each other view's comment, its own side first, moving none.
+    fn place_foreign(&mut self) {
+        self.placed.clear();
+        let Some(file) = self.diff_path.as_deref() else { return };
+        let new = crate::anchor::lines(&self.open_text.new);
+        let old = crate::anchor::lines(&self.open_text.old);
+        for (i, c) in self.store.iter().enumerate() {
+            if c.file != file || self.comment_in_view(c) {
+                continue;
+            }
+            let held = self.store.held(i);
+            let sides = match c.side {
+                Side::New => [(Side::New, &new), (Side::Old, &old)],
+                Side::Old => [(Side::Old, &old), (Side::New, &new)],
+            };
+            let found = sides.into_iter().find_map(|(side, text)| {
+                crate::anchor::locate(held, c.start, text).map(|(start, end)| (side, start, end))
+            });
+            if let (Some(id), Some(span)) = (self.store.id(i), found) {
+                self.placed.insert(id, span);
+            }
         }
     }
 
@@ -2008,17 +2142,29 @@ impl App {
         }
     }
 
-    /// Where the open diff's new side was read.
-    fn current_rev(&self) -> Rev {
-        match (self.scope, &self.commit_pick) {
+    /// Where `path`'s diff reads its new side: its repository's pick in `commits`, else the worktree.
+    fn rev_of(&self, path: &str) -> Rev {
+        match (self.scope, self.pick_of(path)) {
             (Scope::Commits, Some(pick)) => Rev::Commit(pick.clone()),
             _ => Rev::Worktree,
         }
     }
 
+    /// The pick of the repository holding `path`.
+    fn pick_of(&self, path: &str) -> Option<&CommitPick> {
+        let name = if self.repos.is_folder() { self.repos.locate(path)?.0 } else { "" };
+        self.commit_picks.get(name)
+    }
+
+    /// The lone repository's pick; in a folder, the first repository's.
+    #[must_use]
+    pub fn commit_pick(&self) -> Option<&CommitPick> {
+        self.commit_picks.values().next()
+    }
+
     /// `last-turn` with no baseline captured yet.
     pub fn awaiting_turn(&self) -> bool {
-        self.scope == Scope::LastTurn && self.herdr.last_turn.tree().is_none()
+        self.scope == Scope::LastTurn && self.herdr.last_turn.trees().is_none()
     }
 
     /// `scope-since-send`: what changed after the last send, or, pressed there, back to the scope
@@ -2068,9 +2214,6 @@ impl App {
 
     /// The message for an [`Self::awaiting_turn`] frame; "no agent" only once a sample looked.
     pub fn turn_wait_message(&self) -> &'static str {
-        if self.repos.is_folder() {
-            return "last turn needs one repo, not a folder of them";
-        }
         if self.herdr.too_old {
             return "last-turn needs a newer herdr";
         }
@@ -2846,7 +2989,7 @@ impl App {
     /// The chip click's next scope, skipping `commits` without a live pick.
     pub fn next_chip_scope(&self) -> Scope {
         let next = self.scope.cycle();
-        if next == Scope::Commits && (self.commit_pick.is_none() || self.pick_gone()) {
+        if next == Scope::Commits && (self.commit_picks.is_empty() || self.pick_gone()) {
             return next.cycle();
         }
         next
@@ -2857,7 +3000,7 @@ impl App {
         self.ensure_config_ready()?;
         // `commits` without a live pick opens the picker instead of switching.
         if scope == Scope::Commits
-            && (self.commit_pick.is_none() || self.pick_gone())
+            && (self.commit_picks.is_empty() || self.pick_gone())
             && !self.composing()
         {
             self.open_commit_picker();
@@ -3727,10 +3870,12 @@ impl App {
         claimed && self.target_comment().is_some()
     }
 
-    /// Whether the list's comment is editable: only in the view it was made on.
+    /// Whether the list's comment is editable: in the view it was made on, or one showing it.
     fn list_comment_editable(&self) -> bool {
         self.mode == Mode::List
-            && self.store.get(self.list_cursor).is_some_and(|c| self.rev_is_current(c))
+            && self.store.get(self.list_cursor).is_some_and(|c| {
+                self.rev_is_current(c) || self.view_span(self.list_cursor).is_some()
+            })
     }
 
     /// Whether `edit` opens a file, as the footer asks.
@@ -3844,6 +3989,30 @@ impl App {
         agent.or_else(|| self.last_sent_name.clone()).unwrap_or_else(|| "agent".to_string())
     }
 
+    /// An agent suggests commits: held for the commit picker; the view never moves (Continuity).
+    pub fn receive_suggestion(&mut self, picks: Picks, why: &str, agent: Option<String>) {
+        if picks.is_empty() {
+            return;
+        }
+        let agent = self.agent_name(agent);
+        let key = self.keymap().hint(crate::keymap::Action::CommitPick).label();
+        let what = match picks.iter().next() {
+            Some((repo, pick)) if picks.len() == 1 && repo.is_empty() => pick.label(),
+            Some((repo, pick)) if picks.len() == 1 => format!("{} in {repo}", pick.label()),
+            _ => format!("commits in {} repos", picks.len()),
+        };
+        let one = picks.len() == 1 && picks.values().all(CommitPick::is_single);
+        let them = if one { "it" } else { "them" };
+        logln!("agent suggests {what}");
+        let why = why.split_whitespace().collect::<Vec<_>>().join(" ");
+        self.suggestions.push_back(Suggestion { picks, why, agent: agent.clone() });
+        // A review in steps arrives as several: each waits its turn behind the first.
+        self.status = match self.suggestions.len() {
+            1 => format!("{agent} suggests {what} · {key} opens {them}"),
+            n => format!("{agent} suggests {what} · {n} waiting · {key} opens the first"),
+        };
+    }
+
     /// An agent's answer to thread `number` landed; one for a thread no longer here is dropped.
     pub fn receive_reply(&mut self, number: u64, text: String, agent: Option<String>) {
         let Some(i) = self.store.index_of_number(number) else { return };
@@ -3903,6 +4072,7 @@ impl App {
         self.status = format!("{name} commented on {file}:{start} · {key} goes there");
         // An open file shows it at once, a fold holding it opened.
         if self.diff_path.as_deref() == Some(file.as_str()) && !self.view_frozen() {
+            self.place_foreign();
             self.rebuild_visible();
             self.settle_read();
         }
@@ -4030,18 +4200,14 @@ impl App {
     fn open_comment_row(&mut self, index: usize) {
         let Some(c) = self.store.get(index) else { return };
         let file = c.file.clone();
-        let in_view = self.comment_in_view(c);
         let i = index;
 
         // Open the comment's file by path, so even a collapsed one works.
         if self.diff_path.as_deref() != Some(file.as_str()) {
             self.open_file_by_path(&file);
         }
-        // Only in the comment's own file and view, onto the row its card sits under.
-        if in_view
-            && self.diff_path.as_deref() == Some(file.as_str())
-            && let Some(&(idx, _)) = self.card_rows().iter().find(|&&(_, ci)| ci == i)
-        {
+        // Onto the row its card sits under, wherever this view shows it.
+        if let Some(&(idx, _)) = self.card_rows().iter().find(|&&(_, ci)| ci == i) {
             self.diff_cursor = idx;
             self.select_anchor = None;
         }
@@ -4419,7 +4585,7 @@ impl App {
         // A File view comment is content-anchored: it goes stale only with its file.
         let diff_anchored = self.diff.view == View::Diff;
         // A content comment reads the worktree whatever the scope.
-        let rev = if diff_anchored { self.current_rev() } else { Rev::Worktree };
+        let rev = if diff_anchored { self.rev_of(&file) } else { Rev::Worktree };
         Some(Comment { file, side, start, end, lines, text, diff_anchored, rev })
     }
 
@@ -4434,6 +4600,8 @@ impl App {
                 let file = self.diff_path.clone()?;
                 let (side, start, end, _) = self.selection_anchor()?;
                 // Only `location()` is read here, which ignores `diff_anchored`.
+                let rev =
+                    if self.diff.view == View::Diff { self.rev_of(&file) } else { Rev::Worktree };
                 let c = Comment {
                     file,
                     side,
@@ -4442,7 +4610,7 @@ impl App {
                     lines: String::new(),
                     text: String::new(),
                     diff_anchored: true,
-                    rev: Rev::Worktree,
+                    rev,
                 };
                 Some(c.location())
             }
@@ -4468,27 +4636,51 @@ impl App {
     fn rev_is_current(&self, c: &Comment) -> bool {
         match &c.rev {
             Rev::Worktree => {
-                !c.diff_anchored || self.scope != Scope::Commits || self.commit_pick.is_none()
+                !c.diff_anchored || self.scope != Scope::Commits || self.pick_of(&c.file).is_none()
             }
-            Rev::Commit(p) => self.scope == Scope::Commits && self.commit_pick.as_ref() == Some(p),
+            Rev::Commit(p) => self.scope == Scope::Commits && self.pick_of(&c.file) == Some(p),
         }
     }
 
-    /// The comments the open view shows, by store index.
-    fn shown_comments(&self) -> Vec<(usize, &Comment)> {
-        let Some(file) = self.diff_path.as_deref() else { return Vec::new() };
-        self.store
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.file == file && self.comment_in_view(c))
+    /// Where comment `i` sits in the open view: its own lines where made, else where they read here.
+    fn view_span(&self, i: usize) -> Option<Span> {
+        let c = self.store.get(i)?;
+        if self.diff_path.as_deref() != Some(c.file.as_str()) {
+            return None;
+        }
+        if self.comment_in_view(c) {
+            return Some((c.side, c.start, c.end));
+        }
+        self.placed.get(&self.store.id(i)?).copied()
+    }
+
+    /// Where comment `i`'s card sits in the open view, and what its title says of the view.
+    #[must_use]
+    pub fn card_place(&self, i: usize) -> Option<CardPlace> {
+        let c = self.store.get(i)?;
+        let (side, start, end) = self.view_span(i)?;
+        // The File view reads the worktree, a diff its scope's new side.
+        let shown = if self.diff.view == View::Diff { self.rev_of(&c.file) } else { Rev::Worktree };
+        let from = match &c.rev {
+            rev if *rev == shown => None,
+            Rev::Worktree => Some("the worktree".to_string()),
+            Rev::Commit(pick) => Some(pick.label()),
+        };
+        Some(CardPlace { side, start, end, native: self.comment_in_view(c), from })
+    }
+
+    /// The comments the open view shows, by store index, each with its lines here.
+    fn shown_comments(&self) -> Vec<(usize, Span)> {
+        (0..self.store.len())
             // A resolved thread leaves the diff; the comments list keeps it.
-            .filter(|(ci, _)| self.store.thread(*ci).is_none_or(|t| !t.resolved))
+            .filter(|&ci| self.store.thread(ci).is_none_or(|t| !t.resolved))
+            .filter_map(|ci| Some((ci, self.view_span(ci)?)))
             .collect()
     }
 
     /// The lines the shown comments cover, by side.
-    fn comment_spans(&self) -> Vec<(Side, u32, u32)> {
-        self.shown_comments().into_iter().map(|(_, c)| (c.side, c.start, c.end)).collect()
+    fn comment_spans(&self) -> Vec<Span> {
+        self.shown_comments().into_iter().map(|(_, span)| span).collect()
     }
 
     /// Each shown comment with the rows it covers: the one comment→row map.
@@ -4499,9 +4691,9 @@ impl App {
         }
         if !self.rendered_active() {
             let split = self.split_on_screen();
-            let rows = |c: &Comment| -> Vec<usize> {
+            let rows = |span: Span| -> Vec<usize> {
                 let hit: Vec<usize> =
-                    (0..self.visible.len()).filter(|&i| line_in(c, &self.visible[i])).collect();
+                    (0..self.visible.len()).filter(|&i| line_in(span, &self.visible[i])).collect();
                 // A split comment spans its lines' rows, fill rows between them included.
                 match (split, hit.first(), hit.last()) {
                     (true, Some(&first), Some(&last)) => (first..=last)
@@ -4510,10 +4702,10 @@ impl App {
                     _ => hit,
                 }
             };
-            return shown.into_iter().map(|(ci, c)| (ci, rows(c))).collect();
+            return shown.into_iter().map(|(ci, span)| (ci, rows(span))).collect();
         }
         // The diff's lines, walked once, and only for an old-side comment.
-        let lines: Vec<&Row> = if shown.iter().any(|(_, c)| c.side == Side::Old) {
+        let lines: Vec<&Row> = if shown.iter().any(|(_, (side, ..))| *side == Side::Old) {
             diff_lines(&self.diff.rows).collect()
         } else {
             Vec::new()
@@ -4521,8 +4713,8 @@ impl App {
         let units = self.rendered.index.units();
         shown
             .into_iter()
-            .map(|(ci, c)| {
-                let mut cover = self.rendered_cover(c, &lines);
+            .map(|(ci, span)| {
+                let mut cover = self.rendered_cover(span, &lines);
                 cover.sort_unstable();
                 cover.dedup();
                 // Each covered unit's rows, in row order.
@@ -4531,16 +4723,15 @@ impl App {
             .collect()
     }
 
-    /// The rendered units `c` covers, never empty, so no comment hides (G3).
+    /// The rendered units a comment's `span` covers, never empty, so no comment hides (G3).
     /// New side: the units its range overlaps; old side: the owner of its last deleted row.
-    fn rendered_cover(&self, c: &Comment, lines: &[&Row]) -> Vec<usize> {
+    fn rendered_cover(&self, (side, start, end): Span, lines: &[&Row]) -> Vec<usize> {
         let index = &self.rendered.index;
-        match c.side {
-            Side::New => index.new_side_cover(c.start, c.end),
+        match side {
+            Side::New => index.new_side_cover(start, end),
             Side::Old => {
-                let last = lines
-                    .iter()
-                    .rposition(|r| r.old_no().is_some_and(|n| c.start <= n && n <= c.end));
+                let last =
+                    lines.iter().rposition(|r| r.old_no().is_some_and(|n| start <= n && n <= end));
                 // A restored line sits in its block; a vanished one under the last unit.
                 let owner = match last {
                     Some(i) if lines[i].new_no().is_some() => {
@@ -4709,11 +4900,14 @@ impl App {
             .store
             .iter()
             .enumerate()
-            .filter(|&(i, c)| {
-                self.store.thread(i).is_some_and(|t| t.unread && !t.resolved)
-                    && self.comment_in_view(c)
+            .filter(|&(i, _)| self.store.thread(i).is_some_and(|t| t.unread && !t.resolved))
+            // The open file shows what it places; another file, what it was made in.
+            .filter_map(|(i, c)| match self.view_span(i) {
+                Some((_, start, _)) => Some((i, c, start)),
+                None if self.diff_path.as_deref() == Some(c.file.as_str()) => None,
+                None => self.comment_in_view(c).then_some((i, c, c.start)),
             })
-            .filter_map(|(i, c)| Some((*order.get(c.file.as_str())?, c.start, i)))
+            .filter_map(|(i, c, start)| Some((*order.get(c.file.as_str())?, start, i)))
             .collect();
         if unread.is_empty() {
             self.status = "no new answers".to_string();
@@ -5390,6 +5584,9 @@ impl App {
         if self.store.unread() > 0 {
             out.push((A::NextAnswer, Send));
         }
+        if !self.suggestions.is_empty() && self.tab.is_file_tab() {
+            out.push((A::CommitPick, Send));
+        }
 
         // The `go` band: keys that work anywhere, never repeating row 1.
         if !out.iter().any(|&(a, _)| a == A::Scope || a == A::ScopeOther) {
@@ -5737,18 +5934,57 @@ impl App {
         if !self.tab.is_file_tab() || self.mode != Mode::Normal {
             return;
         }
-        if self.repos.is_folder() {
-            self.status = FOLDER_COMMITS.to_string();
-            return;
-        }
-        let mut picker = match self.list_commit_rows() {
+        let listed = if self.repos.is_folder() {
+            self.list_folder_commit_rows()
+        } else {
+            self.list_commit_rows()
+        };
+        let mut picker = match listed {
             Ok(p) => p,
             Err(e) => {
                 self.status = e;
                 return;
             }
         };
-        match self.commit_pick.clone() {
+        // The first suggestion waiting opens as the selection, its reason the title.
+        let suggested = self.suggestions.front().filter(|s| {
+            let listed = |(repo, p): (&String, &CommitPick)| {
+                (0..picker.rows.len())
+                    .any(|i| picker.repo_of(i) == repo && picker.runs_through(i, p))
+            };
+            match s.picks.get("") {
+                Some(p) if !picker.is_folder() => picker.wholly_lists(p),
+                _ => picker.is_folder() && s.picks.iter().any(listed),
+            }
+        });
+        if let Some(s) = suggested {
+            picker.title = match self.suggestions.len() {
+                1 => format!("{} suggests: {}", s.agent, s.why),
+                n => format!("{} suggests (1 of {n}): {}", s.agent, s.why),
+            };
+            picker.suggested = true;
+        } else if !self.suggestions.is_empty() {
+            self.status = "the suggested commits are not in the list".to_string();
+        }
+        let picks = suggested.map_or(&self.commit_picks, |s| &s.picks);
+        if picker.is_folder() {
+            // The picker opens on the picks: as the highlight's step, else as a selection.
+            let current: BTreeSet<usize> = (0..picker.rows.len())
+                .filter(|&i| {
+                    picks.get(picker.repo_of(i)).is_some_and(|p| picker.runs_through(i, p))
+                })
+                .collect();
+            if let Some(&first) = current.first() {
+                picker.cursor = first;
+                if suggested.is_some() || picker.opened() != current {
+                    picker.checked = current;
+                }
+            }
+            self.commit_picker = Some(picker);
+            self.mode = Mode::CommitPick;
+            return;
+        }
+        match picks.get("").cloned() {
             Some(p) if picker.wholly_lists(&p) => {
                 let n = picker.index_of(&p.newest).expect("wholly listed");
                 let o = picker.index_of(&p.oldest).expect("wholly listed");
@@ -5783,7 +6019,81 @@ impl App {
             None => "commits · last 50".to_string(),
         };
         let empty = "no commits yet".to_string();
-        Ok(CommitPicker { rows, pick_row: None, cursor: 0, anchor: None, title, empty, head })
+        let (repos, checked) = (Vec::new(), BTreeSet::new());
+        Ok(CommitPicker {
+            rows,
+            pick_row: None,
+            cursor: 0,
+            anchor: None,
+            title,
+            empty,
+            head,
+            repos,
+            checked,
+            suggested: false,
+        })
+    }
+
+    /// A folder's picker: every repository's commits over its base, newest first, by repository.
+    fn list_folder_commit_rows(&self) -> Result<CommitPicker, String> {
+        let names = self.repos.names();
+        // In `branch` the view's landed merge bases list the rows; a repository it missed resolves.
+        let landed: HashMap<&str, Option<&str>> = if self.scope == Scope::Branch {
+            let ends = &self.changeset.repo_ends;
+            let merge_base = |name: &String, status: &git::BaseStatus| {
+                status.winner.as_ref().and(ends.get(name)).map(|e| e.old.as_str())
+            };
+            self.repo_bases.iter().map(|(name, s)| (name.as_str(), merge_base(name, s))).collect()
+        } else {
+            HashMap::new()
+        };
+        let (root, base, defaults) = (&self.repo, self.base.as_deref(), self.default_base());
+        let listed = crate::repos::par_map(names, |name| -> Result<Vec<git::CommitRow>, String> {
+            let dir = root.join(name);
+            let mb = if let Some(mb) = landed.get(name.as_str()) {
+                mb.map(str::to_string)
+            } else {
+                let resolved = git::resolve_base_with(&dir, base, defaults).map_err(|e| e.0)?;
+                resolved.status.winner.and_then(|b| git::merge_base(&dir, b.oid()))
+            };
+            // A repository on its base, or with none, holds no commit of this branch.
+            let Some(mb) = mb else { return Ok(Vec::new()) };
+            if git::head_oid(&dir).as_deref() == Some(mb.as_str()) {
+                return Ok(Vec::new());
+            }
+            git::list_commits(&dir, Some(&mb)).map_err(|e| e.to_string())
+        });
+        let mut lists = Vec::new();
+        for (name, listed) in names.iter().zip(listed) {
+            lists.push(listed.map_err(|e| format!("{name}: {e}"))?.into_iter().peekable());
+        }
+        let count = lists.iter().filter(|l| l.len() > 0).count();
+        // Newest first across the repositories, each one's own order kept: a pick's run needs it.
+        let mut rows: Vec<(String, git::CommitRow)> = Vec::new();
+        loop {
+            let newest = (0..lists.len())
+                .filter_map(|k| lists[k].peek().map(|r| (k, r.time)))
+                .min_by_key(|&(k, time)| (std::cmp::Reverse(time), k));
+            let Some((k, _)) = newest else { break };
+            rows.push((names[k].clone(), lists[k].next().expect("peeked")));
+        }
+        let noun = if count == 1 { "repo" } else { "repos" };
+        let title = format!("commits · {} over their bases in {count} {noun}", rows.len());
+        let empty = "no repo has commits over its base".to_string();
+        let (repos, rows): (Vec<String>, Vec<git::CommitRow>) = rows.into_iter().unzip();
+        let (head, checked) = (None, BTreeSet::new());
+        Ok(CommitPicker {
+            rows,
+            pick_row: None,
+            cursor: 0,
+            anchor: None,
+            title,
+            empty,
+            head,
+            repos,
+            checked,
+            suggested: false,
+        })
     }
 
     /// Close the commit picker; the scope stays.
@@ -5794,10 +6104,11 @@ impl App {
         self.commit_picker = None;
     }
 
-    /// `esc` in the picker: clear the anchor, else close.
+    /// `esc` in the picker: clear the anchor or a folder's selection, else close.
     pub fn commit_picker_escape(&mut self) {
         match self.commit_picker.as_mut() {
             Some(cp) if cp.anchor.is_some() => cp.anchor = None,
+            Some(cp) if !cp.checked.is_empty() => cp.checked.clear(),
             _ => self.close_commit_picker(),
         }
     }
@@ -5817,22 +6128,34 @@ impl App {
         }
     }
 
-    /// `v`: toggle the anchor on the highlight; never on the pick row.
+    /// `v`: toggle the anchor, never on the pick row; in a folder, select the step, then add or drop.
     pub fn commit_picker_anchor(&mut self) {
         let Some(cp) = self.commit_picker.as_mut() else { return };
+        if cp.is_folder() {
+            let row = cp.cursor;
+            if cp.checked.is_empty() {
+                cp.checked = cp.namesakes();
+            } else if !cp.checked.remove(&row) {
+                cp.checked.insert(row);
+            }
+            return;
+        }
         if cp.is_empty() || cp.is_pick_row(cp.cursor) {
             return;
         }
         cp.anchor = if cp.anchor == Some(cp.cursor) { None } else { Some(cp.cursor) };
     }
 
-    /// `enter`: pick the run, switch to `commits`, and rebuild.
+    /// `enter`: pick the run, or a folder's rows, switch to `commits`, and rebuild.
     pub fn commit_picker_pick(&mut self) -> Result<()> {
-        let Some(pick) = self.commit_picker.as_ref().and_then(CommitPicker::picked) else {
+        let picks = self.commit_picker.as_ref().map(CommitPicker::picks).unwrap_or_default();
+        if picks.is_empty() {
             return Ok(());
-        };
+        }
         self.close_commit_picker();
-        self.commit_pick = Some(pick);
+        self.commit_picks = picks;
+        // Any pick answers the first suggestion; the next waits for `G`.
+        self.suggestions.pop_front();
         // The old status describes the old shas.
         self.pick_status = None;
         // The pick is world input, so a build of the old one never lands.
@@ -5848,12 +6171,13 @@ impl App {
             return;
         }
         let Some(old) = self.commit_picker.as_ref() else { return };
-        if old.head.as_deref() == head {
+        // A folder's picker lives only while it is open; its rows are what it opened on.
+        if old.is_folder() || old.head.as_deref() == head {
             return;
         }
         let Ok(mut fresh) = self.list_commit_rows() else { return };
         let old = self.commit_picker.take().expect("checked above");
-        let pick = self.commit_pick.clone();
+        let pick = self.commit_pick().cloned();
         if let Some(p) = pick.clone().filter(|p| !fresh.wholly_lists(p)) {
             fresh.pick_row = Some(p);
         }
@@ -5886,6 +6210,10 @@ impl App {
         }
         fresh.cursor = cursor;
         fresh.anchor = anchor;
+        // A suggestion's reason stays the title over the re-listed rows.
+        if old.suggested {
+            (fresh.title, fresh.suggested) = (old.title, true);
+        }
         self.commit_picker = Some(fresh);
     }
 
@@ -6210,12 +6538,12 @@ fn hunk_row(rows: &[Visible], from: Option<usize>, forward: bool) -> Option<usiz
     }
 }
 
-/// Whether `path` is `.md` or `.markdown`, any case.
 /// The last part of `path`, as a status line names a file.
 fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// Whether `path` is `.md` or `.markdown`, any case.
 fn is_markdown_path(path: &str) -> bool {
     std::path::Path::new(path)
         .extension()
@@ -6299,9 +6627,9 @@ fn line_row(rows: &[Visible], line: u32, side: Side) -> usize {
         .unwrap_or(rows.len().saturating_sub(1))
 }
 
-/// Whether row `v` holds a line in `c`'s range on its side.
-fn line_in(c: &Comment, v: &Visible) -> bool {
-    v.no(c.side).is_some_and(|n| c.start <= n && n <= c.end)
+/// Whether row `v` holds a line of `span` on its side.
+fn line_in((side, start, end): Span, v: &Visible) -> bool {
+    v.no(side).is_some_and(|n| start <= n && n <= end)
 }
 
 /// The `(side, start, end, snippet)` of diff rows: new side unless all deletions.
@@ -6330,9 +6658,10 @@ fn anchor<'a>(selected: impl IntoIterator<Item = &'a Row>) -> Option<(Side, u32,
 mod tests {
     use super::{App, Mode, Visible};
     use crate::config::{DiffView, NavigatorPosition};
-    use crate::model::{Comment, CommitPick, Scope, Side};
+    use crate::model::{Comment, CommitPick, Picks, Scope, Side};
     use crate::test_support::test_repo;
     use crate::world::{PickStatus, PickVerdict};
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     #[test]
@@ -6503,8 +6832,14 @@ mod tests {
             title: "commits · last 50".to_string(),
             empty: "no commits yet".to_string(),
             head: None,
+            repos: Vec::new(),
+            checked: BTreeSet::new(),
+            suggested: false,
         });
-        old.commit_pick = Some(CommitPick { oldest: "c".repeat(40), newest: "a".repeat(40) });
+        old.commit_picks = Picks::from([(
+            String::new(),
+            CommitPick { oldest: "c".repeat(40), newest: "a".repeat(40) },
+        )]);
         old.pick_status = Some(PickStatus {
             verdict: PickVerdict::Live,
             subject: "commit a".to_string(),
@@ -6519,17 +6854,17 @@ mod tests {
         assert_eq!((cp.cursor, cp.anchor), (0, Some(2)));
         assert_eq!(cp.rows.len(), 3);
         assert_eq!(
-            recovered.commit_pick.as_ref().map(|p| p.newest.as_str()),
+            recovered.commit_pick().map(|p| p.newest.as_str()),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
         assert_eq!(recovered.pick_status.as_ref().map(|s| s.count), Some(3));
 
         // In `Normal` the pick still carries.
         let mut old = App::blocked(PathBuf::from("."), Scope::Uncommitted, None);
-        old.commit_pick = Some(CommitPick::single("d"));
+        old.commit_picks = Picks::from([(String::new(), CommitPick::single("d"))]);
         let mut recovered = App::new(PathBuf::from("."), Scope::Uncommitted, None);
         recovered.carry_authored_state_from(&mut old);
-        assert_eq!(recovered.commit_pick, Some(CommitPick::single("d")));
+        assert_eq!(recovered.commit_pick().cloned(), Some(CommitPick::single("d")));
     }
 
     #[test]
@@ -7011,16 +7346,18 @@ mod tests {
         open(&mut app);
         // A run of commits: the big side old, then new.
         git(&["commit", "-q", "-am", "shrink"]);
-        app.commit_pick = Some(CommitPick::single(&git(&["rev-parse", "HEAD"])));
+        app.commit_picks =
+            Picks::from([(String::new(), CommitPick::single(&git(&["rev-parse", "HEAD"])))]);
         app.scope = Scope::Commits;
         open(&mut app);
-        app.commit_pick = Some(CommitPick::single(&git(&["rev-parse", "HEAD~1"])));
+        app.commit_picks =
+            Picks::from([(String::new(), CommitPick::single(&git(&["rev-parse", "HEAD~1"])))]);
         open(&mut app);
         // `last-turn`, whose new side is the snapshot the build took.
         let baseline = git(&["rev-parse", "HEAD^{tree}"]);
         std::fs::write(repo.join("big.txt"), &big).unwrap();
         app.sync_turn(crate::turn::TurnReport {
-            last: crate::turn::LastTurn::At(baseline),
+            last: crate::turn::LastTurn::At(crate::turn::Trees::from([(String::new(), baseline)])),
             ..Default::default()
         });
         app.set_scope(Scope::LastTurn).unwrap();
@@ -7146,12 +7483,12 @@ mod tests {
         app.set_scope(Scope::Branch).unwrap();
         let branch = cost(&mut app, "a.txt");
         app.sync_turn(crate::turn::TurnReport {
-            last: crate::turn::LastTurn::At(baseline),
+            last: crate::turn::LastTurn::At(crate::turn::Trees::from([(String::new(), baseline)])),
             ..Default::default()
         });
         app.set_scope(Scope::LastTurn).unwrap();
         let last_turn = cost(&mut app, "a.txt");
-        app.commit_pick = Some(CommitPick::single(&base));
+        app.commit_picks = Picks::from([(String::new(), CommitPick::single(&base))]);
         app.scope = Scope::Commits;
         app.reload().unwrap();
         let commits = cost(&mut app, "a.txt");

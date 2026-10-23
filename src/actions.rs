@@ -19,7 +19,8 @@ use crate::proc::program_name;
 pub enum NonUiRun {
     /// `--action <name>`; a flag that ends argv names the empty action.
     Action(String),
-    /// `--reply <number> …` or `--comment <path>:<line> …`: an agent's message to its pane.
+    /// `--reply <number> …`, `--comment <path>:<line> …` or `--suggest <commits> …`: an agent's
+    /// message to its pane.
     Reply,
     /// `--help` or `-h`: the usage, which an agent reads before it answers.
     Help,
@@ -29,7 +30,7 @@ impl NonUiRun {
     /// The non-UI run `args` asks for, anywhere in argv, or `None` for the review UI.
     pub fn from_args<S: AsRef<OsStr>>(args: &[S]) -> Option<Self> {
         let args: Vec<&OsStr> = args.iter().map(AsRef::as_ref).collect();
-        if args.iter().any(|arg| *arg == "--reply" || *arg == "--comment") {
+        if args.iter().any(|arg| *arg == "--reply" || *arg == "--comment" || *arg == "--suggest") {
             return Some(Self::Reply);
         }
         if args.iter().any(|arg| *arg == "--help" || *arg == "-h") {

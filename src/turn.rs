@@ -1,11 +1,11 @@
 //! Turn tracking: a turn is the worktree's rest→work edge, its baseline promoted once a file changes.
 
-use std::collections::BTreeSet;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::git;
+use crate::repos::Repos;
 
 /// An agent's status as herdr reports it (`agent_status`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -101,6 +101,9 @@ impl TurnTracker {
     }
 }
 
+/// The trees the worktrees held, by repository name (`""` for a lone repository).
+pub type Trees = BTreeMap<String, String>;
+
 /// What `last-turn` diffs against.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum LastTurn {
@@ -109,15 +112,15 @@ pub enum LastTurn {
     Waiting,
     /// The last turn's first write raced its start snapshot: it shows nothing, and says why.
     Raced,
-    /// The tree the last turn started from.
-    At(String),
+    /// The trees the last turn started from.
+    At(Trees),
 }
 
 impl LastTurn {
-    /// The tree to diff against, when there is one.
-    pub fn tree(&self) -> Option<&str> {
+    /// The trees to diff against, when there are some.
+    pub fn trees(&self) -> Option<&Trees> {
         match self {
-            Self::At(tree) => Some(tree),
+            Self::At(trees) => Some(trees),
             Self::Waiting | Self::Raced => None,
         }
     }
@@ -183,7 +186,7 @@ const RACE_AFTER: Duration = crate::watch::GATHER.saturating_add(Duration::from_
 /// it, and when it was snapshotted and ended.
 #[derive(Clone, Debug)]
 struct TurnWindow {
-    candidate: String,
+    candidate: Trees,
     race_from: Instant,
     snapped: Instant,
     ended: Option<Instant>,
@@ -191,13 +194,15 @@ struct TurnWindow {
     unobserved: bool,
 }
 
-/// Turn tracking for one worktree: which agents work in it, its baseline, and the ref that
-/// persists it. The herdr connection's thread owns it and feeds it every status change.
+/// Turn tracking for one worktree, or a folder of them: which agents work in it, its baseline,
+/// and the refs that persist it. The herdr connection's thread owns it and feeds it every status.
 #[derive(Debug)]
 pub struct TurnHost {
     tracker: TurnTracker,
     last: LastTurn,
     repo: PathBuf,
+    /// A folder's repositories, each snapshotted as its own; empty for a lone repository.
+    repos: Repos,
     /// The reviewed worktree's [`canonical`] root, which a member's top level equals.
     root: PathBuf,
     /// Each agent `cwd` with a resolved top level, mapped to whether it is a member.
@@ -236,14 +241,15 @@ fn canonical(path: &Path) -> PathBuf {
 }
 
 impl TurnHost {
-    /// Resume the persisted baseline of `repo`, which must be the git top level.
-    pub fn open(repo: PathBuf) -> Self {
-        let last = git::read_baseline_ref(&repo).map_or(LastTurn::Waiting, LastTurn::At);
+    /// Resume the persisted baseline of `repo`, the git top level or the folder holding `repos`.
+    pub fn open(repo: PathBuf, repos: Repos) -> Self {
+        let last = read_trees(&repo, &repos).map_or(LastTurn::Waiting, LastTurn::At);
         Self {
             tracker: TurnTracker::default(),
             last,
             root: canonical(&repo),
             repo,
+            repos,
             resolved: HashMap::new(),
             turn: None,
             last_write: None,
@@ -251,8 +257,13 @@ impl TurnHost {
         }
     }
 
-    pub fn baseline(&self) -> Option<&str> {
-        self.last.tree()
+    pub fn baseline(&self) -> Option<&Trees> {
+        self.last.trees()
+    }
+
+    /// The folder's repositories changed: the next turn snapshots the new set.
+    pub fn set_repos(&mut self, repos: Repos) {
+        self.repos = repos;
     }
 
     /// The panes among `agents` (pane, cwd) working in this worktree, or `None` while any one's
@@ -326,21 +337,7 @@ impl TurnHost {
         }
         // Only a net change promotes: a temp file made and removed, a `touch`, a same-content
         // rewrite leaves the turn pending.
-        let narrow = wrote.paths.as_ref().filter(|p| git::fits_command_line(*p));
-        let moved = match narrow {
-            Some(paths) => {
-                let paths: Vec<String> = paths.iter().cloned().collect();
-                git::snapshot_worktree_in(&self.repo, &turn.candidate, &paths)
-            }
-            None => Ok(None),
-        };
-        let moved = match moved {
-            Ok(Some(tree)) => Ok(tree != turn.candidate),
-            // Past the cap, or anywhere: the whole worktree answers.
-            Ok(None) => git::snapshot_worktree(&self.repo).map(|now| now != turn.candidate),
-            Err(e) => Err(e),
-        };
-        match moved {
+        match self.changed_since(&turn.candidate, wrote.paths.as_ref()) {
             Ok(true) => {
                 self.promote(turn.candidate);
                 true
@@ -357,20 +354,98 @@ impl TurnHost {
         }
     }
 
+    /// Whether the worktrees moved off `candidate`: only the repositories `paths` touch, read
+    /// for those paths, else every one in full.
+    fn changed_since(
+        &self,
+        candidate: &Trees,
+        paths: Option<&BTreeSet<String>>,
+    ) -> anyhow::Result<bool> {
+        let Some(paths) = paths.filter(|p| git::fits_command_line(*p)) else {
+            return Ok(moved(candidate, &self.snapshot()?));
+        };
+        let mut touched: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        for path in paths {
+            // A path beside a folder's repositories is in none of them.
+            let at = if self.repos.is_folder() {
+                self.repos.locate(path)
+            } else {
+                Some(("", path.as_str()))
+            };
+            if let Some((name, inner)) = at {
+                touched.entry(name).or_default().push(inner.to_string());
+            }
+        }
+        for (name, inner) in touched {
+            let Some(tree) = candidate.get(name) else { continue };
+            let dir = self.dir(name);
+            // Past the cap, the whole worktree answers.
+            let now = match git::snapshot_worktree_in(&dir, tree, &inner)? {
+                Some(now) => now,
+                None => git::snapshot_worktree(&dir)?,
+            };
+            if now != *tree {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Every repository's worktree as a tree now; one that failed is left out, and said.
+    fn snapshot(&self) -> anyhow::Result<Trees> {
+        let (trees, failed) = crate::world::snapshot_all(&self.repo, &self.repos);
+        for (name, why) in &failed {
+            logln!("turn snapshot of {name:?} failed: {why}");
+        }
+        if trees.is_empty() {
+            anyhow::bail!("no worktree snapshotted");
+        }
+        Ok(trees)
+    }
+
+    /// Where repository `name` lives: the root itself for a lone repository.
+    fn dir(&self, name: &str) -> PathBuf {
+        if name.is_empty() { self.repo.clone() } else { self.repo.join(name) }
+    }
+
     fn abandon(&mut self) {
         self.turn = None;
         self.last = LastTurn::Raced;
-        if let Err(e) = git::delete_baseline_ref(&self.repo) {
-            logln!("turn baseline ref delete failed: {e}");
-        }
+        self.persist(None);
     }
 
-    fn promote(&mut self, candidate: String) {
+    fn promote(&mut self, candidate: Trees) {
         self.turn = None;
-        if let Err(e) = git::write_baseline_ref(&self.repo, &candidate) {
-            logln!("turn baseline ref write failed: {e}");
-        }
+        self.persist(Some(&candidate));
         self.last = LastTurn::At(candidate);
+    }
+
+    /// Keep the baseline in each repository's private ref, or forget it.
+    fn persist(&self, trees: Option<&Trees>) {
+        if !self.repos.is_folder() {
+            let result = match trees.and_then(|t| t.get("")) {
+                Some(tree) => git::write_baseline_ref(&self.repo, tree),
+                None => git::delete_baseline_ref(&self.repo),
+            };
+            if let Err(e) = result {
+                logln!("turn baseline ref failed: {e}");
+            }
+            return;
+        }
+        let names = self.repos.names();
+        let root = &self.repo;
+        let results = crate::repos::par_map(names, |name| {
+            let dir = root.join(name);
+            match trees.and_then(|t| t.get(name)) {
+                Some(tree) => git::write_folder_baseline_ref(&dir, tree),
+                None => git::delete_folder_baseline_ref(&dir),
+            }
+        });
+        for (name, result) in names.iter().zip(results) {
+            if let Err(e) = result {
+                logln!("turn baseline ref in {name} failed: {e}");
+            }
+        }
     }
 
     /// The turn rested. If the watcher missed any part of it, the worktree says whether it wrote.
@@ -381,19 +456,25 @@ impl TurnHost {
             return;
         }
         let candidate = turn.candidate.clone();
-        match git::snapshot_worktree(&self.repo) {
-            Ok(now) if now != candidate => self.promote(candidate),
+        match self.snapshot() {
+            Ok(now) if moved(&candidate, &now) => self.promote(candidate),
             Ok(_) => self.turn = None,
             Err(e) => logln!("turn end snapshot failed: {e}"),
         }
     }
 
     /// An agent's place by git top level: a subdirectory is a member, a sibling worktree is not.
+    /// In a folder, anywhere inside it is: its root, or any of its repositories.
     fn membership(&mut self, cwd: Option<&str>) -> Membership {
         let Some(cwd) = worktree_cwd(cwd) else {
             return Membership::NotMember;
         };
         if let Some(&member) = self.resolved.get(cwd) {
+            return if member { Membership::Member } else { Membership::NotMember };
+        }
+        if self.repos.is_folder() {
+            let member = canonical(Path::new(cwd)).starts_with(&self.root);
+            self.resolved.insert(cwd.to_string(), member);
             return if member { Membership::Member } else { Membership::NotMember };
         }
         // A member's top level is this root, so a cwd outside it is none, with no git to ask.
@@ -420,7 +501,7 @@ impl TurnHost {
         let transition = self.tracker.observe(state);
         if transition.started {
             self.turn = None;
-            match git::snapshot_worktree(&self.repo) {
+            match self.snapshot() {
                 Ok(candidate) => {
                     let unobserved = self.watcher_down;
                     let snapped = Instant::now();
@@ -443,6 +524,24 @@ impl TurnHost {
     }
 }
 
+/// Whether any repository `now` holds moved off its tree in `candidate`; one missing from either
+/// says nothing.
+fn moved(candidate: &Trees, now: &Trees) -> bool {
+    candidate.iter().any(|(name, tree)| now.get(name).is_some_and(|now| now != tree))
+}
+
+/// The persisted baseline: the lone repository's, else each folder repository's that has one.
+fn read_trees(repo: &Path, repos: &Repos) -> Option<Trees> {
+    if !repos.is_folder() {
+        return git::read_baseline_ref(repo).map(|tree| Trees::from([(String::new(), tree)]));
+    }
+    let names = repos.names();
+    let read = crate::repos::par_map(names, |name| git::read_folder_baseline_ref(&repo.join(name)));
+    let trees: Trees =
+        names.iter().zip(read).filter_map(|(name, tree)| Some((name.clone(), tree?))).collect();
+    (!trees.is_empty()).then_some(trees)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Status, TurnTracker, WorktreeState, worktree_cwd};
@@ -457,7 +556,7 @@ mod tests {
         let crate::git::Worktree::Root(root) = crate::git::worktree_of(dir.path()) else {
             panic!("a fresh repository resolves to a worktree root");
         };
-        let mut host = super::TurnHost::open(root);
+        let mut host = super::TurnHost::open(root, crate::repos::Repos::default());
         let reported = Instant::now().checked_sub(std::time::Duration::from_secs(2)).unwrap();
         host.observe_statuses(Some(&[super::Status::Idle]), reported);
         host.observe_statuses(Some(&[super::Status::Idle]), reported);
@@ -475,7 +574,7 @@ mod tests {
             panic!("a fresh repository resolves to a worktree root");
         };
         let elsewhere = tempfile::tempdir().unwrap();
-        let mut host = super::TurnHost::open(root);
+        let mut host = super::TurnHost::open(root, crate::repos::Repos::default());
         let before = crate::git::GIT_COMMANDS.with(std::cell::Cell::get);
         let cwd = elsewhere.path().to_string_lossy().into_owned();
         assert_eq!(host.members(&[("w:1", Some(cwd.as_str()))]), Some(vec![]));
@@ -500,7 +599,7 @@ mod tests {
         let crate::git::Worktree::Root(root) = crate::git::worktree_of(dir.path()) else {
             panic!("a fresh repository resolves to a worktree root");
         };
-        let mut host = super::TurnHost::open(root.clone());
+        let mut host = super::TurnHost::open(root.clone(), crate::repos::Repos::default());
         let recased = root.to_string_lossy().to_ascii_uppercase();
         assert_ne!(recased, root.to_string_lossy(), "the spelling really differs");
         assert!(matches!(host.membership(Some(&recased)), super::Membership::Member));
@@ -513,7 +612,7 @@ mod tests {
             panic!("a fresh repository resolves to a worktree root");
         };
         let outside = tempfile::tempdir().unwrap();
-        let mut host = super::TurnHost::open(root.clone());
+        let mut host = super::TurnHost::open(root.clone(), crate::repos::Repos::default());
         let mine = root.to_string_lossy().into_owned();
         let theirs = outside.path().to_string_lossy().into_owned();
         let agents = [("w:1", Some(mine.as_str())), ("w:2", Some(theirs.as_str())), ("w:3", None)];

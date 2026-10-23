@@ -649,7 +649,7 @@ fn an_agents_reply_run_reaches_the_pane_that_listens() {
     assert_eq!(stdout(&output), "answered #4\n");
     let text_of = |incoming: herdr_reviewr::reply::Incoming| match incoming {
         herdr_reviewr::reply::Incoming::Reply { number, text, .. } => (number, text),
-        other @ herdr_reviewr::reply::Incoming::Comment { .. } => panic!("not a reply: {other:?}"),
+        other => panic!("not a reply: {other:?}"),
     };
     assert_eq!(text_of(rx.recv().unwrap()), (4, "the guard is needed".to_string()));
 
@@ -692,7 +692,7 @@ fn an_agents_comment_finds_the_pane_in_its_tab_without_a_token() {
             verdict.send(Ok(3)).unwrap();
             (path, start, end, text)
         }
-        other @ Incoming::Reply { .. } => panic!("not a comment: {other:?}"),
+        other => panic!("not a comment: {other:?}"),
     });
 
     let output = Command::new(reviewr_bin())
@@ -709,16 +709,49 @@ fn an_agents_comment_finds_the_pane_in_its_tab_without_a_token() {
     assert_eq!(landed, (root.join("a.rs"), 2, 3, "this reads twice".to_string()));
 }
 
+#[cfg(unix)]
+#[test]
+fn an_agents_comment_reads_a_path_from_the_review_root_when_its_shell_moved() {
+    use herdr_reviewr::reply::{Incoming, Whereabouts};
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    fs::create_dir_all(root.join("shop")).unwrap();
+    fs::write(root.join("billing.py"), "one\ntwo\n").unwrap();
+    let tab = format!("test-tab-moved-{}", std::process::id());
+    let here =
+        Whereabouts { root: root.clone(), socket: None, workspace: None, tab: Some(tab.clone()) };
+    let (tx, rx) = herdr_reviewr::wake::channel(&herdr_reviewr::wake::Waker::detached());
+    let open = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _listener = herdr_reviewr::reply::listen(open, &here, tx).unwrap();
+    let pane = std::thread::spawn(move || match rx.recv().unwrap() {
+        Incoming::Comment { path, verdict, .. } => {
+            verdict.send(Ok(2)).unwrap();
+            path
+        }
+        other => panic!("not a comment: {other:?}"),
+    });
+
+    // The agent's shell sits in `shop`; the path is the one the send named, from the root.
+    let output = Command::new(reviewr_bin())
+        .args(["--comment", "billing.py:2", "rounds", "toward", "zero"])
+        .current_dir(root.join("shop"))
+        .env("HERDR_TAB_ID", &tab)
+        .env_remove("HERDR_PANE_ID")
+        .env("HERDR_BIN_PATH", "false")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(pane.join().unwrap(), root.join("billing.py"));
+}
+
 #[test]
 fn help_names_the_commands_an_agent_answers_with() {
     for flag in ["--help", "-h"] {
         let output = Command::new(reviewr_bin()).arg(flag).output().unwrap();
         assert!(output.status.success(), "{}", stderr(&output));
         let usage = stdout(&output);
-        assert!(
-            usage.contains("--reply <number>") && usage.contains("--comment <path>"),
-            "{usage}"
-        );
+        let commands = ["--reply <number>", "--comment <path>", "--suggest <commit>"];
+        assert!(commands.iter().all(|c| usage.contains(c)), "{usage}");
     }
 }
 

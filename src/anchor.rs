@@ -89,15 +89,33 @@ pub fn follow(
         let end = if held.is_empty() { end } else { start + held.len() as u32 - 1 };
         return Placed { start, end, changed: false };
     }
+    match lone_match(held, now) {
+        Some(at) => Placed { start: at, end: at + held.len() as u32 - 1, changed: false },
+        None => Placed { start, end, changed: true },
+    }
+}
+
+/// Where another view shows `held` in `now`, never moving the comment: at `near` while it reads
+/// there, else at its one match; `None` when `now` holds no such lines.
+#[must_use]
+pub fn locate(held: &[String], near: u32, now: &[&str]) -> Option<(u32, u32)> {
+    let last = held.len().checked_sub(1)? as u32;
+    let at = if reads_at(now, near, held) { near } else { lone_match(held, now)? };
+    Some((at, at + last))
+}
+
+/// The one line `held` reads from in `now`, when it is distinct enough to prove anything.
+fn lone_match(held: &[String], now: &[&str]) -> Option<u32> {
     let visible: usize =
         held.iter().map(|l| l.chars().filter(|c| !c.is_whitespace()).count()).sum();
-    if visible >= DISTINCT {
-        let mut found = (1..=now.len() as u32).filter(|&at| reads_at(now, at, held));
-        if let (Some(at), None) = (found.next(), found.next()) {
-            return Placed { start: at, end: at + held.len() as u32 - 1, changed: false };
-        }
+    if visible < DISTINCT {
+        return None;
     }
-    Placed { start, end, changed: true }
+    let mut found = (1..=now.len() as u32).filter(|&at| reads_at(now, at, held));
+    match (found.next(), found.next()) {
+        (Some(at), None) => Some(at),
+        _ => None,
+    }
 }
 
 /// Whether `now` holds `held` from 1-based line `at` on.
@@ -108,7 +126,7 @@ fn reads_at(now: &[&str], at: u32, held: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{LineMap, Placed, follow, lines, version};
+    use super::{LineMap, Placed, follow, lines, locate, version};
 
     fn held(text: &[&str]) -> Vec<String> {
         text.iter().map(|s| (*s).to_string()).collect()
@@ -204,5 +222,18 @@ mod tests {
             follow(&held(&["b"]), 2, 2, None, &[]),
             Placed { start: 1, end: 1, changed: true }
         );
+    }
+
+    #[test]
+    fn another_view_shows_the_lines_where_they_read_the_same_or_nowhere() {
+        let now = lines("a\n    let total = items.len();\nc\n    let total = items.len();\n");
+        let total = held(&["    let total = items.len();"]);
+        assert_eq!(locate(&total, 2, &now), Some((2, 2)), "at its own line while it reads there");
+        assert_eq!(locate(&total, 1, &now), None, "two matches elsewhere: neither is it");
+        let now = lines("x\ny\n    let total = items.len();\n");
+        assert_eq!(locate(&total, 1, &now), Some((3, 3)), "its one match");
+        assert_eq!(locate(&held(&["}"]), 1, &lines("{\n}\n")), None, "a short line proves nothing");
+        assert_eq!(locate(&held(&["}"]), 2, &lines("{\n}\n")), Some((2, 2)), "but reads in place");
+        assert_eq!(locate(&[], 1, &now), None);
     }
 }

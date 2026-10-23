@@ -1,6 +1,7 @@
-//! The reply channel: the agent's `herdr-reviewr --reply <n> …` or `--comment <path>:<line> …`
-//! reaches the pane over a socket named for its process, and lands in its threads.
+//! The reply channel: the agent's `herdr-reviewr --reply <n> …`, `--comment <path>:<line> …` or
+//! `--suggest <commits> …` reaches the pane over a socket named for its process.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -20,6 +21,8 @@ pub enum Incoming {
         agent: Option<String>,
         verdict: std::sync::mpsc::Sender<Result<u64, String>>,
     },
+    /// Commits the agent suggests the reviewer look at, one run per repository, and why.
+    Suggest { picks: crate::model::Picks, text: String, agent: Option<String> },
 }
 
 /// The most one request carries: one answer, never a stream.
@@ -168,7 +171,17 @@ fn answer(
     open: &Mutex<Vec<u64>>,
     tx: &crate::wake::Sender<Incoming>,
 ) -> Option<String> {
-    let Request { number, text, comment, agent } = request;
+    let Request { number, text, comment, agent, suggest } = request;
+    if let Some(runs) = suggest {
+        let picks = runs
+            .into_iter()
+            .map(|(repo, Run { oldest, newest })| {
+                (repo, crate::model::CommitPick { oldest, newest })
+            })
+            .collect();
+        tx.send(Incoming::Suggest { picks, text, agent }).ok()?;
+        return Some("ok".to_string());
+    }
     if let Some(Spot { path, start, end }) = comment {
         let (verdict, heard) = std::sync::mpsc::channel();
         tx.send(Incoming::Comment { path, start, end, text, agent, verdict }).ok()?;
@@ -208,6 +221,16 @@ struct Request {
     /// The agent's name as herdr knows its pane, which its words carry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent: Option<String>,
+    /// Suggested commits by repository (`""` for a lone one), resolved by the command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    suggest: Option<BTreeMap<String, Run>>,
+}
+
+/// One repository's suggested run, its two ends' full shas, oldest first.
+#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct Run {
+    oldest: String,
+    newest: String,
 }
 
 /// Where a comment goes: a file by its absolute path, and its lines.
@@ -223,7 +246,7 @@ fn parse_request(line: &str) -> Result<Request, String> {
     serde_json::from_str(line.trim_end()).map_err(|e| format!("unreadable request: {e}"))
 }
 
-/// Deliver one `--reply` or `--comment`, its text inline or on stdin; the exit code says if it landed.
+/// Deliver one agent command, its text inline or on stdin; the exit code says if it landed.
 pub fn run(args: &[OsString]) -> i32 {
     match deliver(args) {
         Ok(said) => {
@@ -237,17 +260,24 @@ pub fn run(args: &[OsString]) -> i32 {
     }
 }
 
-/// What a command sends: an answer to a thread, or a comment on lines.
+/// What a command sends: an answer to a thread, a comment on lines, or commits to look at.
 #[derive(Debug, PartialEq, Eq)]
 enum What {
     Reply(u64),
-    Comment { path: PathBuf, start: u32, end: u32 },
+    Comment {
+        path: PathBuf,
+        start: u32,
+        end: u32,
+    },
+    /// Each a commit, or `a..b` for the run from `a` to `b`, both included.
+    Suggest(Vec<String>),
 }
 
 /// What the arguments ask for: the message, the pane if named, and the text if given inline.
 fn parse_args(args: &[OsString]) -> Result<(What, Option<String>, String), String> {
     const USAGE: &str = "usage: herdr-reviewr --reply <number> [--to <token>] [answer]\n       \
-                         herdr-reviewr --comment <path>:<line>[-<end>] [--to <token>] [comment]";
+                         herdr-reviewr --comment <path>:<line>[-<end>] [--to <token>] [comment]\n       \
+                         herdr-reviewr --suggest <commit>[..<commit>][,...] [--to <token>] [why]";
     let mut what = None;
     let mut token = None;
     let mut words = Vec::new();
@@ -262,6 +292,23 @@ fn parse_args(args: &[OsString]) -> Result<(What, Option<String>, String), Strin
                 what = Some(What::Reply(number));
             }
             "--comment" => what = Some(parse_spot(&it.next().ok_or(USAGE)?)?),
+            "--suggest" => {
+                let value = it.next().ok_or(USAGE)?;
+                let specs: Vec<String> = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
+                if specs.is_empty()
+                    || specs.iter().any(|s| s.starts_with("..") || s.ends_with(".."))
+                {
+                    return Err(format!(
+                        "not a <commit>, <commit>..<commit>, or a list of them: {value}"
+                    ));
+                }
+                what = Some(What::Suggest(specs));
+            }
             "--to" => token = Some(it.next().ok_or(USAGE)?),
             _ => words.push(arg),
         }
@@ -302,34 +349,127 @@ fn deliver(args: &[OsString]) -> Result<String, String> {
         std::env::var("HERDR_PANE_ID").ok().and_then(|pane| crate::herdr::agent_name(&pane));
     let here =
         std::env::current_dir().map_err(|e| format!("reading the working directory: {e}"))?;
-    let (request, near, done) = match &what {
-        What::Reply(number) => {
-            let request = Request { number: Some(*number), text, comment: None, agent };
-            (request, here, "answered")
-        }
-        What::Comment { path, start, end } => {
-            let path = std::fs::canonicalize(here.join(path))
-                .map_err(|_| format!("no file at {}", path.display()))?;
-            let spot = Spot { path: path.clone(), start: *start, end: *end };
-            (Request { number: None, text, comment: Some(spot), agent }, path, "commented")
-        }
+    let here_file = match &what {
+        What::Comment { path, .. } => std::fs::canonicalize(here.join(path)).ok(),
+        What::Reply(_) | What::Suggest(_) => None,
     };
     let token = match token {
         Some(token) => token,
-        None => discover(&near)?,
+        None => discover(here_file.as_deref().unwrap_or(&here))?,
     };
+    let request = |number, comment, suggest| Request { number, text, comment, agent, suggest };
+    let (request, done) = match what {
+        What::Reply(number) => (request(Some(number), None, None), "answered".to_string()),
+        What::Comment { path, start, end } => {
+            // A path the shell's folder lacks reads from the review's root, as sends spell it.
+            let root = || reviewed_root(&token).ok();
+            let in_root = || root().and_then(|r| std::fs::canonicalize(r.join(&path)).ok());
+            let Some(file) = here_file.or_else(in_root) else {
+                return Err(match root() {
+                    Some(root) => {
+                        format!("no file at {} here or in {}", path.display(), root.display())
+                    }
+                    None => format!("no file at {}", path.display()),
+                });
+            };
+            let spot = Spot { path: file, start, end };
+            (request(None, Some(spot), None), "commented".to_string())
+        }
+        What::Suggest(specs) => {
+            let picks = resolve_commits(&reviewed_root(&token)?, &specs)?;
+            let said: Vec<String> = picks
+                .iter()
+                .map(|(repo, p)| match repo.as_str() {
+                    "" => p.label(),
+                    repo => format!("{} in {repo}", p.label()),
+                })
+                .collect();
+            let runs = picks
+                .into_iter()
+                .map(|(repo, p)| (repo, Run { oldest: p.oldest, newest: p.newest }))
+                .collect();
+            (request(None, None, Some(runs)), format!("suggested {}", said.join(", ")))
+        }
+    };
+    let suggesting = request.suggest.is_some();
     let verdict = exchange(&token, &request)?;
     match verdict.strip_prefix("error: ") {
-        // A pane from before comments reads a comment as a reply missing its number.
-        Some(why) if why.contains("missing field `number`") => {
+        // A pane from before comments reads a comment as a reply missing its number, and one
+        // from before suggestions reads a suggestion so.
+        Some(why)
+            if why.contains("missing field `number`")
+                || (suggesting && why.contains("needs a number")) =>
+        {
             Err("that review pane is older than this command: reopen it".to_string())
         }
         Some(why) => Err(why.to_string()),
+        None if verdict == "ok" => Ok(done),
         None => match verdict.strip_prefix("ok ") {
             Some(number) => Ok(format!("{done} {number}")),
             None => Err(format!("the pane answered {verdict:?}")),
         },
     }
+}
+
+/// Where the pane at `token` reviews, as its sidecar says.
+#[cfg(unix)]
+fn reviewed_root(token: &str) -> Result<PathBuf, String> {
+    let read = std::fs::read(sidecar_path(token)).ok();
+    let told: Option<Whereabouts> = read.and_then(|json| serde_json::from_slice(&json).ok());
+    told.map(|w| w.root)
+        .filter(|root| !root.as_os_str().is_empty())
+        .ok_or_else(|| format!("the review pane at {token} says nothing of where it reviews"))
+}
+
+#[cfg(not(unix))]
+fn reviewed_root(_token: &str) -> Result<PathBuf, String> {
+    Err("replies need macOS or Linux for now".to_string())
+}
+
+/// The commits `specs` name under `root` as one run per repository, each found in exactly one.
+fn resolve_commits(root: &Path, specs: &[String]) -> Result<crate::model::Picks, String> {
+    // As the pane reads its root: one repository when inside one, else the folder's.
+    let repos = match crate::git::toplevel(root) {
+        Some(_) => crate::repos::Repos::default(),
+        None => crate::repos::Repos::discover(root),
+    };
+    let names = if repos.is_folder() { repos.names().to_vec() } else { vec![String::new()] };
+    let mut ends: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for spec in specs {
+        let (from, to) = spec.split_once("..").unwrap_or((spec, spec));
+        let found = crate::repos::par_map(&names, |name| {
+            let dir = root.join(name);
+            let sha = |rev: &str| crate::git::resolve_commit(&dir, rev).ok().flatten();
+            let newest = sha(to)?;
+            Some((if from == to { newest.clone() } else { sha(from)? }, newest))
+        });
+        let hits: Vec<(&str, (String, String))> =
+            names.iter().zip(found).filter_map(|(name, f)| Some((name.as_str(), f?))).collect();
+        match hits.as_slice() {
+            [] if repos.is_folder() => return Err(format!("no repository here has {spec}")),
+            [] => return Err(format!("no commit {spec} here")),
+            [(name, (a, b))] => ends.entry(name).or_default().extend([a.clone(), b.clone()]),
+            many => {
+                let names: Vec<&str> = many.iter().map(|(name, _)| *name).collect();
+                return Err(format!("{spec} names commits in {}: give its sha", names.join(", ")));
+            }
+        }
+    }
+    let run = |name: &str, shas: &[String]| {
+        let dir = root.join(name);
+        let ancestor =
+            |a: &String, b: &String| a == b || crate::git::is_ancestor(&dir, a, b).unwrap_or(false);
+        let newest = shas.iter().find(|n| shas.iter().all(|s| ancestor(s, n)));
+        let oldest = shas.iter().find(|o| shas.iter().all(|s| ancestor(o, s)));
+        match (oldest, newest) {
+            (Some(o), Some(n)) => {
+                Ok(crate::model::CommitPick { oldest: o.clone(), newest: n.clone() })
+            }
+            _ if name.is_empty() => Err("the commits are not one line of history".to_string()),
+            _ => Err(format!("the commits in {name} are not one line of history")),
+        }
+    };
+    ends.into_iter().map(|(name, shas)| Ok((name.to_string(), run(name, &shas)?))).collect()
 }
 
 /// The pane without `--to`: the one in the agent's tab, else its workspace, else the deepest at `near`.
@@ -470,13 +610,85 @@ mod tests {
             Incoming::Reply { number, text, .. } => {
                 assert_eq!((number, text.as_str()), (5, "it guards the restart"));
             }
-            other @ Incoming::Comment { .. } => panic!("not a reply: {other:?}"),
+            other => panic!("not a reply: {other:?}"),
         }
         let refused = send("9", "lost").unwrap_err();
         assert!(refused.contains("no comment #9") && refused.contains("#2, #5"), "{refused}");
         drop(listener);
         let gone = send("2", "late").unwrap_err();
         assert!(gone.contains("closed"), "{gone}");
+    }
+
+    #[test]
+    fn a_suggestion_names_commits_runs_or_a_list_of_them() {
+        let parsed = parse_args(&args(&["--suggest", "a1,b2..c3", "--to", "1f", "one", "step"]));
+        let specs = What::Suggest(vec!["a1".into(), "b2..c3".into()]);
+        assert_eq!(parsed, Ok((specs, Some("1f".to_string()), "one step".into())));
+        for bad in [",", "..a1", "a1..", "a1,..b2"] {
+            assert!(parse_args(&args(&["--suggest", bad])).is_err(), "{bad}");
+        }
+    }
+
+    /// A repository at `dir` with `n` commits; their shas, oldest first.
+    fn repo_with(dir: &std::path::Path, n: usize) -> Vec<String> {
+        std::fs::create_dir_all(dir).unwrap();
+        let git = |list: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(dir).args(list).output();
+            let out = out.unwrap();
+            assert!(out.status.success(), "git {list:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        (0..n)
+            .map(|i| {
+                // The folder's name in the file, so two repositories never share a commit.
+                std::fs::write(dir.join("a.txt"), format!("{} {i}", dir.display())).unwrap();
+                git(&["add", "-A"]);
+                git(&["commit", "-q", "-m", &format!("c{i}")]);
+                git(&["rev-parse", "HEAD"])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_suggestion_lands_as_one_run_per_repository_of_the_pane() {
+        use crate::model::{CommitPick, Picks};
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let api = repo_with(&root.join("api"), 3);
+        let web = repo_with(&root.join("web"), 1);
+        let (tx, rx) = crate::wake::channel::<Incoming>(&crate::wake::Waker::detached());
+        let here = Whereabouts { root: root.clone(), ..Whereabouts::default() };
+        let listener = listen(Arc::new(Mutex::new(Vec::new())), &here, tx).unwrap();
+        let token = listener.token().to_string();
+        let suggest =
+            |spec: &str| super::deliver(&args(&["--suggest", spec, "--to", &token, "why"]));
+        // Two specs in `api` make one run from the oldest end to the newest.
+        let spec =
+            format!("{},{}..{},{}", &api[2][..10], &api[0][..10], &api[1][..10], &web[0][..9]);
+        let short = |sha: &str| sha[..7].to_string();
+        let said = format!(
+            "suggested {}..{} in api, {} in web",
+            short(&api[0]),
+            short(&api[2]),
+            short(&web[0])
+        );
+        assert_eq!(suggest(&spec), Ok(said));
+        match rx.recv().unwrap() {
+            Incoming::Suggest { picks, text, .. } => {
+                let run = CommitPick { oldest: api[0].clone(), newest: api[2].clone() };
+                let want =
+                    Picks::from([("api".into(), run), ("web".into(), CommitPick::single(&web[0]))]);
+                assert_eq!((picks, text.as_str()), (want, "why"));
+            }
+            other => panic!("not a suggestion: {other:?}"),
+        }
+        let both = suggest("main").unwrap_err();
+        assert!(both.contains("api, web"), "a branch every repository has: {both}");
+        let none = suggest("0123456789abcdef").unwrap_err();
+        assert!(none.contains("no repository here has"), "{none}");
     }
 
     #[test]
@@ -493,7 +705,7 @@ mod tests {
                 verdict.send(Ok(7)).unwrap();
                 (path, start, end, text)
             }
-            other @ Incoming::Reply { .. } => panic!("not a comment: {other:?}"),
+            other => panic!("not a comment: {other:?}"),
         });
         let spot = format!("{}:2", file.display());
         let said = super::deliver(&args(&["--comment", &spot, "--to", &token, "see", "this"]));

@@ -57,13 +57,14 @@ pub fn format_send(prefix: Option<&str>, blocks: &[Outgoing<'_>], answer: Option
         .join("\n\n")
 }
 
-/// The lines that tell the agent how to answer, and to comment itself, at the pane `token` names.
+/// How the agent answers, comments, and suggests commits, at the pane `token` names.
 pub fn answer_line(token: &str) -> String {
     format!(
         "Answer each comment by its number in herdr-reviewr, the review pane this came from: \
          herdr-reviewr --reply <number> --to {token} \"<answer>\"\n\
          Comment on a line yourself: herdr-reviewr --comment <path>:<line> --to {token} \
-         \"<comment>\". herdr-reviewr --help explains both."
+         \"<comment>\". Suggest commits to review together: herdr-reviewr --suggest \
+         <sha>[,<sha>...] --to {token} \"<why>\". herdr-reviewr --help explains all three."
     )
 }
 
@@ -428,7 +429,8 @@ mod tests {
              Answer each comment by its number in herdr-reviewr, the review pane this came from: \
              herdr-reviewr --reply <number> --to 1f2e \"<answer>\"\n\
              Comment on a line yourself: herdr-reviewr --comment <path>:<line> --to 1f2e \
-             \"<comment>\". herdr-reviewr --help explains both."
+             \"<comment>\". Suggest commits to review together: herdr-reviewr --suggest \
+             <sha>[,<sha>...] --to 1f2e \"<why>\". herdr-reviewr --help explains all three."
         );
         assert_eq!(
             format_send(None, &[Outgoing::Comment(3, &b, false)], None),

@@ -72,16 +72,19 @@ enum Msg {
     /// A line of the subscription tagged so, and when it arrived.
     Line(u64, Line, Instant),
     News(TurnNews),
+    /// A folder's repositories came or went.
+    Repos(crate::repos::Repos),
     Stop,
 }
 
 impl Connection {
     /// Connect to the herdr socket at `socket` as the pane `pane_id`, tracking the turns of the
-    /// agents working in `repo`, and report to `tx`.
+    /// agents working in `repo` (or the folder holding `repos`), and report to `tx`.
     pub fn start(
         socket: OsString,
         pane_id: String,
         repo: PathBuf,
+        repos: crate::repos::Repos,
         tx: crate::wake::Sender<HerdrEvent>,
     ) -> std::io::Result<Self> {
         let (me, rx) = mpsc::channel();
@@ -91,7 +94,7 @@ impl Connection {
                 socket,
                 pane_id,
                 terminal: None,
-                host: TurnHost::open(repo),
+                host: TurnHost::open(repo, repos),
                 agents: HashMap::new(),
                 members: Vec::new(),
                 subscribed: Vec::new(),
@@ -104,6 +107,11 @@ impl Connection {
             thread.run();
         })?;
         Ok(Self { tx: me })
+    }
+
+    /// The folder's repositories changed: the next turn snapshots these.
+    pub fn set_repos(&self, repos: crate::repos::Repos) {
+        let _ = self.tx.send(Msg::Repos(repos));
     }
 
     /// The handle the watcher feeds turn tracking through.
@@ -239,6 +247,7 @@ impl Thread {
     fn handle_outside_lines(&mut self, msg: Msg) -> bool {
         match msg {
             Msg::News(news) => self.news(news),
+            Msg::Repos(repos) => self.host.set_repos(repos),
             Msg::Stop => return true,
             Msg::Line(..) => {}
         }

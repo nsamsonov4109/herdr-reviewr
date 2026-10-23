@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use common::Repo;
 use herdr_reviewr::herdr_socket::{Connection, HerdrEvent, Session};
+use herdr_reviewr::repos::Repos;
 use herdr_reviewr::turn::{LastTurn, TurnNews, TurnReport, Wrote};
 use herdr_reviewr::wake::{Waker, channel};
 use serde_json::{Value, json};
@@ -224,7 +225,9 @@ fn agent(pane: &str, cwd: &str, status: &str) -> Value {
 fn connect(fake: &FakeHerdr, repo: &Path) -> (Connection, Receiver<HerdrEvent>) {
     let (tx, rx) = channel(&Waker::detached());
     let socket = fake.path.clone().into_os_string();
-    let connection = Connection::start(socket, "w1:p1".into(), repo.to_path_buf(), tx).unwrap();
+    let connection =
+        Connection::start(socket, "w1:p1".into(), repo.to_path_buf(), Repos::default(), tx)
+            .unwrap();
     (connection, rx)
 }
 
@@ -367,7 +370,7 @@ fn the_live_server_answers_with_this_pane() {
     let pane = std::env::var("HERDR_PANE_ID").expect("inside herdr");
     let (tx, rx) = channel(&Waker::detached());
     let repo = std::env::current_dir().unwrap();
-    let _c = Connection::start(socket, pane.clone(), repo, tx).unwrap();
+    let _c = Connection::start(socket, pane.clone(), repo, Repos::default(), tx).unwrap();
     let s = next_session(&rx);
     let me = s.me.expect("the live session lists this pane");
     println!("live: me={me:?} visible={}", s.visible);
@@ -451,13 +454,14 @@ fn a_turn_promotes_on_its_first_fed_change() {
             feed_write(&c, later, &["a.rs"]);
             assert!(Instant::now() < deadline, "never promoted");
             match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(HerdrEvent::Turn(t)) if t.last.tree().is_some() => Some(t),
+                Ok(HerdrEvent::Turn(t)) if t.last.trees().is_some() => Some(t),
                 _ => None,
             }
         })
         .expect("promoted");
     let persisted = herdr_reviewr::git::read_baseline_ref(&root);
-    assert_eq!(persisted.as_deref(), promoted.last.tree(), "and persisted");
+    let lone = promoted.last.trees().and_then(|t| t.get("")).map(String::as_str);
+    assert_eq!(persisted.as_deref(), lone, "and persisted");
 }
 
 #[test]
@@ -479,7 +483,7 @@ fn the_watcher_feeds_turn_tracking_without_the_frame_loop() {
         if let Ok(HerdrEvent::Turn(t)) = rx.recv_timeout(Duration::from_millis(400))
             && t.last != LastTurn::Waiting
         {
-            assert!(t.last.tree().is_some(), "the watcher's write promoted the turn: {t:?}");
+            assert!(t.last.trees().is_some(), "the watcher's write promoted the turn: {t:?}");
             break;
         }
         assert!(Instant::now() < deadline, "the watcher's write never reached a turn");
@@ -550,7 +554,7 @@ fn a_turn_that_starts_during_an_outage_is_never_adopted() {
     fake.push(&[status("w1:p2", "idle")]);
     let promoted = events_within(&rx, Duration::from_millis(500))
         .into_iter()
-        .any(|e| matches!(e, HerdrEvent::Turn(t) if t.last.tree().is_some()));
+        .any(|e| matches!(e, HerdrEvent::Turn(t) if t.last.trees().is_some()));
     assert!(!promoted, "a turn whose start nobody saw is never adopted");
 }
 
@@ -593,7 +597,7 @@ fn a_subscribe_refused_for_a_closed_pane_reads_the_session_again() {
     fake.state().refuse_pane_subscribes = 2;
     let (tx, rx) = channel(&Waker::detached());
     let socket = fake.path.clone().into_os_string();
-    let _c = Connection::start(socket, "w1:p1".into(), root.clone(), tx).unwrap();
+    let _c = Connection::start(socket, "w1:p1".into(), root.clone(), Repos::default(), tx).unwrap();
     let subscribed = wait_subscribed(&fake, 3);
     assert!(subscribed.len() >= 3, "refused twice, then subscribed again: {subscribed:?}");
     let lost = events_within(&rx, Duration::from_millis(300))
@@ -642,7 +646,7 @@ fn an_agent_first_seen_working_starts_no_turn() {
     fake.push(&[status("w1:p3", "idle")]);
     let events = events_within(&rx, Duration::from_millis(500));
     let adopted =
-        events.iter().any(|e| matches!(e, HerdrEvent::Turn(t) if t.last.tree().is_some()));
+        events.iter().any(|e| matches!(e, HerdrEvent::Turn(t) if t.last.trees().is_some()));
     assert!(!adopted, "a turn nobody saw start is never adopted: {events:?}");
 }
 
@@ -661,7 +665,7 @@ fn lost_events_are_a_gap_in_turn_tracking_and_no_outage() {
     fake.push(&[status("w1:p2", "idle")]);
     let events = events_within(&rx, Duration::from_millis(500));
     let adopted =
-        events.iter().any(|e| matches!(e, HerdrEvent::Turn(t) if t.last.tree().is_some()));
+        events.iter().any(|e| matches!(e, HerdrEvent::Turn(t) if t.last.trees().is_some()));
     assert!(!adopted, "a turn whose start fell in the gap is never adopted: {events:?}");
     assert!(
         !events.iter().any(|e| matches!(e, HerdrEvent::Lost)),

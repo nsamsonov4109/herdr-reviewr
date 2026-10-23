@@ -4137,6 +4137,61 @@ fn the_commit_picker_paints_rows_a_run_bar_and_its_count() {
 }
 
 #[test]
+fn a_card_another_version_shows_names_the_one_it_was_made_on() {
+    let (r, mut app, shas) = commits_app();
+    app.open_commit_picker();
+    app.commit_picker_pick().unwrap();
+    assert_eq!(app.diff_path.as_deref(), Some("three.rs"));
+    app.focus = Focus::Diff;
+    app.diff_cursor = app.visible.iter().position(|v| v.marker() == '+').unwrap();
+    app.start_comment();
+    app.input_push('x');
+    app.submit_comment();
+    let out = render(&app);
+    assert!(out.contains("#1 · line 1 ─"), "its own view names nothing more:\n{out}");
+    // `branch` from the root reads `three`'s line as it was.
+    r.set_origin_default("main", &shas[0]);
+    app.set_scope(Scope::Branch).unwrap();
+    let row = app
+        .file_rows
+        .iter()
+        .position(|row| row.file_index().is_some_and(|i| app.entries[i].path == "three.rs"));
+    app.select_file(row.unwrap()).unwrap();
+    let out = render(&app);
+    let title = format!("#1 · line 1 · from {} ─", short(&shas[3]));
+    assert!(out.contains(&title), "{title}:\n{out}");
+}
+
+#[test]
+fn the_footer_offers_all_the_agent_sent_beside_the_send() {
+    use herdr_reviewr::model::{CommitPick, Picks};
+    let (_r, mut app, shas) = commits_app();
+    let comment = |app: &mut App, text: &str| {
+        app.focus = Focus::Diff;
+        app.diff_cursor = app.visible.iter().position(|v| v.marker() == '+').unwrap();
+        app.start_comment();
+        text.chars().for_each(|ch| app.input_push(ch));
+        app.submit_comment();
+    };
+    comment(&mut app, "why dirty?");
+    app.store.mark_sent();
+    app.receive_reply(1, "a test fixture".into(), Some("claude".into()));
+    comment(&mut app, "and this?");
+    let last = Picks::from([(String::new(), CommitPick::single(&shas[3]))]);
+    app.receive_suggestion(last, "the newest", Some("claude".into()));
+    app.status.clear();
+    let footer = footer_line(&render(&app));
+    for entry in ["s send 1", "A new answer", "G suggested commits"] {
+        assert!(footer.contains(entry), "{entry}: {footer}");
+    }
+    let first = Picks::from([(String::new(), CommitPick::single(&shas[1]))]);
+    app.receive_suggestion(first, "the oldest", Some("claude".into()));
+    app.status.clear();
+    let footer = footer_line(&render(&app));
+    assert!(footer.contains("G 2 suggested steps"), "{footer}");
+}
+
+#[test]
 fn the_commits_header_names_the_pick_and_its_verdict() {
     let (r, mut app, shas) = commits_app();
     app.open_commit_picker();

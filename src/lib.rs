@@ -82,8 +82,15 @@ herdr-reviewr: a code-review pane for herdr.
   herdr-reviewr --comment <path>:<line>[-<end>] [--to <token>] [comment]
       Comment on lines of the code under review. Without a comment, it is read from stdin.
 
-A review names its pane's token. Without --to, --reply and --comment go to the review pane in
-this herdr tab, else in this workspace, else the one reviewing this folder.
+  herdr-reviewr --suggest <commit>[..<commit>][,<commit>...] [--to <token>] [why]
+      Suggest commits for the reviewer to look at together: a..b is the run from a to b, both
+      included. In a folder of repositories, each commit is found in its own repository. For a
+      review in steps, suggest each step on its own: they wait in the order sent, and the
+      reviewer opens each from the pane; nothing moves by itself. Without a why, it is read
+      from stdin.
+
+A review names its pane's token. Without --to, these commands go to the review pane in this
+herdr tab, else in this workspace, else the one reviewing this folder.
 ";
 
 /// Entry point: parse config, set up the terminal, run the loop, restore.
@@ -897,10 +904,13 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
     // herdr pushes focus, this pane's moves, and agent statuses; outside herdr nothing connects.
     let (herdr_tx, herdr_rx) = crate::wake::channel::<crate::herdr_socket::HerdrEvent>(&waker);
     let herdr = herdr::connection_target().and_then(|(socket, pane)| {
-        crate::herdr_socket::Connection::start(socket, pane, app.repo.clone(), herdr_tx)
+        let (repo, repos) = (app.repo.clone(), app.repos().clone());
+        crate::herdr_socket::Connection::start(socket, pane, repo, repos, herdr_tx)
             .inspect_err(|e| logln!("herdr connection did not start: {e}"))
             .ok()
     });
+    // The folder's repositories turn tracking snapshots, kept as they come and go.
+    let mut turn_repos = app.repos().clone();
     // What changed in the worktree, its git files and the config.
     let (watch_tx, watch_rx) = crate::wake::channel::<crate::watch::WatchEvent>(&waker);
     // Its writes reach turn tracking directly, so a terminal editor holding the loop delays nothing.
@@ -1111,6 +1121,9 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
                     crate::reply::Incoming::Comment { path, start, end, text, agent, verdict } => {
                         let _ = verdict.send(app.receive_comment(&path, start, end, text, agent));
                     }
+                    crate::reply::Incoming::Suggest { picks, text, agent } => {
+                        app.receive_suggestion(picks, &text, agent);
+                    }
                 }
             }
             // A pane that moved tab says so, for the commands that look for it there.
@@ -1142,6 +1155,12 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
             while let Ok(event) = watch_rx.try_recv() {
                 let search = search_worker.as_ref().map(|(tx, _)| tx);
                 config_dirty |= land_watch_event(event, app, &mut pacer, &mut pr, search);
+            }
+            if app.repos() != &turn_repos {
+                turn_repos = app.repos().clone();
+                if let Some(herdr) = &herdr {
+                    herdr.set_repos(turn_repos.clone());
+                }
             }
             let mut heard = false;
             let mut moved = shown_by_input.take();

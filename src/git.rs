@@ -965,7 +965,7 @@ fn frontier_names(
 }
 
 /// Whether `commit` is an ancestor of (or equal to) `of`.
-fn is_ancestor(repo: &Path, commit: &str, of: &str) -> Result<bool, GitFail> {
+pub fn is_ancestor(repo: &Path, commit: &str, of: &str) -> Result<bool, GitFail> {
     Ok(git_tristate(repo, &["merge-base", "--is-ancestor", commit, of])?.is_some())
 }
 
@@ -1527,6 +1527,8 @@ fn parse_sides(out: &str) -> Option<DiffSides> {
 
 const BASE_PICK_REF: &str = "refs/worktree/reviewr/base-pick";
 const TURN_BASE_REF: &str = "refs/worktree/reviewr/turn-base";
+/// A folder pane's turn baseline in each of its repositories, apart from a pane on the one repo.
+const FOLDER_TURN_BASE_REF: &str = "refs/worktree/reviewr/folder-turn-base";
 
 /// What this process last wrote to each private ref (`None`: deleted), so the watcher drops its own writes.
 static OWN_REF_WRITES: Mutex<Vec<(PathBuf, &str, Option<String>)>> = Mutex::new(Vec::new());
@@ -1940,20 +1942,47 @@ pub fn end_sessions() {
 
 /// The persisted turn baseline tree for this worktree, if a baseline exists.
 pub fn read_baseline_ref(repo: &Path) -> Option<String> {
-    git_line(repo, &["rev-parse", "--verify", "--quiet", TURN_BASE_REF])
+    read_turn_ref(repo, TURN_BASE_REF)
 }
 
 /// Forget the turn baseline: a turn whose start raced its first write leaves `last-turn` empty.
 pub fn delete_baseline_ref(repo: &Path) -> Result<()> {
-    record_own_ref(repo, TURN_BASE_REF, None);
-    git(repo, &["update-ref", "-d", TURN_BASE_REF])?;
-    Ok(())
+    delete_turn_ref(repo, TURN_BASE_REF)
 }
 
 /// Persist the turn baseline atomically under this worktree's private ref.
 pub fn write_baseline_ref(repo: &Path, sha: &str) -> Result<()> {
-    record_own_ref(repo, TURN_BASE_REF, Some(sha));
-    git(repo, &["update-ref", TURN_BASE_REF, sha])?;
+    write_turn_ref(repo, TURN_BASE_REF, sha)
+}
+
+/// [`read_baseline_ref`] for a folder pane, in one of its repositories.
+pub fn read_folder_baseline_ref(repo: &Path) -> Option<String> {
+    read_turn_ref(repo, FOLDER_TURN_BASE_REF)
+}
+
+/// [`delete_baseline_ref`] for a folder pane, in one of its repositories.
+pub fn delete_folder_baseline_ref(repo: &Path) -> Result<()> {
+    delete_turn_ref(repo, FOLDER_TURN_BASE_REF)
+}
+
+/// [`write_baseline_ref`] for a folder pane, in one of its repositories.
+pub fn write_folder_baseline_ref(repo: &Path, sha: &str) -> Result<()> {
+    write_turn_ref(repo, FOLDER_TURN_BASE_REF, sha)
+}
+
+fn read_turn_ref(repo: &Path, name: &'static str) -> Option<String> {
+    git_line(repo, &["rev-parse", "--verify", "--quiet", name])
+}
+
+fn delete_turn_ref(repo: &Path, name: &'static str) -> Result<()> {
+    record_own_ref(repo, name, None);
+    git(repo, &["update-ref", "-d", name])?;
+    Ok(())
+}
+
+fn write_turn_ref(repo: &Path, name: &'static str, sha: &str) -> Result<()> {
+    record_own_ref(repo, name, Some(sha));
+    git(repo, &["update-ref", name, sha])?;
     Ok(())
 }
 

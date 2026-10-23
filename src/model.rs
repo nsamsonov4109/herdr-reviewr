@@ -1,6 +1,6 @@
 //! The review model: scopes, changed files, and the session's comments, never lost to a refresh.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Which set of changes the Changes view shows.
@@ -65,7 +65,20 @@ impl CommitPick {
     pub fn is_single(&self) -> bool {
         self.oldest == self.newest
     }
+
+    /// `1a2b3c4`, or `1a2b3c4..5d6e7f8` for a run, oldest first.
+    pub fn label(&self) -> String {
+        let short = crate::git::abbreviate_oid;
+        if self.is_single() {
+            short(&self.newest)
+        } else {
+            format!("{}..{}", short(&self.oldest), short(&self.newest))
+        }
+    }
 }
+
+/// The `commits` scope's picks by repository name (`""` for a lone repository).
+pub type Picks = BTreeMap<String, CommitPick>;
 
 /// Where a comment's diff was read; it renders only while the scope reads that same diff.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -147,16 +160,23 @@ pub struct Comment {
 }
 
 impl Comment {
-    /// The `path:start-end` (or `path:line`) location, with ` (removed)` when old-side.
+    /// `path:start-end` or `path:line`, saying ` (removed)` and ` (in commit 1a2b3c4)` as they apply.
     pub fn location(&self) -> String {
         let range = if self.start == self.end {
             format!("{}:{}", self.file, self.start)
         } else {
             format!("{}:{}-{}", self.file, self.start, self.end)
         };
-        match self.side {
-            Side::New => range,
-            Side::Old => format!("{range} (removed)"),
+        let commit = match &self.rev {
+            Rev::Worktree => None,
+            Rev::Commit(pick) if pick.is_single() => Some(format!("commit {}", pick.label())),
+            Rev::Commit(pick) => Some(format!("commits {}", pick.label())),
+        };
+        match (self.side, commit) {
+            (Side::New, None) => range,
+            (Side::Old, None) => format!("{range} (removed)"),
+            (Side::New, Some(commit)) => format!("{range} (in {commit})"),
+            (Side::Old, Some(commit)) => format!("{range} (removed in {commit})"),
         }
     }
 }
@@ -278,6 +298,11 @@ impl CommentStore {
     /// Whether the lines under comment `index` changed since it was made.
     pub fn changed(&self, index: usize) -> bool {
         self.anchors.get(index).is_some_and(|a| a.changed)
+    }
+
+    /// The lines comment `index` was made on, as they read then.
+    pub fn held(&self, index: usize) -> &[String] {
+        self.anchors.get(index).map_or(&[], |a| a.held.as_slice())
     }
 
     /// Carry the comments `wants` picks into `text`, their side as it reads now; whether any moved.
@@ -505,6 +530,13 @@ mod tests {
         assert_eq!(c.location(), "a.rs:40");
         c.side = Side::Old;
         assert_eq!(c.location(), "a.rs:40 (removed)");
+        // A comment made on a commit names it, so the agent reads the lines it saw.
+        let (one, two) = ("1a2b3c4d".repeat(5), "5d6e7f80".repeat(5));
+        c.rev = Rev::Commit(super::CommitPick::single(&one));
+        assert_eq!(c.location(), "a.rs:40 (removed in commit 1a2b3c4)");
+        c.side = Side::New;
+        c.rev = Rev::Commit(super::CommitPick { oldest: one, newest: two });
+        assert_eq!(c.location(), "a.rs:40 (in commits 1a2b3c4..5d6e7f8)");
     }
 
     #[test]
