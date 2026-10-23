@@ -7,8 +7,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Threads**: a sent comment stays on its line as a numbered thread, and the agent answers it with `herdr-reviewr --reply <number>`, which the send tells it how to run. `a` replies, and the next send carries your replies with any new comments. `D` resolves a thread, hiding it from the diff while the comments list keeps it. A new answer marks its thread and its file until you go to it, and `A` goes to the next one. Each message opens under its author, you or the agent, with a bar in that author's color down its lines, and the agent's newest message says `new` until you've read it; a card wraps at 96 columns however wide the pane. The comments list puts each thread's state before its text, and `send` counts what the next send carries. Answers need macOS or Linux.
+- **Since send**: `i` shows only what changed after your last send, every repository against a snapshot taken as you sent, so the next review round reads just the agent's follow-up. `i` again goes back to the scope you came from.
+- **Comments follow the code**: when the agent edits a file, each comment moves with the lines it is on, open file or not. A comment whose lines were rewritten or deleted stays where they were and says `code changed`, and a draft like that goes out marked so. A comment's lines inside a fold open it, where before the comment hid.
+- **Viewed marks**: `space` marks the file viewed and opens the next one you haven't viewed; on a viewed file it unmarks, and on a folder it marks every file in it. A file changed after you viewed it shows `!` until you view it again, and the file list counts what is viewed.
+- **The agent comments too**: `herdr-reviewr --comment <path>:<line>[-<end>] "<comment>"` puts the agent's own comment on those lines, as a thread you answer with `a`, resolve, or delete. It lands as a new comment, which `A` goes to. The command finds the review pane in the agent's tab, in the agent's own herdr session, so neither it nor `--reply` needs `--to` there. Every send's last lines name both commands and say where they come from.
+- **`--help`** lists the review UI's flags and the two commands an agent answers a review with. Run without a terminal, reviewr now says so instead of crashing.
+- **Breaking: `a`, `A`, `D`, `i` and `space` are new default keys.** A `[keybindings]` config that already uses one now collides and must move it. `space` binds by name, `viewed = ["space"]`.
 - **A folder of repositories**: started in a folder that holds repositories directly, like a workspace of clones, reviewr shows all their changes at once. Each repository is a folder in the file list and diffs against its own base, and toggle opens reviewr on such a folder. The PR tab, last turn and commits still need one repository.
 - **`default_base`**: branches the branch scope tries before the default branch, in order, each repository taking the first it has. `default_base = ["develop", "main"]` covers repositories with different trunks, and a pick still wins over it.
+
+### Changed
+- **`n` and `N` cross files**: past a file's last comment, `n` opens the next file holding one, around the review.
+- **Send goes to the agent beside reviewr**: with one agent in reviewr's own tab, `s` sends to it without the picker. The picker opens only when that tab holds none or several and the workspace more than one, listing the tab's agents first.
 
 ## [0.48.0] — 2026-10-19
 

@@ -49,6 +49,7 @@ fn world_input(repo: &Path, scope: Scope, base: Option<&str>, turn: Option<&str>
         default_base: Vec::new(),
         base_epoch: 0,
         turn_baseline: turn.map(str::to_string),
+        send_baselines: std::collections::BTreeMap::new(),
         commit_pick: None,
         toggled_dirs: std::collections::HashSet::default(),
     }

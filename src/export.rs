@@ -5,6 +5,68 @@ use anyhow::Result;
 use crate::herdr;
 use crate::model::Comment;
 
+/// One block a send carries: a new comment by its number (`true`: its code changed since), or a reply.
+#[derive(Clone, Copy, Debug)]
+pub enum Outgoing<'a> {
+    Comment(u64, &'a Comment, bool),
+    Reply(u64, &'a Comment, &'a str),
+}
+
+impl Outgoing<'_> {
+    fn comment(&self) -> &Comment {
+        match self {
+            Self::Comment(_, c, _) | Self::Reply(_, c, _) => c,
+        }
+    }
+
+    fn block(&self) -> String {
+        match self {
+            Self::Comment(n, c, false) => format!("#{n} {}", format_comment(c)),
+            // The snippet is what the reviewer saw; the note says the file no longer reads so.
+            Self::Comment(n, c, true) => format!(
+                "#{n} {}{CHANGED_NOTE}\n{}\n{}",
+                c.location(),
+                c.lines,
+                normalize_text(&c.text)
+            ),
+            Self::Reply(n, c, text) => {
+                format!("#{n} reply · {}\n{}", c.location(), normalize_text(text))
+            }
+        }
+    }
+}
+
+/// How a send marks a comment whose code changed after it was written.
+const CHANGED_NOTE: &str = " (the code changed since)";
+
+/// A send: the trimmed prefix, the blocks by file and start line, then how to answer, if anyone listens.
+pub fn format_send(prefix: Option<&str>, blocks: &[Outgoing<'_>], answer: Option<&str>) -> String {
+    let mut sorted = blocks.to_vec();
+    sorted.sort_by(|a, b| {
+        let (a, b) = (a.comment(), b.comment());
+        a.file.cmp(&b.file).then(a.start.cmp(&b.start))
+    });
+    let prefix = prefix
+        .map(|text| text.replace('\r', "").trim_end().to_owned())
+        .filter(|text| !text.is_empty());
+    prefix
+        .into_iter()
+        .chain(sorted.iter().map(Outgoing::block))
+        .chain(answer.map(str::to_owned))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// The lines that tell the agent how to answer, and to comment itself, at the pane `token` names.
+pub fn answer_line(token: &str) -> String {
+    format!(
+        "Answer each comment by its number in herdr-reviewr, the review pane this came from: \
+         herdr-reviewr --reply <number> --to {token} \"<answer>\"\n\
+         Comment on a line yourself: herdr-reviewr --comment <path>:<line> --to {token} \
+         \"<comment>\". herdr-reviewr --help explains both."
+    )
+}
+
 /// One comment as its export block: location, snippet, then text.
 pub fn format_comment(comment: &Comment) -> String {
     format!("{}\n{}\n{}", comment.location(), comment.lines, normalize_text(&comment.text))
@@ -39,7 +101,7 @@ pub trait ExportTarget {
     fn export(&self, text: &str) -> Result<()>;
     fn label(&self) -> &'static str;
     /// Destination-specific confirmation shown after a successful export.
-    fn success_message(&self, count: usize) -> String;
+    fn success_message(&self, what: &str) -> String;
     /// The status after a failed export, `copy` naming the copy key; the cause goes to the log.
     fn failure_message(&self, error: &anyhow::Error, copy: &str) -> String;
 }
@@ -64,6 +126,21 @@ pub(crate) fn counted_comments(count: usize) -> String {
     format!("{count} {noun}")
 }
 
+/// What a send carried: `2 comments`, `1 reply`, or `2 comments and 1 reply`.
+#[must_use]
+pub fn counted_send(comments: usize, replies: usize) -> String {
+    let replies = match replies {
+        0 => None,
+        1 => Some("1 reply".to_string()),
+        n => Some(format!("{n} replies")),
+    };
+    match (comments, replies) {
+        (0, Some(replies)) => replies,
+        (n, Some(replies)) => format!("{} and {replies}", counted_comments(n)),
+        (n, None) => counted_comments(n),
+    }
+}
+
 /// The system clipboard: the first tool on `PATH`, or the Win32 clipboard on Windows.
 #[derive(Debug)]
 pub struct Clipboard;
@@ -73,8 +150,8 @@ impl ExportTarget for Clipboard {
         "clipboard"
     }
 
-    fn success_message(&self, count: usize) -> String {
-        format!("copied {}", counted_comments(count))
+    fn success_message(&self, what: &str) -> String {
+        format!("copied {what}")
     }
 
     fn failure_message(&self, error: &anyhow::Error, _copy: &str) -> String {
@@ -182,8 +259,8 @@ impl ExportTarget for Agent {
     }
 
     /// Names the agent: the reviewer's only record of where the review went.
-    fn success_message(&self, count: usize) -> String {
-        format!("sent {} to {}", counted_comments(count), self.name)
+    fn success_message(&self, what: &str) -> String {
+        format!("sent {what} to {}", self.name)
     }
 
     /// Every send failure is a [`herdr::SendError`]; anything else only says the send failed.
@@ -205,7 +282,10 @@ impl ExportTarget for Agent {
 
 #[cfg(test)]
 mod tests {
-    use super::{Agent, Clipboard, ExportTarget, format_comment, format_review, send_failure};
+    use super::{
+        Agent, Clipboard, ExportTarget, Outgoing, answer_line, format_comment, format_review,
+        format_send, send_failure,
+    };
     use crate::model::{Comment, Side};
 
     #[cfg(not(windows))]
@@ -230,10 +310,12 @@ mod tests {
     fn export_confirmations_name_the_actual_result_and_pluralize_comments() {
         // The agent line names the pane it addressed.
         let agent = Agent { pane: "w8:p1".into(), name: "release-bot".into() };
-        assert_eq!(agent.success_message(1), "sent 1 comment to release-bot");
-        assert_eq!(agent.success_message(2), "sent 2 comments to release-bot");
-        assert_eq!(Clipboard.success_message(1), "copied 1 comment");
-        assert_eq!(Clipboard.success_message(2), "copied 2 comments");
+        assert_eq!(agent.success_message("1 comment"), "sent 1 comment to release-bot");
+        assert_eq!(Clipboard.success_message("2 comments"), "copied 2 comments");
+        assert_eq!(super::counted_send(1, 0), "1 comment");
+        assert_eq!(super::counted_send(0, 1), "1 reply");
+        assert_eq!(super::counted_send(0, 3), "3 replies");
+        assert_eq!(super::counted_send(2, 1), "2 comments and 1 reply");
     }
 
     #[test]
@@ -330,6 +412,33 @@ mod tests {
         let a1 = comment("a.rs", Side::New, 3, 3, "+z", "earlier");
         let out = format_review(None, &[&b, &a2, &a1]);
         assert_eq!(out, "a.rs:3\n+z\nearlier\n\na.rs:20\n+y\nlater\n\nb.rs:5\n+x\ntwo");
+    }
+
+    #[test]
+    fn a_send_numbers_each_block_and_ends_with_how_to_answer() {
+        let b = comment("b.rs", Side::New, 5, 5, "+x", "two");
+        let a = comment("a.rs", Side::Old, 3, 3, "-z", "one");
+        let blocks =
+            [Outgoing::Comment(2, &b, false), Outgoing::Reply(1, &a, "but why\n\nnot here?")];
+        let answer = answer_line("1f2e");
+        let out = format_send(Some("review:"), &blocks, Some(&answer));
+        assert_eq!(
+            out,
+            "review:\n\n#1 reply · a.rs:3 (removed)\nbut why\nnot here?\n\n#2 b.rs:5\n+x\ntwo\n\n\
+             Answer each comment by its number in herdr-reviewr, the review pane this came from: \
+             herdr-reviewr --reply <number> --to 1f2e \"<answer>\"\n\
+             Comment on a line yourself: herdr-reviewr --comment <path>:<line> --to 1f2e \
+             \"<comment>\". herdr-reviewr --help explains both."
+        );
+        assert_eq!(
+            format_send(None, &[Outgoing::Comment(3, &b, false)], None),
+            "#3 b.rs:5\n+x\ntwo"
+        );
+        assert_eq!(
+            format_send(None, &[Outgoing::Comment(3, &b, true)], None),
+            "#3 b.rs:5 (the code changed since)\n+x\ntwo",
+            "a comment whose code changed says so after its place"
+        );
     }
 
     #[test]

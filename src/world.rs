@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
 use anyhow::{Context, Result};
@@ -28,6 +29,9 @@ pub struct WorldInput {
     pub base_epoch: u64,
     /// The `last-turn` baseline tree the changed set diffs against; `None` before a turn.
     pub turn_baseline: Option<String>,
+    /// The trees the repositories held at the reviewer's last send, by name (`""` for a lone
+    /// repository): what `since send` diffs against.
+    pub send_baselines: BTreeMap<String, String>,
     /// The `commits` scope's pick, so a build of a replaced pick never lands.
     pub commit_pick: Option<CommitPick>,
     /// Expanded ignored directories whose children the `All files` tree loads.
@@ -48,6 +52,10 @@ impl WorldInput {
             default_base: self.default_base.clone(),
             base_epoch: self.base_epoch,
             turn_baseline: self.turn_baseline.clone(),
+            send_baselines: self
+                .send_baselines
+                .get(name)
+                .map_or_else(BTreeMap::new, |tree| BTreeMap::from([(String::new(), tree.clone())])),
             commit_pick: self.commit_pick.clone(),
             toggled_dirs: toggled.map(str::to_string).collect(),
         }
@@ -183,6 +191,26 @@ pub fn build(input: &WorldInput) -> Result<WorldSnapshot> {
     })
 }
 
+/// Every repository's worktree as a tree, by name (`""` for a lone repository), as a send's
+/// round starts from it; with the repositories it failed in, and why.
+pub fn snapshot_all(
+    root: &Path,
+    repos: &Repos,
+) -> (BTreeMap<String, String>, Vec<(String, String)>) {
+    let names: Vec<String> =
+        if repos.is_folder() { repos.names().to_vec() } else { vec![String::new()] };
+    let trees = crate::repos::par_map(&names, |name| git::snapshot_worktree(&root.join(name)));
+    let mut baselines = BTreeMap::new();
+    let mut failed = Vec::new();
+    for (name, tree) in names.into_iter().zip(trees) {
+        match tree {
+            Ok(tree) => drop(baselines.insert(name, tree)),
+            Err(e) => failed.push((name, format!("{e:#}"))),
+        }
+    }
+    (baselines, failed)
+}
+
 /// Merge a folder's repository builds into one, every path spelled from the folder.
 fn compose(
     parts: &BTreeMap<String, WorldSnapshot>,
@@ -262,6 +290,13 @@ fn scope_build(input: &WorldInput, head: Option<String>) -> Result<ScopeBuild> {
             Some(t) => {
                 let now = git::snapshot_worktree(&input.repo)?;
                 at_ends(&input.repo, DiffEnds { old: t.to_string(), new: Some(now) })
+            }
+            None => Ok(ScopeBuild::default()),
+        },
+        Scope::SinceSend => match input.send_baselines.get("") {
+            Some(sent) => {
+                let now = git::snapshot_worktree(&input.repo)?;
+                at_ends(&input.repo, DiffEnds { old: sent.clone(), new: Some(now) })
             }
             None => Ok(ScopeBuild::default()),
         },
@@ -558,6 +593,18 @@ impl Refresh {
         matches!(self, Self::Full)
     }
 
+    /// Whether it may re-read `path`, spelled from the folder in a folder's refresh.
+    pub fn covers(&self, path: &str, repos: &Repos) -> bool {
+        match self {
+            Self::Full => true,
+            // A staging change may widen into a full build.
+            Self::Paths { paths, index } => *index || git::covered(paths, path),
+            Self::Repos(each) => repos.locate(path).is_some_and(|(name, inner)| {
+                each.get(name).is_some_and(|r| r.covers(inner, &Repos::default()))
+            }),
+        }
+    }
+
     /// The paths it re-reads; `None` for a full build or a folder's.
     pub fn named_paths(&self) -> Option<&BTreeSet<String>> {
         match self {
@@ -666,6 +713,8 @@ pub struct WorldJob {
     /// Whether the result re-reveals the cursor: a user's switch does, a background one never.
     pub reveal: bool,
     pub refresh: Refresh,
+    /// Files to read back once built, where the refresh may have changed them; `true` wants the text.
+    pub probe: BTreeMap<String, bool>,
 }
 
 /// A finished job; no snapshot on the `PR` tab.
@@ -679,6 +728,54 @@ pub struct WorldCompletion {
     pub refresh: Refresh,
     /// How long the build took: the pacing budget's measure, which bounds its git's CPU.
     pub took: std::time::Duration,
+    /// The probed files the refresh may have changed, as they read after it.
+    pub probed: BTreeMap<String, Probed>,
+}
+
+/// One file as a build read it back: what its bytes hash to, and its text when asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Probed {
+    /// `None` while the file is missing or unreadable.
+    pub fingerprint: Option<u64>,
+    pub text: Option<Arc<str>>,
+}
+
+/// Read back each `wanted` path `refresh` may have changed, spelled from `root`.
+pub fn probe(
+    root: &Path,
+    repos: &Repos,
+    wanted: &BTreeMap<String, bool>,
+    refresh: &Refresh,
+) -> BTreeMap<String, Probed> {
+    wanted
+        .iter()
+        .filter(|(path, _)| refresh.covers(path, repos))
+        .map(|(path, &text)| (path.clone(), read_back(&root.join(path), text)))
+        .collect()
+}
+
+/// One file's [`Probed`]; past the size budget, its size and time stand in for its bytes.
+#[must_use]
+pub fn read_back(path: &Path, text: bool) -> Probed {
+    use std::hash::{Hash, Hasher};
+    let hash = |value: &dyn Fn(&mut std::collections::hash_map::DefaultHasher)| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        value(&mut hasher);
+        hasher.finish()
+    };
+    let missing = Probed { fingerprint: None, text: None };
+    let Ok(meta) = std::fs::metadata(path) else { return missing };
+    if crate::diff::over_byte_budget(usize::try_from(meta.len()).unwrap_or(usize::MAX)) {
+        let stamp = (meta.len(), meta.modified().ok());
+        return Probed { fingerprint: Some(hash(&|h| stamp.hash(h))), text: None };
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => Probed {
+            fingerprint: Some(hash(&|h| bytes.hash(h))),
+            text: text.then(|| String::from_utf8_lossy(&bytes).into()),
+        },
+        Err(_) => missing,
+    }
 }
 
 /// Run the world worker for `repo`; queued requests coalesce into the newest, keeping a reveal.
@@ -704,6 +801,12 @@ pub fn spawn(
                 } else {
                     None
                 };
+                let probed = match &snapshot {
+                    Some(Ok(_)) => {
+                        probe(&job.input.repo, &job.input.repos, &job.probe, &job.refresh)
+                    }
+                    _ => BTreeMap::new(),
+                };
                 let done = WorldCompletion {
                     generation: job.generation,
                     input: job.input,
@@ -711,6 +814,7 @@ pub fn spawn(
                     snapshot,
                     refresh: job.refresh,
                     took: started.elapsed(),
+                    probed,
                 };
                 if tx.send(done).is_err() {
                     break;

@@ -19,6 +19,7 @@ pub enum Action {
     HalfDown,
     ScopeUncommitted,
     ScopeBranch,
+    ScopeSinceSend,
     ScopeLastTurn,
     ScopeCommits,
     BasePick,
@@ -37,6 +38,12 @@ pub enum Action {
     Comment,
     Edit,
     Delete,
+    /// Answer a sent comment's thread.
+    Reply,
+    /// Close a sent comment's thread, or reopen a closed one.
+    Resolve,
+    /// Go to the next thread whose answer is unread.
+    NextAnswer,
     NextComment,
     PrevComment,
     Comments,
@@ -46,6 +53,8 @@ pub enum Action {
     Keys,
     Send,
     Copy,
+    /// Mark the file viewed and go to the next one not viewed, or unmark a viewed one.
+    Viewed,
     OpenPr,
     Refresh,
     Quit,
@@ -63,12 +72,13 @@ pub enum KeyCode {
     Down,
     PageUp,
     PageDown,
+    Space,
 }
 
 impl KeyCode {
     /// Every named key, the one list `by_name` and `names` derive from.
-    const NAMED: [KeyCode; 6] =
-        [Self::Left, Self::Right, Self::Up, Self::Down, Self::PageUp, Self::PageDown];
+    const NAMED: [KeyCode; 7] =
+        [Self::Left, Self::Right, Self::Up, Self::Down, Self::PageUp, Self::PageDown, Self::Space];
 
     /// The config spelling: the bare character, or the named key's lowercase name
     fn name(self) -> String {
@@ -80,6 +90,7 @@ impl KeyCode {
             Self::Down => "down".into(),
             Self::PageUp => "pageup".into(),
             Self::PageDown => "pagedown".into(),
+            Self::Space => "space".into(),
         }
     }
 
@@ -93,6 +104,7 @@ impl KeyCode {
             Self::Down => "↓".into(),
             Self::PageUp => "PageUp".into(),
             Self::PageDown => "PageDown".into(),
+            Self::Space => "space".into(),
         }
     }
 
@@ -152,7 +164,7 @@ impl Key {
 }
 
 /// Every action with its config name and default keys, the one table the keymap derives from.
-const ACTIONS: [(Action, &str, &[Key]); 45] = [
+const ACTIONS: [(Action, &str, &[Key]); 50] = [
     (Action::Down, "down", &[Key::plain('j'), Key::named(KeyCode::Down)]),
     (Action::Up, "up", &[Key::plain('k'), Key::named(KeyCode::Up)]),
     (Action::NextHunk, "next-hunk", &[Key::plain(']')]),
@@ -167,6 +179,7 @@ const ACTIONS: [(Action, &str, &[Key]); 45] = [
     (Action::HalfDown, "half-down", &[Key::ctrl('d')]),
     (Action::ScopeUncommitted, "scope-uncommitted", &[Key::plain('u')]),
     (Action::ScopeBranch, "scope-branch", &[Key::plain('b')]),
+    (Action::ScopeSinceSend, "scope-since-send", &[Key::plain('i')]),
     (Action::ScopeLastTurn, "scope-last-turn", &[Key::plain('t')]),
     (Action::ScopeCommits, "scope-commits", &[Key::plain('g')]),
     (Action::BasePick, "base-pick", &[Key::plain('B')]),
@@ -185,6 +198,9 @@ const ACTIONS: [(Action, &str, &[Key]); 45] = [
     (Action::Comment, "comment", &[Key::plain('c')]),
     (Action::Edit, "edit", &[Key::plain('e')]),
     (Action::Delete, "delete", &[Key::plain('d')]),
+    (Action::Reply, "reply", &[Key::plain('a')]),
+    (Action::Resolve, "resolve", &[Key::plain('D')]),
+    (Action::NextAnswer, "next-answer", &[Key::plain('A')]),
     (Action::NextComment, "next-comment", &[Key::plain('n')]),
     (Action::PrevComment, "prev-comment", &[Key::plain('N')]),
     (Action::Comments, "comments", &[Key::plain('l')]),
@@ -194,6 +210,7 @@ const ACTIONS: [(Action, &str, &[Key]); 45] = [
     (Action::Keys, "keys", &[Key::plain('?')]),
     (Action::Send, "send", &[Key::plain('s'), Key::plain('S')]),
     (Action::Copy, "copy", &[Key::plain('y'), Key::plain('Y')]),
+    (Action::Viewed, "viewed", &[Key::named(KeyCode::Space)]),
     (Action::OpenPr, "open-pr", &[Key::plain('o')]),
     (Action::Refresh, "refresh", &[Key::plain('r')]),
     (Action::Quit, "quit", &[Key::plain('q')]),

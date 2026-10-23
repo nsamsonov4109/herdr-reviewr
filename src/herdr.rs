@@ -383,18 +383,24 @@ pub fn connection_target() -> Option<(OsString, String)> {
     Some((var_os("HERDR_SOCKET_PATH")?, var("HERDR_PANE_ID")?))
 }
 
-/// This pane's (workspace, pane) ids: the environment's at launch, then what the herdr
+/// This pane's (workspace, pane, tab) ids: the environment's at launch, then what the herdr
 /// connection sees, since a move to another tab or workspace changes them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PaneIds {
     pub workspace: Option<String>,
     pub pane: Option<String>,
+    /// The tab the pane sits in, whose agent a send goes to first.
+    pub tab: Option<String>,
 }
 
 impl PaneIds {
     /// The ids herdr launched this pane with; none outside herdr.
     pub fn from_env() -> Self {
-        Self { workspace: var("HERDR_WORKSPACE_ID"), pane: var("HERDR_PANE_ID") }
+        Self {
+            workspace: var("HERDR_WORKSPACE_ID"),
+            pane: var("HERDR_PANE_ID"),
+            tab: var("HERDR_TAB_ID"),
+        }
     }
 }
 
@@ -446,19 +452,51 @@ fn agent_list() -> Result<Vec<AgentPane>, HerdrError> {
     parse_agents(&call(&["agent", "list"])?)
 }
 
-/// What `Send` does: one agent sends, several open the picker, none refuses.
+/// The name of the agent in `pane`, as the picker would show it; `None` outside herdr.
+pub fn agent_name(pane: &str) -> Option<String> {
+    let agents = agent_list().ok()?;
+    agents.iter().find(|agent| agent.pane_id == pane).map(AgentPane::row_name)
+}
+
+/// What `Send` does: the one agent beside this pane, else the workspace's one, sends; several
+/// open the picker; none refuses.
 pub fn send_target(ids: &PaneIds) -> Result<SendTarget, SendError> {
-    let (ws, me) = (ids.workspace.clone(), ids.pane.clone());
     let agents = agent_list()?;
-    // Candidates: agents in our workspace other than our pane, in herdr's own order.
-    let picked = candidates(&agents, ws.as_deref(), me.as_deref());
-    match picked.len() {
-        0 => Err(SendError::NoAgent),
-        // The sole-agent send shows no row, so only the picker pays for the tab-label call.
-        1 => Ok(SendTarget::One(picked[0].choice(&HashMap::new()))),
-        _ => {
-            let tabs = tab_labels(ws.as_deref());
+    match route(&agents, ids) {
+        Route::Nobody => Err(SendError::NoAgent),
+        // A send with no picker shows no row, so only the picker pays for the tab-label call.
+        Route::One(agent) => Ok(SendTarget::One(agent.choice(&HashMap::new()))),
+        Route::Pick(picked) => {
+            let tabs = tab_labels(ids.workspace.as_deref());
             Ok(SendTarget::Many(picked.into_iter().map(|agent| agent.choice(&tabs)).collect()))
+        }
+    }
+}
+
+/// Where a send goes among the agents herdr lists.
+#[derive(Debug, PartialEq, Eq)]
+enum Route<'a> {
+    Nobody,
+    One(&'a AgentPane),
+    /// Several: the picker, this pane's tab first and then herdr's order.
+    Pick(Vec<&'a AgentPane>),
+}
+
+/// The agent alone in this pane's tab is the one under review; with none or several there, the
+/// workspace decides as it always did, the tab's agents leading the picker.
+fn route<'a>(agents: &'a [AgentPane], ids: &PaneIds) -> Route<'a> {
+    let mut picked = candidates(agents, ids.workspace.as_deref(), ids.pane.as_deref());
+    let beside = |agent: &AgentPane| ids.tab.as_deref() == Some(agent.tab_id.as_str());
+    if let [only] = picked.iter().filter(|a| beside(a)).collect::<Vec<_>>().as_slice() {
+        return Route::One(only);
+    }
+    match picked.len() {
+        0 => Route::Nobody,
+        1 => Route::One(picked[0]),
+        _ => {
+            // Stable, so herdr's order holds within each group.
+            picked.sort_by_key(|agent| !beside(agent));
+            Route::Pick(picked)
         }
     }
 }
@@ -1072,6 +1110,46 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_send_goes_to_the_agent_alone_in_this_panes_tab() {
+        use super::{PaneIds, Route, route};
+        let agents = vec![
+            agent("w8:p1", "w8:t1", "w8"),
+            agent("w8:p2", "w8:t2", "w8"),
+            agent("w8:p3", "w8:t3", "w8"),
+            non_agent_pane("w8:p4", "w8:t2", "w8"),
+        ];
+        let ids = |tab: Option<&str>| PaneIds {
+            workspace: Some("w8".into()),
+            pane: Some("w8:p9".into()),
+            tab: tab.map(str::to_string),
+        };
+        let pane = |r: &Route<'_>| match r {
+            Route::One(a) => vec![a.pane_id.clone()],
+            Route::Pick(all) => all.iter().map(|a| a.pane_id.clone()).collect(),
+            Route::Nobody => Vec::new(),
+        };
+        let beside = route(&agents, &ids(Some("w8:t2")));
+        assert!(matches!(beside, Route::One(_)), "the tab's agent sends without asking");
+        assert_eq!(pane(&beside), ["w8:p2"]);
+        // A tab with no agent, or an unknown tab, leaves the workspace to choose.
+        assert_eq!(pane(&route(&agents, &ids(Some("w8:t9")))), ["w8:p1", "w8:p2", "w8:p3"]);
+        assert!(matches!(route(&agents, &ids(None)), Route::Pick(_)));
+        // Two agents in the tab: the picker, those two first.
+        let crowded = vec![
+            agent("w8:p1", "w8:t1", "w8"),
+            agent("w8:p2", "w8:t2", "w8"),
+            agent("w8:p5", "w8:t2", "w8"),
+        ];
+        let picked = route(&crowded, &ids(Some("w8:t2")));
+        assert!(matches!(picked, Route::Pick(_)));
+        assert_eq!(pane(&picked), ["w8:p2", "w8:p5", "w8:p1"]);
+        // One agent in the workspace still sends wherever it sits.
+        let lone = vec![agent("w8:p1", "w8:t1", "w8")];
+        assert!(matches!(route(&lone, &ids(Some("w8:t2"))), Route::One(_)));
+        assert_eq!(route(&[], &ids(Some("w8:t2"))), Route::Nobody);
     }
 
     #[test]

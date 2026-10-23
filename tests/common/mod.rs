@@ -234,10 +234,14 @@ pub fn enter_tab(app: &mut App, tab: herdr_reviewr::app::Tab) {
     land_world(app);
 }
 
-/// Land the queued world refresh synchronously, as the worker's completion would.
+/// Land the queued world refresh synchronously, as the worker's completion would, read-backs too.
 pub fn land_world(app: &mut App) {
-    let snapshot = herdr_reviewr::world::build(&app.world_input()).unwrap();
+    let input = app.world_input();
+    let snapshot = herdr_reviewr::world::build(&input).unwrap();
+    let full = herdr_reviewr::world::Refresh::Full;
+    let probed = herdr_reviewr::world::probe(&input.repo, &input.repos, &app.probe_paths(), &full);
     app.reconcile_world(snapshot);
+    app.land_probes(probed);
     app.world_request = None;
 }
 

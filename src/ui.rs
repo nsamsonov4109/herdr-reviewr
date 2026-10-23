@@ -13,7 +13,7 @@ use ratatui::widgets::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Band, Focus, FooterAction, Mode, Tab};
+use crate::app::{App, Band, Focus, FooterAction, Mode, Tab, ViewedMark};
 use crate::config::NavigatorPosition;
 use crate::diff::{FileDiff, MarkerKind, Notice, RenderedKind, Row};
 use crate::file_list::RowKind;
@@ -22,7 +22,7 @@ use crate::git;
 use crate::herdr::AgentChoice;
 use crate::keymap::Keymap;
 use crate::model::Side;
-use crate::model::{ChangeKind, ChangedFile, Comment};
+use crate::model::{Author, ChangeKind, ChangedFile, Comment, CommentStore};
 use crate::roles::Palette;
 use crate::roles::{Fill, Ink};
 use crate::snippet::{snippet_caption_sign, snippet_row_is_comment};
@@ -346,8 +346,7 @@ pub fn diff_row_heights(app: &App, area: Rect) -> Vec<usize> {
             let card: usize = cards
                 .iter()
                 .filter(|&&(row, ci)| row == i && Some(ci) != editing)
-                .filter_map(|&(_, ci)| app.store.get(ci))
-                .map(|c| comment_card_lines(c, width, p).len())
+                .map(|&(_, ci)| comment_card_lines(&app.store, ci, width, p).len())
                 .sum();
             base + card
         })
@@ -397,11 +396,9 @@ fn read_layout(app: &App, inner: Rect, cards: &[(usize, usize)]) -> Vec<Slot> {
         let segs = visible_height(&app.visible[i], gutter_w, width, app.wrap);
         let mut out: Vec<Slot> = (0..segs).map(|seg| Slot::Code { row: i, seg }).collect();
         for &(_, ci) in cards.iter().filter(|&&(row, _)| row == i) {
-            if Some(ci) != editing
-                && let Some(c) = app.store.get(ci)
-            {
+            if Some(ci) != editing {
                 out.extend(
-                    (0..comment_card_lines(c, width, p).len())
+                    (0..comment_card_lines(&app.store, ci, width, p).len())
                         .map(|line| Slot::Card { comment: ci, line }),
                 );
             }
@@ -722,8 +719,7 @@ fn render_text_selection(frame: &mut Frame, app: &App, area: Rect) {
         Surface::Card { comment } => {
             let pane = read_pane(area, app);
             let slots = app.painted_slots();
-            let Some(c) = app.store.get(comment) else { return };
-            let texts = card_body_lines(c, pane.inner.width as usize);
+            let texts = card_body_lines(&app.store, comment, pane.inner.width as usize);
             for (off, slot) in slots.iter().enumerate() {
                 let Slot::Card { comment: ci, line } = *slot else { continue };
                 if ci != comment || line == 0 {
@@ -837,11 +833,158 @@ const CARD_INDENT: usize = 2;
 /// Where a card's body text starts, from the pane's left edge: the indent plus `│ `.
 const CARD_TEXT_X: usize = CARD_INDENT + 2;
 
-/// A comment card's wrapped body lines, without its box glyphs.
-pub(crate) fn card_body_lines(c: &Comment, width: usize) -> Vec<String> {
-    let box_w = width.saturating_sub(CARD_INDENT).max(10);
-    let text_w = box_w.saturating_sub(4).max(1); // inside "│ " … " │"
-    c.text.split('\n').flat_map(|l| wrap_text(l, text_w)).collect()
+/// The widest a card's box gets, so a message wraps at a readable width in a wide pane.
+const CARD_MAX_WIDTH: usize = 96;
+
+/// A card's box width in a pane `width` columns wide.
+fn card_box_width(width: usize) -> usize {
+    width.saturating_sub(CARD_INDENT).clamp(10, CARD_MAX_WIDTH)
+}
+
+/// One line of a card's body: who wrote a message, a line of it, or the gap between two.
+enum CardLine {
+    /// The author of the message below, whether an agent, and what to say of it.
+    Author {
+        name: String,
+        agent: bool,
+        note: Note,
+    },
+    /// A line of a message, painted beside its author's bar.
+    Text {
+        text: String,
+        agent: bool,
+    },
+    Gap,
+}
+
+/// What an author line says after the name.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Note {
+    None,
+    /// The agent's newest message, which the reviewer hasn't gone to yet.
+    New,
+    /// The reviewer's reply, waiting for the next send.
+    NotSent,
+}
+
+impl CardLine {
+    /// What a selection copies from this line.
+    fn text(&self) -> String {
+        match self {
+            Self::Author { name, note: Note::NotSent, .. } => format!("{name}{NOT_SENT}"),
+            Self::Author { name, .. } => name.clone(),
+            Self::Text { text, .. } => text.clone(),
+            Self::Gap => String::new(),
+        }
+    }
+}
+
+/// How a reply of the reviewer's that waits for a send reads after its author.
+const NOT_SENT: &str = " · not sent";
+
+/// How the agent's newest message reads after its name until the reviewer goes to it.
+const NEW_NOTE: &str = " · new";
+
+/// The bar a message runs down, in its author's color, where the card's left border was.
+const MESSAGE_BAR: &str = "┃ ";
+
+/// How a card's title and list row say the lines under a comment changed since it was made.
+const CODE_CHANGED_NOTE: &str = "· code changed ";
+
+/// Comment `ci`'s card body: each message, the comment first, under its author and a gap apart.
+fn card_body(store: &CommentStore, ci: usize, width: usize) -> Vec<CardLine> {
+    let Some(c) = store.get(ci) else { return Vec::new() };
+    let text_w = card_box_width(width).saturating_sub(4).max(1); // inside "┃ " … " │"
+    let thread = store.thread(ci);
+    let opener = thread.map_or(&Author::Reviewer, |t| &t.opener);
+    let replies = thread.iter().flat_map(|t| &t.replies);
+    let messages: Vec<(&Author, &str, bool)> = std::iter::once((opener, c.text.as_str(), true))
+        .chain(replies.map(|r| (&r.author, r.text.as_str(), r.sent)))
+        .collect();
+    // Only the agent's newest message can be the one unread.
+    let unread = thread.is_some_and(|t| t.unread && !t.resolved);
+    let newest = messages.iter().rposition(|(author, ..)| matches!(author, Author::Agent(_)));
+    let mut out = Vec::new();
+    for (k, (author, text, sent)) in messages.into_iter().enumerate() {
+        if k > 0 {
+            out.push(CardLine::Gap);
+        }
+        let (name, agent) = match author {
+            Author::Reviewer => ("you".to_string(), false),
+            Author::Agent(name) => (name.clone(), true),
+        };
+        let note = match (unread && newest == Some(k), sent) {
+            (true, _) => Note::New,
+            (false, false) => Note::NotSent,
+            (false, true) => Note::None,
+        };
+        out.push(CardLine::Author { name, agent, note });
+        out.extend(tidy(text, text_w).into_iter().map(|text| CardLine::Text { text, agent }));
+    }
+    out
+}
+
+/// Comment `ci`'s card body without its box glyphs, as a selection reads it.
+pub(crate) fn card_body_lines(store: &CommentStore, ci: usize, width: usize) -> Vec<String> {
+    card_body(store, ci, width).iter().map(CardLine::text).collect()
+}
+
+/// A message as a card shows it at `width`: no blank runs or blank edges, and a `-` item as a
+/// `•` whose wrapped lines hang under its text.
+fn tidy(text: &str, width: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut gap = false;
+    for line in text.lines().map(str::trim_end) {
+        if line.trim().is_empty() {
+            gap = !out.is_empty();
+            continue;
+        }
+        if std::mem::take(&mut gap) {
+            out.push(String::new());
+        }
+        let indent = line.len() - line.trim_start().len();
+        let rest = &line[indent..];
+        let Some(item) = rest.strip_prefix("- ").or_else(|| rest.strip_prefix("* ")) else {
+            out.extend(wrap_text(line, width));
+            continue;
+        };
+        let hang = " ".repeat(indent + 2);
+        let pieces = wrap_text(item, width.saturating_sub(indent + 2).max(1));
+        for (i, piece) in pieces.into_iter().enumerate() {
+            let lead = if i == 0 { format!("{}• ", &line[..indent]) } else { hang.clone() };
+            out.push(format!("{lead}{piece}"));
+        }
+    }
+    out
+}
+
+/// Where a comment sits in its file, which its card's diff already names.
+fn line_ref(c: &Comment) -> String {
+    let lines = if c.start == c.end {
+        format!("line {}", c.start)
+    } else {
+        format!("lines {}–{}", c.start, c.end)
+    };
+    match c.side {
+        Side::Old => format!("{lines}, removed"),
+        Side::New => lines,
+    }
+}
+
+/// Where comment `ci`'s thread stands, as its badge says it, and the ink it says it in.
+pub(crate) fn card_state(store: &CommentStore, ci: usize) -> (&'static str, Ink) {
+    match store.thread(ci) {
+        None => ("draft", Ink::Warning),
+        Some(t) if t.resolved => ("resolved", Ink::TextMuted),
+        // Only an agent's own comment is unread before anyone answered it.
+        Some(t) if t.unread && t.replies.is_empty() => ("new comment", Ink::Accent),
+        Some(t) if t.unread => ("new answer", Ink::Accent),
+        Some(t) if t.replies.iter().any(|r| !r.sent) => ("reply not sent", Ink::Warning),
+        Some(t) if t.answered() => ("answered", Ink::Success),
+        // An agent's comment no one answered yet, read.
+        Some(t) if t.replies.is_empty() && t.opener != Author::Reviewer => ("open", Ink::TextMuted),
+        Some(_) => ("sent", Ink::TextMuted),
+    }
 }
 
 /// The card selection point under `(col, row)`.
@@ -888,7 +1031,8 @@ fn card_point(
     line: usize,
     col: u16,
 ) -> Option<crate::selection::Point> {
-    let texts = card_body_lines(app.store.get(comment)?, pane.inner.width as usize);
+    app.store.get(comment)?;
+    let texts = card_body_lines(&app.store, comment, pane.inner.width as usize);
     if texts.is_empty() {
         return None;
     }
@@ -1269,11 +1413,12 @@ pub fn hit_header(area: Rect, app: &App, keymap: &Keymap, col: u16, row: u16) ->
         let base_start = scope_end + BASE_GAP.len() as u16;
         let base_end = base_start + (lead.width() + name.width() + tail.width()) as u16;
         if (base_start..base_end).contains(&col) {
-            return Some(if app.scope == crate::model::Scope::Commits {
-                HeaderHit::Pick
-            } else {
-                HeaderHit::Base
-            });
+            return match app.scope {
+                crate::model::Scope::Commits => Some(HeaderHit::Pick),
+                // The round names a send, which no picker chooses.
+                crate::model::Scope::SinceSend => None,
+                _ => Some(HeaderHit::Base),
+            };
         }
     }
     None
@@ -1328,6 +1473,12 @@ fn scope_chip(app: &App) -> String {
 fn base_label(app: &App) -> Option<(String, String, String, String)> {
     if app.scope == crate::model::Scope::Commits {
         return pick_label(app);
+    }
+    // `since send` diffs against the round's snapshot, named by the send that took it.
+    if app.scope == crate::model::Scope::SinceSend {
+        let round = app.send_round();
+        return (round > 0)
+            .then(|| ("vs ".to_string(), format!("send {round}"), String::new(), String::new()));
     }
     if app.scope != crate::model::Scope::Branch {
         return None;
@@ -1512,6 +1663,19 @@ fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// The file list's title: `Files`, and in `Changes` how much of it is viewed once any is.
+fn files_title(app: &App) -> String {
+    let (viewed, changed) = app.viewed_counts();
+    if app.tab != Tab::Changes || viewed + changed == 0 {
+        return "Files".to_string();
+    }
+    let total = app.changed_count();
+    match changed {
+        0 => format!("Files · {viewed}/{total} viewed"),
+        _ => format!("Files · {viewed}/{total} viewed · {changed} changed since"),
+    }
+}
+
 /// The mark on a collapsed `All files` folder holding a change; a folder mixes kinds.
 const DIR_DOT: &str = "•";
 /// The columns every `All files` folder keeps for the dot, so names elide alike.
@@ -1519,7 +1683,7 @@ const DIR_DOT_RESERVE: usize = 2;
 
 fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
     let p = app.palette();
-    let block = bordered("Files", app.focus == Focus::Files, p);
+    let block = bordered(&files_title(app), app.focus == Focus::Files, p);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1528,6 +1692,7 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
         let msg = match app.tab {
             Tab::AllFiles => "no files",
             Tab::Changes if app.awaiting_turn() => app.turn_wait_message(),
+            Tab::Changes if app.awaiting_send() => "nothing sent yet",
             Tab::Changes if app.commits_gone() => gone.as_str(),
             _ => "no changes",
         };
@@ -1592,6 +1757,8 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
                             name: &row.name,
                             ignored: row.ignored,
                             emphasis: &[],
+                            fresh: app.has_new_answer(&app.entries[*index].path),
+                            viewed: app.viewed_mark(&app.entries[*index].path),
                         },
                         width,
                         on,
@@ -1611,25 +1778,43 @@ struct FileRowSpec<'a> {
     name: &'a str,
     ignored: bool,
     emphasis: &'a [(u32, u32)],
+    /// The file holds a thread whose answer is unread.
+    fresh: bool,
+    /// The reviewer marked the file viewed, and whether it changed since.
+    viewed: Option<ViewedMark>,
 }
+
+/// A file with a new answer: `name ●`.
+const FRESH_DOT: &str = " ●";
+/// A file viewed as it reads now: `name ✓`, the name dimmed.
+const VIEWED_MARK: &str = " ✓";
+/// A viewed file that changed since: `name !`.
+const CHANGED_MARK: &str = " !";
 
 /// A file row: `<indent><marker> <name> <stats>`, a long name eliding its head.
 fn file_row_item(row: &FileRowSpec<'_>, width: usize, on: Fill, p: &Palette) -> ListItem<'static> {
-    let FileRowSpec { indent, annotation, name, ignored, emphasis } = *row;
+    let FileRowSpec { indent, annotation, name, ignored, emphasis, fresh, viewed } = *row;
     let marker = annotation.map_or(String::new(), |a| format!("{} ", a.kind.marker()));
     let (additions, deletions) = annotation.map_or((0, 0), |a| (a.additions, a.deletions));
     let stats = stats_str(additions, deletions);
     let gap = if stats.is_empty() { 0 } else { 2 };
-    let fixed = indent.width() + marker.width() + stats.width() + gap;
+    let dot = if fresh { FRESH_DOT.width() } else { 0 };
+    let mark = match viewed {
+        Some(ViewedMark::Viewed) => VIEWED_MARK,
+        Some(ViewedMark::Changed) => CHANGED_MARK,
+        None => "",
+    };
+    let fixed = indent.width() + marker.width() + stats.width() + gap + dot + mark.width();
     let shown = elide_head(name, width.saturating_sub(fixed).max(1));
 
     let mut spans = vec![Span::styled(indent.to_string(), text_style(p, on))];
     if let Some(a) = annotation {
         spans.push(Span::styled(marker, Style::default().fg(kind_color(p, a.kind, on))));
     }
-    // An ignored file dims its name, never its change marker.
+    // An ignored or viewed file dims its name, never its change marker.
     let muted = Style::default().fg(p.ink(Ink::TextMuted, on));
-    let base_style = if ignored { muted } else { text_style(p, on) };
+    let done = ignored || viewed == Some(ViewedMark::Viewed);
+    let base_style = if done { muted } else { text_style(p, on) };
     let shown_spans = remap_emphasis(emphasis, name, &shown);
     if shown_spans.is_empty() {
         // Dim the parent directories, keep the basename bright.
@@ -1647,6 +1832,14 @@ fn file_row_item(row: &FileRowSpec<'_>, width: usize, on: Fill, p: &Palette) -> 
         spans.extend(emphasized_spans(&shown, &shown_spans, search_hl(p), |byte| {
             if byte < basename_at { muted } else { base_style }
         }));
+    }
+    if !mark.is_empty() {
+        let ink = if viewed == Some(ViewedMark::Changed) { Ink::Warning } else { Ink::TextMuted };
+        spans.push(Span::styled(mark, Style::default().fg(p.ink(ink, on))));
+    }
+    if fresh {
+        let dot = Style::default().fg(p.ink(Ink::Accent, on)).add_modifier(Modifier::BOLD);
+        spans.push(Span::styled(FRESH_DOT, dot));
     }
     if !stats.is_empty() {
         let used: usize = spans.iter().map(Span::width).sum();
@@ -1726,34 +1919,85 @@ fn elide_head(name: &str, max: usize) -> String {
     format!("…{tail}")
 }
 
-/// A saved comment's inline card: a box titled with its location, holding its text.
-fn comment_card_lines(c: &Comment, width: usize, p: &Palette) -> Vec<Line<'static>> {
+/// A saved comment's inline card: a box titled with its number and location, holding its thread.
+fn comment_card_lines(
+    store: &CommentStore,
+    ci: usize,
+    width: usize,
+    p: &Palette,
+) -> Vec<Line<'static>> {
     const INDENT: usize = CARD_INDENT;
-    let box_w = width.saturating_sub(INDENT).max(10);
-    let text_w = box_w.saturating_sub(4).max(1); // inside "│ " … " │"
+    let Some(c) = store.get(ci) else { return Vec::new() };
+    let box_w = card_box_width(width);
+    let text_w = box_w.saturating_sub(4).max(1); // inside "┃ " … " │"
+    let ink = |ink: Ink| Style::default().fg(p.ink(ink, Fill::Base));
     let border = Style::default().fg(p.mark(Ink::Border, Fill::Base));
-    let title = Style::default().fg(p.ink(Ink::Comment, Fill::Base)).add_modifier(Modifier::BOLD);
-    let body_style = Style::default().fg(p.ink(Ink::Text, Fill::Base));
     let pad = || Span::raw(" ".repeat(INDENT));
 
-    let label = truncate_width(&format!(" comment · {} ", c.location()), box_w.saturating_sub(3));
-    let fill = box_w.saturating_sub(3 + label.width());
+    // `╭─ #3 · line 71 · code changed ─── answered ─╮`: a narrow box drops the note, then the badge.
+    let number = format!(" #{}", store.number(ci).unwrap_or_default());
+    let (state, state_ink) = card_state(store, ci);
+    let room = box_w.saturating_sub(4);
+    let mut place = format!(" · {} ", line_ref(c));
+    let mut changed = if store.changed(ci) { CODE_CHANGED_NOTE.to_string() } else { String::new() };
+    let mut badge = format!(" {state} ");
+    if number.width() + place.width() + changed.width() + badge.width() > room {
+        changed.clear();
+    }
+    if number.width() + place.width() + badge.width() > room {
+        badge.clear();
+        place = truncate_width(&place, room.saturating_sub(number.width()));
+    }
+    let fill =
+        room.saturating_sub(number.width() + place.width() + changed.width() + badge.width());
     let mut lines = vec![Line::from(vec![
         pad(),
         Span::styled("╭─", border),
-        Span::styled(label, title),
-        Span::styled(format!("{}╮", "─".repeat(fill)), border),
+        Span::styled(number, ink(Ink::Comment).add_modifier(Modifier::BOLD)),
+        Span::styled(place, ink(Ink::TextSecondary)),
+        Span::styled(changed, ink(Ink::Warning)),
+        Span::styled("─".repeat(fill), border),
+        Span::styled(badge, ink(state_ink)),
+        Span::styled("─╮", border),
     ])];
 
-    // The selection model's own wrap, so paint and copy agree.
-    for piece in card_body_lines(c, width) {
-        let gap = " ".repeat(text_w.saturating_sub(piece.width()));
-        lines.push(Line::from(vec![
-            pad(),
-            Span::styled("│ ", border),
-            Span::styled(piece, body_style),
-            Span::styled(format!("{gap} │"), border),
-        ]));
+    // The selection model's own lines, so paint and copy agree; each message runs down its author's bar.
+    let voice = |agent: bool| if agent { Ink::Accent } else { Ink::Comment };
+    let bar = |agent: bool| {
+        Span::styled(MESSAGE_BAR, Style::default().fg(p.mark(voice(agent), Fill::Base)))
+    };
+    for line in card_body(store, ci, width) {
+        match line {
+            CardLine::Author { name, agent, note } => {
+                let (said, said_ink) = match note {
+                    Note::New => (NEW_NOTE, Ink::Accent),
+                    Note::NotSent => (NOT_SENT, Ink::Warning),
+                    Note::None => ("", Ink::TextMuted),
+                };
+                let name = truncate_width(&name, text_w.saturating_sub(said.width()));
+                let gap = " ".repeat(text_w.saturating_sub(name.width() + said.width()));
+                lines.push(Line::from(vec![
+                    pad(),
+                    bar(agent),
+                    Span::styled(name, ink(voice(agent)).add_modifier(Modifier::BOLD)),
+                    Span::styled(said, ink(said_ink)),
+                    Span::styled(format!("{gap} │"), border),
+                ]));
+            }
+            CardLine::Text { text, agent } => {
+                let gap = " ".repeat(text_w.saturating_sub(text.width()));
+                lines.push(Line::from(vec![
+                    pad(),
+                    bar(agent),
+                    Span::styled(text, ink(Ink::Text)),
+                    Span::styled(format!("{gap} │"), border),
+                ]));
+            }
+            CardLine::Gap => {
+                let blank = " ".repeat(text_w);
+                lines.push(Line::from(vec![pad(), Span::styled(format!("│ {blank} │"), border)]));
+            }
+        }
     }
 
     lines.push(Line::from(vec![
@@ -1886,11 +2130,7 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
             }
             Slot::Card { comment, line } => {
                 if card_cache.as_ref().is_none_or(|(c, _)| *c != comment) {
-                    let lines = app
-                        .store
-                        .get(comment)
-                        .map(|c| comment_card_lines(c, width, p))
-                        .unwrap_or_default();
+                    let lines = comment_card_lines(&app.store, comment, width, p);
                     card_cache = Some((comment, lines));
                 }
                 card_cache.as_ref().and_then(|(_, l)| l.get(line).cloned()).unwrap_or_default()
@@ -2623,7 +2863,11 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
     let p = app.palette();
     let loc = app.pending_location().unwrap_or_else(|| "comment".to_string());
     let editing = matches!(app.mode, Mode::Composing { editing: Some(_) });
-    let title = if editing { format!("edit · {loc}") } else { format!("comment · {loc}") };
+    let title = match app.replying_to() {
+        Some(number) => format!("reply #{number} · {loc}"),
+        None if editing => format!("edit · {loc}"),
+        None => format!("comment · {loc}"),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.mark(Ink::Comment, Fill::Base)))
@@ -2825,6 +3069,10 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         A::EditComment => (hint(K::Edit), "edit"),
         A::EditFile => (hint(K::Edit), "edit file"),
         A::DeleteComment => (hint(K::Delete), "delete"),
+        A::Reply => (hint(K::Reply), "reply"),
+        A::Resolve => (hint(K::Resolve), "resolve"),
+        A::NextAnswer => (hint(K::NextAnswer), "new answer"),
+        A::Viewed => (hint(K::Viewed), "viewed"),
         A::JumpComment => (format!("{}/{}", hint(K::NextComment), hint(K::PrevComment)), "jump"),
         A::ExpandFold => (hint(K::Expand), "expand fold"),
         A::CrossFile { forward: true } => (hint(K::NextHunk), "next file"),
@@ -2856,7 +3104,7 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
             ),
             "scope",
         ),
-        A::Send => return (hint(K::Send), format!("send {}", app.store.len())),
+        A::Send => return (hint(K::Send), format!("send {}", app.store.unsent())),
         A::List => (hint(K::Comments), "comments"),
         A::Copy => (hint(K::Copy), "copy"),
         A::QuitDiscard => {
@@ -2886,6 +3134,7 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
             let others: Vec<String> = [
                 (Scope::Uncommitted, K::ScopeUncommitted),
                 (Scope::Branch, K::ScopeBranch),
+                (Scope::SinceSend, K::ScopeSinceSend),
                 (Scope::LastTurn, K::ScopeLastTurn),
                 (Scope::Commits, K::ScopeCommits),
             ]
@@ -3205,15 +3454,51 @@ fn render_comments_list(frame: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, c)| {
             let on = cursor_fill(i == app.list_cursor);
+            let thread = app.store.thread(i);
+            let resolved = thread.is_some_and(|t| t.resolved);
+            // A resolved thread stays listed, greyed, so it can be read or reopened.
+            let ink = if resolved { Ink::TextMuted } else { Ink::Comment };
+            let number = app.store.number(i).unwrap_or_default();
             let loc = Span::styled(
-                format!(" {}", c.location()),
-                Style::default().fg(p.ink(Ink::Comment, on)).add_modifier(Modifier::BOLD),
+                format!(" #{number} {}", c.location()),
+                Style::default().fg(p.ink(ink, on)).add_modifier(Modifier::BOLD),
             );
-            let mut spans = vec![loc, Span::styled(format!("  {}", c.text), text_style(p, on))];
+            let body = if resolved {
+                Style::default().fg(p.ink(Ink::TextMuted, on))
+            } else {
+                text_style(p, on)
+            };
+            // Where the thread stands comes before the text, which a narrow list cuts first.
+            let (state, state_ink) = card_state(&app.store, i);
+            let mut spans = vec![
+                loc,
+                Span::styled(format!("  {state}"), Style::default().fg(p.ink(state_ink, on))),
+            ];
+            let replies = thread.map_or(0, |t| t.replies.len());
+            if replies > 0 {
+                let noun = if replies == 1 { "reply" } else { "replies" };
+                spans.push(Span::styled(
+                    format!(" · {replies} {noun}"),
+                    Style::default().fg(p.ink(Ink::TextMuted, on)),
+                ));
+            }
+            if app.store.changed(i) {
+                spans.push(Span::styled(
+                    format!(" {}", CODE_CHANGED_NOTE.trim_end()),
+                    Style::default().fg(p.ink(Ink::Warning, on)),
+                ));
+            }
             // A comment whose anchor may have moved is flagged, never dropped.
             if app.is_stale(c) {
-                spans.push(Span::styled("  (stale)", Style::default().fg(p.ink(Ink::Warning, on))));
+                spans.push(Span::styled(" · stale", Style::default().fg(p.ink(Ink::Warning, on))));
             }
+            // Who wrote the comment, then its first line.
+            let first = c.text.lines().next().unwrap_or_default();
+            let by = match thread.map(|t| &t.opener) {
+                Some(Author::Agent(name)) => format!("{name}: "),
+                _ => String::new(),
+            };
+            spans.push(Span::styled(format!("  {by}{first}"), body));
             // The list overlay is the active modal, so its row reads at full brightness.
             selectable_row(p, spans, width, on)
         })
@@ -3952,6 +4237,8 @@ fn render_search_results(
                         name: path,
                         ignored: false,
                         emphasis: &[],
+                        fresh: false,
+                        viewed: None,
                     },
                     width,
                     Fill::Base,
@@ -3972,6 +4259,8 @@ fn render_search_results(
                         name: &hit.path,
                         ignored: false,
                         emphasis: &hit.spans,
+                        fresh: false,
+                        viewed: None,
                     },
                     width,
                     on,

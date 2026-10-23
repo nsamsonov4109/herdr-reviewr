@@ -571,8 +571,11 @@ pub(crate) fn read_session(
         *terminal = mine.and_then(|p| p["terminal_id"].as_str()).map(str::to_string);
     }
     let field = |p: &Value, key: &str| p[key].as_str().map(str::to_string);
-    let me =
-        mine.map(|p| PaneIds { workspace: field(p, "workspace_id"), pane: field(p, "pane_id") });
+    let me = mine.map(|p| PaneIds {
+        workspace: field(p, "workspace_id"),
+        pane: field(p, "pane_id"),
+        tab: field(p, "tab_id"),
+    });
     // Unknown visibility (no focused tab, or this pane unlisted) keeps reviewr live.
     let visible = match (mine, snapshot["focused_tab_id"].as_str()) {
         (Some(p), Some(tab)) => p["tab_id"].as_str() == Some(tab),

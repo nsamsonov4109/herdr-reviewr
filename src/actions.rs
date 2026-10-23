@@ -19,12 +19,22 @@ use crate::proc::program_name;
 pub enum NonUiRun {
     /// `--action <name>`; a flag that ends argv names the empty action.
     Action(String),
+    /// `--reply <number> …` or `--comment <path>:<line> …`: an agent's message to its pane.
+    Reply,
+    /// `--help` or `-h`: the usage, which an agent reads before it answers.
+    Help,
 }
 
 impl NonUiRun {
     /// The non-UI run `args` asks for, anywhere in argv, or `None` for the review UI.
     pub fn from_args<S: AsRef<OsStr>>(args: &[S]) -> Option<Self> {
         let args: Vec<&OsStr> = args.iter().map(AsRef::as_ref).collect();
+        if args.iter().any(|arg| *arg == "--reply" || *arg == "--comment") {
+            return Some(Self::Reply);
+        }
+        if args.iter().any(|arg| *arg == "--help" || *arg == "-h") {
+            return Some(Self::Help);
+        }
         let at = args.iter().position(|arg| *arg == "--action")?;
         let name = args.get(at + 1).map(|name| name.to_string_lossy().into_owned());
         Some(Self::Action(name.unwrap_or_default()))
@@ -240,7 +250,7 @@ impl Target {
         let context: Value = var("HERDR_PLUGIN_CONTEXT_JSON")
             .and_then(|json| serde_json::from_str(&json).ok())
             .unwrap_or_default();
-        let herdr::PaneIds { workspace: ws, pane } = herdr::PaneIds::from_env();
+        let herdr::PaneIds { workspace: ws, pane, .. } = herdr::PaneIds::from_env();
         Ok(Self {
             ws: ws.ok_or_else(no_workspace)?,
             pane,

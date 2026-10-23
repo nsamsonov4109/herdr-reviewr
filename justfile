@@ -19,7 +19,7 @@ lint:
 # run the test suite, cut off from the herdr it may run inside: a test that reaches `herdr`
 # gets a binary that refuses and no socket, never a live agent pane
 test:
-    env -u HERDR_WORKSPACE_ID -u HERDR_PANE_ID -u HERDR_SOCKET_PATH HERDR_BIN_PATH=false cargo test --all-features
+    env -u HERDR_WORKSPACE_ID -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_SOCKET_PATH HERDR_BIN_PATH=false cargo test --all-features
 
 # build (debug)
 build:

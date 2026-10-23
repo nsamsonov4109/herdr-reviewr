@@ -30,8 +30,13 @@ impl Worker {
     /// needed re-reading.
     fn run(&mut self, input: &WorldInput, refresh: Refresh) -> (WorldInput, Option<WorldSnapshot>) {
         self.generation += 1;
-        let job =
-            WorldJob { generation: self.generation, input: input.clone(), reveal: false, refresh };
+        let job = WorldJob {
+            generation: self.generation,
+            input: input.clone(),
+            reveal: false,
+            refresh,
+            probe: std::collections::BTreeMap::new(),
+        };
         self.jobs.send(job).unwrap();
         let completion = self.done.recv().unwrap();
         (completion.input, completion.snapshot.map(|s| s.expect("the build succeeds")))

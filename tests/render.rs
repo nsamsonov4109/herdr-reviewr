@@ -405,7 +405,146 @@ fn a_saved_comment_renders_inline_as_a_card() {
 
     let out = render(&app);
     assert!(out.contains("memoize this"), "the saved comment stays visible inline: {out:?}");
-    assert!(out.contains("comment ·"), "the inline card is titled with the location");
+    assert!(out.contains("#1 · line 2"), "the inline card is titled with its number and line");
+}
+
+#[test]
+fn a_thread_card_carries_its_number_its_state_and_its_replies() {
+    let r = Repo::init();
+    r.write("a.rs", "alpha\nbeta\n");
+    r.commit_all("init");
+    r.write("a.rs", "alpha\nBETA\n");
+    let mut app = app_on(&r);
+    app.focus = Focus::Diff;
+    app.diff_cursor = app.visible.iter().position(|row| row.marker() == '+').unwrap();
+    app.start_comment();
+    for ch in "why upper case?".chars() {
+        app.input_push(ch);
+    }
+    app.submit_comment();
+    let out = render(&app);
+    assert!(out.contains("╭─ #1 · line 2 ") && out.contains(" draft ─╮"), "a draft:\n{out}");
+
+    // As a send leaves it: the comment, now a thread, answered.
+    app.store.mark_sent();
+    let answer =
+        "It names a constant.\n\n\n\nSo each step:\n- even: pop the stats;\n- odd: print them.\n\n";
+    app.receive_reply(1, answer.into(), None);
+    let out = render(&app);
+    assert!(out.contains(" new answer ─╮"), "the agent spoke last, unread:\n{out}");
+    assert!(out.contains("a.rs ●"), "its file wears the new-answer dot:\n{out}");
+    assert!(out.contains("┃ agent · new"), "the unread message says so by its author:\n{out}");
+    app.store.mark_read(0);
+    let out = render(&app);
+    assert!(out.contains(" answered ─╮") && !out.contains("a.rs ●"), "read:\n{out}");
+    assert!(!out.contains("· new"), "read, it is new no more:\n{out}");
+    assert!(out.contains("• even: pop the stats;"), "an item reads as a bullet:\n{out}");
+    // Each message opens under its author, a blank row apart, its lines down the author's bar.
+    let rows: Vec<&str> = out.lines().collect();
+    let at = |text: &str| rows.iter().position(|l| l.contains(text)).unwrap();
+    let (you, comment, agent, first) =
+        (at("┃ you"), at("┃ why upper case?"), at("┃ agent"), at("┃ It names a constant."));
+    assert_eq!((comment, agent, first), (you + 1, you + 3, you + 4), "{out}");
+    assert!(rows[you + 2].trim_matches(['│', ' ']).is_empty(), "a gap between messages:\n{out}");
+    assert!(
+        rows[first + 1].trim_matches(['┃', '│', ' ']).is_empty(),
+        "a blank run reads as one row"
+    );
+    assert!(rows[first + 2].contains("┃ So each step:"), "{out}");
+
+    // A reply of the reviewer's waits, and says so.
+    app.focus = Focus::Diff;
+    app.start_reply();
+    for ch in "then name it".chars() {
+        app.input_push(ch);
+    }
+    app.submit_comment();
+    let out = render(&app);
+    assert!(out.contains("┃ you · not sent") && out.contains(" reply not sent ─╮"), "{out}");
+    assert!(out.contains("s send 1"), "the next send carries the one reply:\n{out}");
+    // The list says where each thread stands before its text, which a narrow list cuts.
+    app.open_list();
+    let out = render_at(&app, 100);
+    let row = out.lines().find(|l| l.contains("#1 a.rs:2")).expect("the thread's row");
+    let (state, text) = (row.find("reply not sent").unwrap(), row.find("why upper case?").unwrap());
+    assert!(state < text, "{row}");
+}
+
+#[test]
+fn a_card_wraps_at_a_readable_width_in_a_wide_pane() {
+    let r = Repo::init();
+    r.write("a.rs", "alpha\nbeta\n");
+    r.commit_all("init");
+    r.write("a.rs", "alpha\nBETA\n");
+    let mut app = app_on(&r);
+    app.focus = Focus::Diff;
+    app.diff_cursor = app.visible.iter().position(|row| row.marker() == '+').unwrap();
+    app.start_comment();
+    for ch in "word ".repeat(60).chars() {
+        app.input_push(ch);
+    }
+    app.submit_comment();
+    let out = render_at(&app, 240);
+    let top = out.lines().find(|l| l.contains("╭─ #1")).expect("the card's title");
+    let card = top.trim_start_matches(|c: char| c != '╭');
+    let width = unicode_width::UnicodeWidthStr::width(card.trim_end_matches(|c: char| c != '╮'));
+    assert_eq!(width, 96, "the box stops at its readable width:\n{out}");
+}
+
+#[test]
+fn viewed_files_wear_their_mark_and_the_list_counts_them() {
+    let r = Repo::init();
+    r.write("a.rs", "1\n");
+    r.write("b.rs", "1\n");
+    r.write("c.rs", "1\n");
+    r.commit_all("init");
+    for name in ["a.rs", "b.rs", "c.rs"] {
+        r.write(name, "2\n");
+    }
+    let mut app = app_on(&r);
+    app.toggle_viewed();
+    app.toggle_viewed();
+    r.write("b.rs", "3\n");
+    common::land_world(&mut app);
+    let out = render(&app);
+    assert!(out.contains("a.rs ✓"), "a viewed file wears its check:\n{out}");
+    assert!(out.contains("b.rs !"), "a file changed since wears the warning:\n{out}");
+    assert!(out.contains("Files · 1/3 viewed · 1 changed since"), "{out}");
+}
+
+#[test]
+fn an_agents_comment_opens_under_its_name() {
+    let r = Repo::init();
+    r.write("a.rs", "alpha\nbeta\n");
+    r.commit_all("init");
+    r.write("a.rs", "alpha\nBETA\n");
+    let mut app = app_on(&r);
+    let path = std::fs::canonicalize(r.path().join("a.rs")).unwrap();
+    app.receive_comment(&path, 2, 2, "upper-cased on purpose".into(), Some("claude".into()))
+        .unwrap();
+    let out = render(&app);
+    assert!(out.contains(" new comment ─╮"), "{out}");
+    assert!(out.contains("┃ claude · new"), "its text opens under its author:\n{out}");
+    assert!(out.contains("upper-cased on purpose") && out.contains("a.rs ●"), "{out}");
+    app.store.mark_read(0);
+    assert!(render(&app).contains(" open ─╮"), "read, no one answered yet");
+}
+
+#[test]
+fn since_send_names_its_round_or_says_nothing_was_sent() {
+    // The snapshot reads the worktree, so the repo stays.
+    let r = Repo::init();
+    r.write("hello.rs", "alpha\nbeta\n");
+    r.commit_all("init");
+    r.write("hello.rs", "alpha\nBETA\n");
+    let mut app = app_on(&r);
+    app.toggle_since_send().unwrap();
+    let out = render(&app);
+    assert!(out.contains("[since send]") && out.contains("nothing sent yet"), "{out}");
+    let (baselines, failed) = herdr_reviewr::world::snapshot_all(&app.repo, app.repos());
+    app.land_send_baselines(baselines, &failed);
+    app.reload().unwrap();
+    assert!(render(&app).contains("[since send] vs send 1"), "{}", render(&app));
 }
 
 #[test]
@@ -1382,7 +1521,7 @@ fn the_comments_list_flags_a_stale_comment() {
     app.open_list();
 
     let out = render(&app);
-    assert!(out.contains("(stale)"), "stale comment flagged in the list:\n{out}");
+    assert!(out.contains("· stale"), "stale comment flagged in the list:\n{out}");
 }
 
 #[test]
@@ -4074,7 +4213,7 @@ fn the_commits_header_names_the_pick_and_its_verdict() {
     );
     let footer = footer_line(&out);
     assert!(footer.trim_start().starts_with("G commits"), "{footer}");
-    assert!(footer.contains("u/b/t scope"), "the other three scopes: {footer}");
+    assert!(footer.contains("u/b/i/t scope"), "the other four scopes: {footer}");
 }
 
 #[test]

@@ -6,9 +6,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
+use crate::anchor::LineMap;
 use crate::config::DiffView;
 use crate::diff::{DiffCache, FileDiff, RenderedKind, Row, View};
-use crate::export::{Agent, ExportTarget, format_review};
+use crate::export::{Agent, ExportTarget, format_send};
 use crate::file_list::{self, Entry, RowKind};
 use crate::forge;
 use crate::git;
@@ -16,7 +17,9 @@ use crate::herdr::{self, AgentChoice, SendTarget};
 use crate::highlight::Highlighter;
 use crate::logln;
 use crate::marks::{MarkMap, Unit, diff_lines};
-use crate::model::{ChangeKind, ChangedFile, Comment, CommentStore, CommitPick, Rev, Scope, Side};
+use crate::model::{
+    Author, ChangeKind, ChangedFile, Comment, CommentStore, CommitPick, Rev, Scope, Side,
+};
 use crate::rendered::{Built, Content, OldMap, RenderedIndex, RenderedInput, RenderedView, RowId};
 use crate::roles::Palette;
 use crate::split::{Pair, Visible};
@@ -495,6 +498,14 @@ pub enum FooterAction {
     EditFile,
     DeleteComment,
     JumpComment,
+    /// Answer a sent comment's thread.
+    Reply,
+    /// Close or reopen a sent comment's thread.
+    Resolve,
+    /// Go to the next thread with an unread answer.
+    NextAnswer,
+    /// Mark the file viewed and go on to the next.
+    Viewed,
     ExpandFold,
     /// Take the armed crossing by repeating its hunk step.
     CrossFile {
@@ -599,6 +610,20 @@ struct LastClick {
 const FOLDER_COMMITS: &str = "commits need one repo, not a folder of them";
 
 /// The full state of the review session.
+/// A viewed file's mark: still as viewed, or changed since.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewedMark {
+    Viewed,
+    Changed,
+}
+
+/// A file's two sides as the open view read them.
+#[derive(Clone, Debug, Default)]
+struct OpenText {
+    old: std::sync::Arc<str>,
+    new: std::sync::Arc<str>,
+}
+
 // The bools are independent toggles, not a hidden state machine.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
@@ -712,6 +737,12 @@ pub struct App {
     last_click: Option<LastClick>,
     /// Whether a gesture held a reload, owed at its end.
     view_reload_held: bool,
+    /// The open file's two sides as read: the text a new comment's lines count in.
+    open_text: OpenText,
+    /// The files marked viewed, each with what its bytes hashed to then (`None`: no file).
+    viewed: HashMap<String, Option<u64>>,
+    /// What each viewed file's bytes hash to as last read.
+    viewed_now: HashMap<String, Option<u64>>,
     pub store: CommentStore,
     pub list_cursor: usize,
     /// The agent picker's rows, frozen at open.
@@ -721,6 +752,21 @@ pub struct App {
     pub picker_over: Mode,
     /// The agent of the last successful send, which arms the picker.
     pub last_sent_pane: Option<String>,
+    /// That agent's name, which its answers carry.
+    last_sent_name: Option<String>,
+    /// What the agent names this pane by to answer, while the reply channel listens.
+    pub reply_token: Option<String>,
+    /// The comment id the composer answers, while composing a reply.
+    reply_to: Option<u64>,
+    /// The trees the repositories held at the last send whose snapshot landed, which
+    /// `since send` diffs against (`""` for a lone repository).
+    send_baselines: std::collections::BTreeMap<String, String>,
+    /// How many sends' snapshots landed: the round `since send` names.
+    send_round: u64,
+    /// The scope `since send` was entered from by its key, which the key returns to.
+    scope_before_send: Option<Scope>,
+    /// A send succeeded: the loop snapshots every repository for its round.
+    pub snapshot_request: bool,
     /// The base picker's rows, filter, and highlight while `Mode::BasePick` is open
     pub base_picker: Option<BasePicker>,
     pub mode: Mode,
@@ -910,6 +956,9 @@ impl App {
             hover: None,
             last_click: None,
             view_reload_held: false,
+            open_text: OpenText::default(),
+            viewed: HashMap::new(),
+            viewed_now: HashMap::new(),
             select_anchor: None,
             comment_target: None,
             store: CommentStore::new(),
@@ -918,6 +967,13 @@ impl App {
             picker_cursor: 0,
             picker_over: Mode::Normal,
             last_sent_pane: None,
+            last_sent_name: None,
+            reply_token: None,
+            reply_to: None,
+            send_baselines: std::collections::BTreeMap::new(),
+            send_round: 0,
+            scope_before_send: None,
+            snapshot_request: false,
             base_picker: None,
             mode: Mode::Normal,
             input: String::new(),
@@ -1059,6 +1115,16 @@ impl App {
         self.keys_expanded = old.keys_expanded;
         // Session memory, like the comments.
         self.last_sent_pane = old.last_sent_pane.take();
+        self.last_sent_name = old.last_sent_name.take();
+        // The channel the sent threads named still listens, so their answers still land.
+        self.reply_token = old.reply_token.take();
+        // Viewed marks are the reviewer's work, like the comments.
+        self.viewed = std::mem::take(&mut old.viewed);
+        self.viewed_now = std::mem::take(&mut old.viewed_now);
+        // The round is session memory, like the threads it follows.
+        self.send_baselines = std::mem::take(&mut old.send_baselines);
+        self.send_round = old.send_round;
+        self.scope_before_send = old.scope_before_send.take();
         // The commit pick is session memory like the comments: replaced, never cleared
         self.commit_pick = old.commit_pick.take();
         self.navigator_side_pct = old.navigator_side_pct;
@@ -1117,6 +1183,7 @@ impl App {
                 self.mode = old.mode.clone();
                 self.input = std::mem::take(&mut old.input);
                 self.caret = old.caret;
+                self.reply_to = old.reply_to.take();
                 // The base picker survives recovery whole — rows, filter, and highlight
                 self.base_picker = old.base_picker.take();
                 // So does the commit picker, with its highlight and anchor.
@@ -1258,6 +1325,7 @@ impl App {
             default_base: self.default_base().to_vec(),
             base_epoch: self.base_epoch,
             turn_baseline: self.herdr.last_turn.tree().map(str::to_string),
+            send_baselines: self.send_baselines.clone(),
             commit_pick: self.commit_pick.clone(),
             // `Changes` never reads the toggled set, so a toggle there invalidates nothing.
             toggled_dirs: if self.tab == Tab::AllFiles {
@@ -1401,6 +1469,7 @@ impl App {
         let previous_path = self.rename_source(&path);
         let (old, new) = match self.content_sides(&path) {
             Ok((old, new)) => {
+                self.follow_comments(&path, &old, &new);
                 self.diff = self.cache.get(path, previous_path, &old, &new, &self.highlighter);
                 (old, new)
             }
@@ -1409,6 +1478,7 @@ impl App {
                 (String::new(), String::new())
             }
         };
+        self.open_text = OpenText { old: old.as_str().into(), new: new.as_str().into() };
         // The new side is the render input, the old side the marks' base; a notice holds none.
         let renders = self.markdown_file() && self.diff.notice.is_none();
         self.rendered.content = if renders { self.content(new, Some(old)) } else { None };
@@ -1425,6 +1495,12 @@ impl App {
         self.diff_path = Some(path.to_string());
         self.expanded_folds.clear(); // the File view has no folds
         let (diff, content) = self.file_view(path);
+        if diff.notice.is_none() {
+            let worktree =
+                |c: &Comment| c.file == path && c.side == Side::New && c.rev == Rev::Worktree;
+            self.store.follow(worktree, &content);
+        }
+        self.open_text = OpenText { old: "".into(), new: content.as_str().into() };
         // A notice never renders, so its content is not held.
         let renders = self.markdown_file() && diff.notice.is_none();
         self.rendered.content = if renders { self.content(content, None) } else { None };
@@ -1537,9 +1613,17 @@ impl App {
                 Some((from, ..)) if !choose => from == Shown::Split && self.diff.view == View::Diff,
                 _ => self.wants_split(),
             };
+            // A fold holding a shown comment's line opens, so no comment hides in one.
+            let spans = self.comment_spans();
+            let holds = |lines: &[Row]| {
+                lines.iter().any(|l| {
+                    spans.iter().any(|&(side, s, e)| l.no(side).is_some_and(|n| s <= n && n <= e))
+                })
+            };
             let rows = self.diff.rows.iter().flat_map(|row| match row {
                 Row::Fold { lines }
-                    if row.fold_anchor().is_some_and(|a| self.expanded_folds.contains(&a)) =>
+                    if row.fold_anchor().is_some_and(|a| self.expanded_folds.contains(&a))
+                        || holds(lines) =>
                 {
                     lines.clone()
                 }
@@ -1815,6 +1899,55 @@ impl App {
         // bottom half: leave diff_scroll — the content above the fold stays put, grow downward
     }
 
+    /// The files a build reads back: each viewed one, and each a comment follows, its text wanted.
+    pub fn probe_paths(&self) -> std::collections::BTreeMap<String, bool> {
+        let mut paths: std::collections::BTreeMap<String, bool> =
+            self.viewed.keys().map(|p| (p.clone(), false)).collect();
+        for c in self.store.iter().filter(|c| c.side == Side::New && c.rev == Rev::Worktree) {
+            paths.insert(c.file.clone(), true);
+        }
+        paths
+    }
+
+    /// Land what a build read back: comments in files not open follow their lines there.
+    pub fn land_probes(
+        &mut self,
+        probed: std::collections::BTreeMap<String, crate::world::Probed>,
+    ) {
+        for (path, probe) in probed {
+            if self.viewed.contains_key(&path) {
+                self.viewed_now.insert(path.clone(), probe.fingerprint);
+            }
+            // The open file's comments follow the sides its own view read.
+            if self.diff_path.as_deref() == Some(path.as_str()) {
+                continue;
+            }
+            if let Some(text) = probe.text {
+                let ours =
+                    |c: &Comment| c.file == path && c.side == Side::New && c.rev == Rev::Worktree;
+                self.store.follow(ours, &text);
+            }
+        }
+    }
+
+    /// The comments on `path` follow their lines to where its sides now read them (Continuity).
+    fn follow_comments(&mut self, path: &str, old: &str, new: &str) {
+        // A path outside the landed changeset reads empty: no side to follow into.
+        let Some(file) = self.changeset.files.get(path) else { return };
+        let has_old = !matches!(file.kind, ChangeKind::Added | ChangeKind::Untracked);
+        let has_new = file.kind != ChangeKind::Deleted;
+        let rev = self.current_rev();
+        if has_new {
+            self.store.follow(|c| c.file == path && c.side == Side::New && c.rev == rev, new);
+        }
+        if has_old {
+            let ours = |c: &Comment| {
+                c.file == path && c.side == Side::Old && c.diff_anchored && c.rev == rev
+            };
+            self.store.follow(ours, old);
+        }
+    }
+
     /// `path`'s sides from the landed build's record: a notice, or one `git diff` of the scope's ends.
     fn content_sides(&self, path: &str) -> Result<(String, String), crate::diff::Notice> {
         use crate::diff::Notice;
@@ -1886,6 +2019,51 @@ impl App {
     /// `last-turn` with no baseline captured yet.
     pub fn awaiting_turn(&self) -> bool {
         self.scope == Scope::LastTurn && self.herdr.last_turn.tree().is_none()
+    }
+
+    /// `scope-since-send`: what changed after the last send, or, pressed there, back to the scope
+    /// it was entered from.
+    pub fn toggle_since_send(&mut self) -> Result<()> {
+        if self.scope == Scope::SinceSend {
+            let back = self.scope_before_send.take().unwrap_or(Scope::Branch);
+            return self.set_scope(back);
+        }
+        let from = self.scope;
+        self.set_scope(Scope::SinceSend)?;
+        if self.scope == Scope::SinceSend {
+            self.scope_before_send = Some(from);
+        }
+        Ok(())
+    }
+
+    /// A send's snapshot landed: `since send` diffs against it from here, as its next round.
+    pub fn land_send_baselines(
+        &mut self,
+        baselines: std::collections::BTreeMap<String, String>,
+        failed: &[(String, String)],
+    ) {
+        if let Some((name, why)) = failed.first() {
+            let name = if name.is_empty() { "the repository" } else { name.as_str() };
+            self.status = format!("the send's snapshot failed in {name}: {why}");
+        }
+        if baselines.is_empty() {
+            return;
+        }
+        self.send_baselines = baselines;
+        self.send_round += 1;
+        if self.scope == Scope::SinceSend {
+            self.request_world_refresh(false);
+        }
+    }
+
+    /// The round `since send` shows, from 1; `0` before any send's snapshot landed.
+    pub fn send_round(&self) -> u64 {
+        self.send_round
+    }
+
+    /// Whether `since send` is on screen with nothing sent to diff against yet.
+    pub fn awaiting_send(&self) -> bool {
+        self.scope == Scope::SinceSend && self.send_baselines.is_empty()
     }
 
     /// The message for an [`Self::awaiting_turn`] frame; "no agent" only once a sample looked.
@@ -3606,19 +3784,258 @@ impl App {
         // Editing from the comments-list overlay returns there on finish (else to the diff).
         let from_list = self.mode == Mode::List;
         let Some(i) = self.target_comment() else { return };
-        let Some(c) = self.store.get(i) else { return };
-        let (file, text) = (c.file.clone(), c.text.clone());
+        // The agent read it as sent, or wrote it: what follows is a reply, never a rewrite.
+        if let Some(thread) = self.store.thread(i) {
+            let key = self.keymap().hint(crate::keymap::Action::Reply).label();
+            self.status = match &thread.opener {
+                Author::Agent(name) => format!("{name}'s comment: {key} replies"),
+                Author::Reviewer => format!("a sent comment stays as sent: {key} replies"),
+            };
+            return;
+        }
+        let Some(text) = self.store.get(i).map(|c| c.text.clone()) else { return };
+        self.open_comment_row(i);
+        self.caret = text.chars().count(); // edit opens with the caret at the end
+        self.input = text;
+        self.resume_list = from_list;
+        self.mode = Mode::Composing { editing: Some(i) };
+        self.target_comment_card(i);
+    }
+
+    /// `reply`: answer the sent comment under the cursor or the list's highlight, under its card.
+    pub fn start_reply(&mut self) {
+        let from_list = self.mode == Mode::List;
+        let Some(i) = self.target_comment() else { return };
+        if self.store.thread(i).is_none() {
+            self.status = "only a sent comment takes replies".to_string();
+            return;
+        }
+        self.open_comment_row(i);
+        self.input.clear();
+        self.caret = 0;
+        self.resume_list = from_list;
+        self.reply_to = self.store.id(i);
+        self.mode = Mode::Composing { editing: None };
+        self.target_comment_card(i);
+        self.store.mark_read(i);
+    }
+
+    /// The number of the thread the composer answers, while it answers one.
+    pub fn replying_to(&self) -> Option<u64> {
+        let index = self.store.index_of(self.reply_to?)?;
+        self.composing().then(|| self.store.number(index)).flatten()
+    }
+
+    /// `resolve`: close the thread under the cursor or the list's highlight, or reopen a closed one.
+    pub fn toggle_resolved(&mut self) {
+        let Some(i) = self.target_comment() else { return };
+        let (Some(thread), Some(number)) = (self.store.thread(i), self.store.number(i)) else {
+            self.status = "only a sent comment resolves".to_string();
+            return;
+        };
+        let resolved = !thread.resolved;
+        self.store.set_resolved(i, resolved);
+        self.status = format!("#{number} {}", if resolved { "resolved" } else { "reopened" });
+        self.refresh_rendered();
+    }
+
+    /// The agent's name: as herdr knows the pane it wrote from, else the last send's, else none.
+    fn agent_name(&self, agent: Option<String>) -> String {
+        agent.or_else(|| self.last_sent_name.clone()).unwrap_or_else(|| "agent".to_string())
+    }
+
+    /// An agent's answer to thread `number` landed; one for a thread no longer here is dropped.
+    pub fn receive_reply(&mut self, number: u64, text: String, agent: Option<String>) {
+        let Some(i) = self.store.index_of_number(number) else { return };
+        let name = self.agent_name(agent);
+        let reply = crate::model::Reply { author: Author::Agent(name.clone()), text, sent: true };
+        if self.store.reply(i, reply) {
+            let key = self.keymap().hint(crate::keymap::Action::NextAnswer).label();
+            self.status = format!("{name} answered #{number} · {key} goes there");
+            self.refresh_rendered();
+        }
+    }
+
+    /// The agent's own comment on `path`'s lines `start..=end`, landed as its thread; its number.
+    pub fn receive_comment(
+        &mut self,
+        path: &std::path::Path,
+        start: u32,
+        end: u32,
+        text: String,
+        agent: Option<String>,
+    ) -> Result<u64, String> {
+        let root = std::fs::canonicalize(&self.repo).unwrap_or_else(|_| self.repo.clone());
+        let inside = path
+            .strip_prefix(&root)
+            .map_err(|_| format!("{} is outside {}", path.display(), root.display()))?;
+        let file = inside.to_string_lossy().replace('\\', "/");
+        let content =
+            worktree_content(&self.repo, &file).map_err(|n| format!("{file}: {}", n.message()))?;
+        let lines = crate::anchor::lines(&content);
+        let count = lines.len() as u32;
+        if start == 0 || end < start {
+            return Err(format!("lines {start}-{end} run backwards: lines count from 1"));
+        }
+        if end > count {
+            return Err(format!("{file} has {count} lines"));
+        }
+        let snippet: Vec<String> =
+            lines[start as usize - 1..end as usize].iter().map(|l| format!(" {l}")).collect();
+        // In the diff while the scope shows the file, else with its content in `All files`.
+        let diff_anchored =
+            self.scope != Scope::Commits && self.changeset.files.contains_key(&file);
+        let comment = Comment {
+            file: file.clone(),
+            side: Side::New,
+            start,
+            end,
+            lines: snippet.join("\n"),
+            text,
+            diff_anchored,
+            rev: Rev::Worktree,
+        };
+        let name = self.agent_name(agent);
+        let i = self.store.add_from_agent(comment, &content, name.clone());
+        let number = self.store.number(i).unwrap_or_default();
+        logln!("agent comment #{number} on {file}:{start}");
+        let key = self.keymap().hint(crate::keymap::Action::NextAnswer).label();
+        self.status = format!("{name} commented on {file}:{start} · {key} goes there");
+        // An open file shows it at once, a fold holding it opened.
+        if self.diff_path.as_deref() == Some(file.as_str()) && !self.view_frozen() {
+            self.rebuild_visible();
+            self.settle_read();
+        }
+        Ok(number)
+    }
+
+    /// Open the listed file `path` at its top, its folders opened and the file cursor on it.
+    fn open_file_by_path(&mut self, path: &str) {
+        let Some(e) = self.entries.iter().find(|e| e.path == path).cloned() else { return };
+        self.reset_diff_view();
+        self.open_path_in_tab(e.path);
+        // Its folders open on the way, so the file list shows where the cursor went.
+        let mut expanded = false;
+        let mut dir = path;
+        while let Some((parent, _)) = dir.rsplit_once('/') {
+            expanded |= self.set_dir_expanded(parent, true);
+            dir = parent;
+        }
+        if expanded {
+            self.rebuild_file_rows();
+        }
+        if let Some(fi) = self.file_row_of_path(path) {
+            self.file_cursor = fi;
+            self.reveal_files = true;
+        }
+    }
+
+    /// `path`'s viewed mark, if the reviewer marked it.
+    #[must_use]
+    pub fn viewed_mark(&self, path: &str) -> Option<ViewedMark> {
+        let at = self.viewed.get(path)?;
+        Some(if self.viewed_now.get(path) == Some(at) {
+            ViewedMark::Viewed
+        } else {
+            ViewedMark::Changed
+        })
+    }
+
+    /// Of the changed files: how many are viewed, and how many changed since.
+    #[must_use]
+    pub fn viewed_counts(&self) -> (usize, usize) {
+        self.changeset.files.keys().fold((0, 0), |(viewed, changed), path| {
+            match self.viewed_mark(path) {
+                Some(ViewedMark::Viewed) => (viewed + 1, changed),
+                Some(ViewedMark::Changed) => (viewed, changed + 1),
+                None => (viewed, changed),
+            }
+        })
+    }
+
+    /// `viewed`: mark the file viewed and open the next not viewed, or unmark it; a folder, all in it.
+    pub fn toggle_viewed(&mut self) {
+        if self.tab != Tab::Changes || self.changeset.files.is_empty() {
+            return;
+        }
+        if self.focus == Focus::Files
+            && let Some(dir) = self.dir_under_cursor()
+        {
+            self.toggle_viewed_under(&dir);
+            return;
+        }
+        let Some(path) = self.shown_entry().map(|e| e.path) else { return };
+        if self.viewed_mark(&path) == Some(ViewedMark::Viewed) {
+            self.viewed.remove(&path);
+            self.viewed_now.remove(&path);
+            self.status = format!("{} not viewed", file_name(&path));
+            return;
+        }
+        self.mark_viewed(&path);
+        let total = self.changeset.files.len();
+        let (viewed, _) = self.viewed_counts();
+        match self.next_unviewed(&path) {
+            Some(next) => {
+                self.open_file_by_path(&next);
+                self.status = format!("{viewed}/{total} viewed");
+            }
+            None => self.status = format!("all {total} files viewed"),
+        }
+    }
+
+    /// Mark every changed file under `dir` viewed, or unmark them all when they all are.
+    fn toggle_viewed_under(&mut self, dir: &str) {
+        let inside = format!("{dir}/");
+        let paths: Vec<String> =
+            self.changeset.files.keys().filter(|p| p.starts_with(&inside)).cloned().collect();
+        if paths.iter().all(|p| self.viewed_mark(p) == Some(ViewedMark::Viewed)) {
+            for p in &paths {
+                self.viewed.remove(p);
+                self.viewed_now.remove(p);
+            }
+            self.status = format!("{inside} not viewed");
+        } else {
+            for p in &paths {
+                self.mark_viewed(p);
+            }
+            let noun = if paths.len() == 1 { "file" } else { "files" };
+            self.status = format!("{inside}: {} {noun} viewed", paths.len());
+        }
+    }
+
+    /// Mark `path` viewed as its bytes read now.
+    fn mark_viewed(&mut self, path: &str) {
+        let fingerprint = crate::world::read_back(&self.repo.join(path), false).fingerprint;
+        self.viewed.insert(path.to_string(), fingerprint);
+        self.viewed_now.insert(path.to_string(), fingerprint);
+    }
+
+    /// The next changed file after `from` in the navigator's order, around the list, not viewed.
+    fn next_unviewed(&self, from: &str) -> Option<String> {
+        let order = self.file_order();
+        let mut files: Vec<(usize, &str)> = self
+            .changeset
+            .files
+            .keys()
+            .filter_map(|p| Some((*order.get(p.as_str())?, p.as_str())))
+            .collect();
+        files.sort_unstable();
+        let here = order.get(from).copied().unwrap_or(0);
+        let open = |&&(_, p): &&(usize, &str)| self.viewed_mark(p) != Some(ViewedMark::Viewed);
+        let after = files.iter().filter(|(at, _)| *at > here).find(open);
+        after.or_else(|| files.iter().find(open)).map(|(_, p)| (*p).to_string())
+    }
+
+    /// Open comment `index`'s file by path and, in its own view, put the cursor on its card's row.
+    fn open_comment_row(&mut self, index: usize) {
+        let Some(c) = self.store.get(index) else { return };
+        let file = c.file.clone();
         let in_view = self.comment_in_view(c);
+        let i = index;
 
         // Open the comment's file by path, so even a collapsed one works.
-        if self.diff_path.as_deref() != Some(file.as_str())
-            && let Some(e) = self.entries.iter().find(|e| e.path == file).cloned()
-        {
-            self.reset_diff_view();
-            self.open_path_in_tab(e.path);
-            if let Some(fi) = self.file_row_of_path(&file) {
-                self.file_cursor = fi;
-            }
+        if self.diff_path.as_deref() != Some(file.as_str()) {
+            self.open_file_by_path(&file);
         }
         // Only in the comment's own file and view, onto the row its card sits under.
         if in_view
@@ -3630,11 +4047,6 @@ impl App {
         }
         self.focus = Focus::Diff;
         self.reveal_diff = true; // scroll the edited line into view before the box opens
-        self.caret = text.chars().count(); // edit opens with the caret at the end
-        self.input = text;
-        self.resume_list = from_list;
-        self.mode = Mode::Composing { editing: Some(i) };
-        self.target_comment_card(i);
     }
 
     // --- text editing: one control set, a char-index caret, edits via `Vec<char>` ---------
@@ -3867,6 +4279,7 @@ impl App {
     fn leave_compose(&mut self) {
         self.input.clear();
         self.caret = 0;
+        self.reply_to = None;
         let resume = std::mem::take(&mut self.resume_list);
         if resume && !self.store.is_empty() {
             self.list_cursor = self.list_cursor.min(self.store.len() - 1);
@@ -3884,6 +4297,15 @@ impl App {
             self.cancel_comment();
             return;
         }
+        if let Some(i) = self.reply_to.and_then(|id| self.store.index_of(id)) {
+            let number = self.store.number(i).unwrap_or_default();
+            let reply = crate::model::Reply { author: Author::Reviewer, text, sent: false };
+            self.store.reply(i, reply);
+            self.status = format!("reply to #{number} waits for the next send");
+            self.leave_compose();
+            self.refresh_rendered();
+            return;
+        }
         match editing {
             Some(i) => {
                 logln!("comment edit [{i}] :: {text}");
@@ -3893,7 +4315,11 @@ impl App {
             None => {
                 if let Some(c) = self.build_comment(text) {
                     logln!("comment add {} :: {}", c.location(), c.text);
-                    let i = self.store.add(c);
+                    let side = match c.side {
+                        Side::New => self.open_text.new.clone(),
+                        Side::Old => self.open_text.old.clone(),
+                    };
+                    let i = self.store.add_on(c, &side);
                     self.target_comment_card(i);
                     self.status = "comment added".to_string();
                 }
@@ -3999,6 +4425,9 @@ impl App {
 
     /// The composer's `path:line`, while composing.
     pub fn pending_location(&self) -> Option<String> {
+        if let Some(i) = self.reply_to.and_then(|id| self.store.index_of(id)) {
+            return self.store.get(i).map(Comment::location);
+        }
         match self.mode {
             Mode::Composing { editing: Some(i) } => self.store.get(i).map(Comment::location),
             Mode::Composing { editing: None } => {
@@ -4045,15 +4474,29 @@ impl App {
         }
     }
 
-    /// Each shown comment with the rows it covers: the one comment→row map.
-    fn comment_rows(&self) -> Vec<(usize, Vec<usize>)> {
+    /// The comments the open view shows, by store index.
+    fn shown_comments(&self) -> Vec<(usize, &Comment)> {
         let Some(file) = self.diff_path.as_deref() else { return Vec::new() };
-        let shown: Vec<(usize, &Comment)> = self
-            .store
+        self.store
             .iter()
             .enumerate()
             .filter(|(_, c)| c.file == file && self.comment_in_view(c))
-            .collect();
+            // A resolved thread leaves the diff; the comments list keeps it.
+            .filter(|(ci, _)| self.store.thread(*ci).is_none_or(|t| !t.resolved))
+            .collect()
+    }
+
+    /// The lines the shown comments cover, by side.
+    fn comment_spans(&self) -> Vec<(Side, u32, u32)> {
+        self.shown_comments().into_iter().map(|(_, c)| (c.side, c.start, c.end)).collect()
+    }
+
+    /// Each shown comment with the rows it covers: the one comment→row map.
+    fn comment_rows(&self) -> Vec<(usize, Vec<usize>)> {
+        let shown = self.shown_comments();
+        if shown.is_empty() {
+            return Vec::new();
+        }
         if !self.rendered_active() {
             let split = self.split_on_screen();
             let rows = |c: &Comment| -> Vec<usize> {
@@ -4196,19 +4639,24 @@ impl App {
                 Some((lead, *ci))
             })
             .collect();
-        if stops.is_empty() {
-            return;
-        }
         // Stable, so comments starting on one row keep their store order.
         stops.sort_by_key(|&(row, _)| row);
         let n = stops.len();
         let cur = self.diff_cursor;
         let at = self.live_target(&rows).and_then(|t| stops.iter().position(|&(_, ci)| ci == t));
-        let k = match at {
-            Some(k) if dir >= 0 => (k + 1) % n,
-            Some(k) => (k + n - 1) % n,
-            None if dir >= 0 => stops.iter().position(|&(r, _)| r > cur).unwrap_or(0),
-            None => stops.iter().rposition(|&(r, _)| r < cur).unwrap_or(n - 1),
+        let next = match at {
+            Some(k) if dir >= 0 => (k + 1 < n).then_some(k + 1),
+            Some(k) => k.checked_sub(1),
+            None if dir >= 0 => stops.iter().position(|&(r, _)| r > cur),
+            None => stops.iter().rposition(|&(r, _)| r < cur),
+        };
+        // Past this file's last comment, the next file holding one; with none, around this file.
+        let k = match next {
+            Some(k) => k,
+            None if self.cross_to_comment(dir) => return,
+            None if n == 0 => return,
+            None if dir >= 0 => 0,
+            None => n - 1,
         };
         let (row, ci) = stops[k];
         self.focus = Focus::Diff;
@@ -4216,6 +4664,101 @@ impl App {
         self.diff_cursor = row;
         self.reveal_diff = true;
         self.target_comment_card(ci);
+        self.store.mark_read(ci);
+    }
+
+    /// Open the next file (or, backward, the previous) holding a comment in this view, around the
+    /// list, onto its first (or last) comment. `false` when no other file holds one.
+    fn cross_to_comment(&mut self, dir: isize) -> bool {
+        let order = self.file_order();
+        let open = self.diff_path.clone();
+        let here = open.as_deref().and_then(|p| order.get(p)).copied();
+        let mut by_file: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (i, c) in self.store.iter().enumerate() {
+            let shown = self.store.thread(i).is_none_or(|t| !t.resolved) && self.comment_in_view(c);
+            if open.as_deref() == Some(c.file.as_str()) || !shown {
+                continue;
+            }
+            if let Some(&at) = order.get(c.file.as_str()) {
+                by_file.entry(at).or_default().push(i);
+            }
+        }
+        let pick = if dir >= 0 {
+            here.and_then(|h| by_file.range(h + 1..).next()).or_else(|| by_file.iter().next())
+        } else {
+            here.and_then(|h| by_file.range(..h).next_back()).or_else(|| by_file.iter().next_back())
+        };
+        let Some((_, comments)) = pick else { return false };
+        let start = |i: usize| self.store.get(i).map_or(0, |c| c.start);
+        let ci = if dir >= 0 {
+            comments.iter().copied().min_by_key(|&i| start(i))
+        } else {
+            comments.iter().copied().max_by_key(|&i| start(i))
+        };
+        let Some(ci) = ci else { return false };
+        self.land_on_comment(ci);
+        true
+    }
+
+    /// `next-answer`: the next thread at or after the cursor whose answer is unread, around the
+    /// review; landing there reads it.
+    pub fn jump_answer(&mut self) {
+        let order = self.file_order();
+        let mut unread: Vec<(usize, u32, usize)> = self
+            .store
+            .iter()
+            .enumerate()
+            .filter(|&(i, c)| {
+                self.store.thread(i).is_some_and(|t| t.unread && !t.resolved)
+                    && self.comment_in_view(c)
+            })
+            .filter_map(|(i, c)| Some((*order.get(c.file.as_str())?, c.start, i)))
+            .collect();
+        if unread.is_empty() {
+            self.status = "no new answers".to_string();
+            return;
+        }
+        unread.sort_unstable();
+        let file = self.diff_path.as_deref().and_then(|p| order.get(p)).copied().unwrap_or(0);
+        let row = self.visible.get(self.diff_cursor);
+        let line = row.and_then(|r| r.no(Side::New).or_else(|| r.no(Side::Old))).unwrap_or(0);
+        let next = unread.iter().find(|&&(f, start, _)| (f, start) >= (file, line));
+        let Some(&(_, _, ci)) = next.or_else(|| unread.first()) else { return };
+        self.land_on_comment(ci);
+        self.status = match self.store.unread() {
+            0 => "no more new answers".to_string(),
+            1 => "1 more new answer".to_string(),
+            left => format!("{left} more new answers"),
+        };
+    }
+
+    /// Whether `path` holds a thread whose answer is unread, which its file row marks.
+    #[must_use]
+    pub fn has_new_answer(&self, path: &str) -> bool {
+        self.store.iter().enumerate().any(|(i, c)| {
+            c.file == path && self.store.thread(i).is_some_and(|t| t.unread && !t.resolved)
+        })
+    }
+
+    /// Go to comment `ci`: its file, its card, picked, and its answers read.
+    fn land_on_comment(&mut self, ci: usize) {
+        self.open_comment_row(ci);
+        self.select_anchor = None;
+        self.target_comment_card(ci);
+        self.store.mark_read(ci);
+    }
+
+    /// Each file's place in the navigator with every folder open: the order comment jumps follow.
+    fn file_order(&self) -> HashMap<&str, usize> {
+        let open = HashSet::<String>::new();
+        let rows = if self.repos.is_folder() {
+            file_list::build_folder(&self.entries, &open, true)
+        } else {
+            file_list::build(&self.entries, &open, true)
+        };
+        let files = rows.iter().filter_map(file_list::Row::file_index);
+        files.enumerate().map(|(at, i)| (self.entries[i].path.as_str(), at)).collect()
     }
 
     // --- Search overlay ------------------------------------------------
@@ -4673,8 +5216,11 @@ impl App {
             }
             Mode::List => {
                 let mut out = vec![(A::Send, Primary), (A::CloseList, Do), (A::Copy, Do)];
-                // A comment from another diff cannot be edited here.
-                if self.list_comment_editable() {
+                // A sent comment takes replies and resolves; a draft from another diff stays put.
+                if self.store.thread(self.list_cursor).is_some() {
+                    out.push((A::Reply, Do));
+                    out.push((A::Resolve, Do));
+                } else if self.list_comment_editable() {
                     out.push((A::EditComment, Do));
                 }
                 out.push((A::DeleteComment, Do));
@@ -4803,6 +5349,12 @@ impl App {
         } else if self.select_anchor.is_some() {
             out.push((A::Comment, Primary));
             out.push((A::ClearSelection, Do));
+        } else if self.comment_claims_edit()
+            && self.target_comment().is_some_and(|i| self.store.thread(i).is_some())
+        {
+            out.push((A::Reply, Primary));
+            out.push((A::Resolve, Do));
+            out.push((A::JumpComment, Do));
         } else if self.comment_claims_edit() {
             out.push((A::EditComment, Primary));
             out.push((A::DeleteComment, Do));
@@ -4831,9 +5383,12 @@ impl App {
             out.insert(0, (A::CrossFile { forward }, Primary));
         }
 
-        // `send` closes row 1 once a comment exists.
-        if !self.store.is_empty() {
+        // `send` closes row 1 while something waits to go, and the way to new answers with it.
+        if self.store.unsent() > 0 {
             out.push((A::Send, Send));
+        }
+        if self.store.unread() > 0 {
+            out.push((A::NextAnswer, Send));
         }
 
         // The `go` band: keys that work anywhere, never repeating row 1.
@@ -4864,6 +5419,9 @@ impl App {
         if !self.store.is_empty() {
             out.push((A::List, Go));
             out.push((A::Copy, Go));
+        }
+        if self.tab == Tab::Changes && !self.changeset.files.is_empty() {
+            out.push((A::Viewed, Go));
         }
         if !out.iter().any(|&(a, _)| a == A::Refresh) {
             out.push((A::Refresh, Go));
@@ -4911,8 +5469,8 @@ fn armed_row(rows: &[AgentChoice], last_sent: Option<&str>) -> usize {
 impl App {
     /// `Send`: one agent sends, several open the picker, none points at the clipboard.
     pub fn send_to_agent(&mut self) {
-        if self.store.is_empty() {
-            self.status = "no comments yet".to_string();
+        if self.store.unsent() == 0 {
+            self.status = self.nothing_to_send().to_string();
             return;
         }
         match herdr::send_target(&self.herdr.ids) {
@@ -5336,24 +5894,31 @@ impl App {
         let target = Agent { pane: agent.pane_id.clone(), name: agent.name.clone() };
         if self.export(&target) {
             self.last_sent_pane = Some(agent.pane_id.clone());
+            self.last_sent_name = Some(agent.name.clone());
         }
     }
 
     /// Export every comment to `target`, consuming them only on success, which it returns.
     pub fn export(&mut self, target: &dyn ExportTarget) -> bool {
-        if self.store.is_empty() {
-            self.status = "no comments yet".to_string();
+        if self.store.unsent() == 0 {
+            self.status = self.nothing_to_send().to_string();
             return false;
         }
-        let refs: Vec<&Comment> = self.store.iter().collect();
+        let blocks = self.outgoing();
         let prefix = self.plugin_config().and_then(crate::config::PluginConfig::review_prefix);
-        let text = format_review(prefix, &refs);
-        let n = refs.len();
+        let answer = self.reply_token.as_deref().map(crate::export::answer_line);
+        let text = format_send(prefix, &blocks, answer.as_deref());
+        let n = blocks.len();
+        let replies =
+            blocks.iter().filter(|b| matches!(b, crate::export::Outgoing::Reply(..))).count();
+        let what = crate::export::counted_send(n - replies, replies);
         logln!("export ({n}) -> {} ::\n{text}", target.label());
         let delivered = match target.export(&text) {
             Ok(()) => {
-                self.store.take_all();
-                self.status = target.success_message(n);
+                // Sent, each comment stays as a thread its answers join, and a new round starts.
+                self.store.mark_sent();
+                self.snapshot_request = true;
+                self.status = target.success_message(&what);
                 logln!("export OK");
                 true
             }
@@ -5371,6 +5936,31 @@ impl App {
         delivered
     }
 
+    /// What a send carries, each by its number: the drafts, and the reviewer's unsent replies.
+    fn outgoing(&self) -> Vec<crate::export::Outgoing<'_>> {
+        use crate::export::Outgoing;
+        let mut out = Vec::new();
+        for (i, c) in self.store.iter().enumerate() {
+            let number = self.store.number(i).unwrap_or_default();
+            match self.store.thread(i) {
+                None => out.push(Outgoing::Comment(number, c, self.store.changed(i))),
+                Some(thread) => out.extend(
+                    thread
+                        .replies
+                        .iter()
+                        .filter(|r| !r.sent && r.author == Author::Reviewer)
+                        .map(|r| Outgoing::Reply(number, c, r.text.as_str())),
+                ),
+            }
+        }
+        out
+    }
+
+    /// Why a send finds nothing: no comment at all, or none since the last send.
+    fn nothing_to_send(&self) -> &'static str {
+        if self.store.is_empty() { "no comments yet" } else { "nothing new to send" }
+    }
+
     /// Quit, asking first while comments are unsent.
     pub fn request_quit(&mut self) {
         if self.unsent() == 0 {
@@ -5384,7 +5974,7 @@ impl App {
     pub fn unsent(&self) -> usize {
         let draft =
             matches!(self.mode, Mode::Composing { editing: None }) && !self.input.trim().is_empty();
-        self.store.len() + usize::from(draft)
+        self.store.unsent() + usize::from(draft)
     }
 
     /// Whether the footer is the `Normal` bar with `?` and bands.
@@ -5621,6 +6211,11 @@ fn hunk_row(rows: &[Visible], from: Option<usize>, forward: bool) -> Option<usiz
 }
 
 /// Whether `path` is `.md` or `.markdown`, any case.
+/// The last part of `path`, as a status line names a file.
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
 fn is_markdown_path(path: &str) -> bool {
     std::path::Path::new(path)
         .extension()
@@ -5704,34 +6299,6 @@ fn line_row(rows: &[Visible], line: u32, side: Side) -> usize {
         .unwrap_or(rows.len().saturating_sub(1))
 }
 
-/// Old → new line numbers across one edit; a changed line maps to its nearest survivor.
-struct LineMap {
-    ops: Vec<similar::DiffOp>,
-    new_len: usize,
-}
-
-impl LineMap {
-    fn new(old: &str, new: &str) -> Self {
-        let (old, new) = (crate::text::lines(old), crate::text::lines(new));
-        let ops = similar::TextDiff::from_slices(&old, &new).ops().to_vec();
-        Self { ops, new_len: new.len() }
-    }
-
-    /// Map 1-based old line `line` to its 1-based new line.
-    fn line(&self, line: u32) -> u32 {
-        let i = line.saturating_sub(1) as usize;
-        let mapped = self.ops.iter().find_map(|op| {
-            let (tag, old, new) = op.as_tag_tuple();
-            old.contains(&i).then(|| match tag {
-                similar::DiffTag::Equal => new.start + (i - old.start),
-                _ => new.start + (i - old.start).min(new.len().saturating_sub(1)),
-            })
-        });
-        let mapped = mapped.unwrap_or(self.new_len).min(self.new_len.saturating_sub(1));
-        mapped as u32 + 1
-    }
-}
-
 /// Whether row `v` holds a line in `c`'s range on its side.
 fn line_in(c: &Comment, v: &Visible) -> bool {
     v.no(c.side).is_some_and(|n| c.start <= n && n <= c.end)
@@ -5801,23 +6368,6 @@ mod tests {
         app.note_pr_read_max_scroll(0);
         app.pr_scroll_read(5);
         assert_eq!(app.pr_read_scroll, 0, "content that fits the pane does not scroll");
-    }
-
-    #[test]
-    fn a_line_map_carries_each_line_through_every_kind_of_edit() {
-        use super::LineMap;
-        // (old, new, old line, its new line)
-        let cases = [
-            ("a\nb\nc\n", "x\na\nb\nc\n", 2, 3), // equal, shifted by an insert above
-            ("a\nb\nc\n", "a\nB\nc\n", 2, 2),    // replaced: its counterpart
-            ("a\nb\nc\nd\n", "a\nd\n", 3, 2),    // deleted: the line after
-            ("a\nb\n", "a\nb\n", 9, 2),          // past the end: the last line
-            ("a\nb\n", "", 1, 1),                // an emptied file: line 1
-            ("a\rb\nc\n", "a\rb\nc\n", 9, 2),    // a bare CR breaks no line
-        ];
-        for (old, new, line, want) in cases {
-            assert_eq!(LineMap::new(old, new).line(line), want, "{old:?} → {new:?} at {line}");
-        }
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! herdr-reviewr: the terminal lifecycle and the frame loop around a terminal-free [`app`].
 
 pub mod actions;
+pub mod anchor;
 pub mod app;
 pub mod azure_devops;
 pub mod browser;
@@ -24,6 +25,7 @@ pub(crate) mod marks;
 pub mod model;
 pub mod proc;
 pub(crate) mod rendered;
+pub mod reply;
 pub mod repos;
 pub mod roles;
 pub mod schedule;
@@ -67,8 +69,30 @@ use crate::export::Clipboard;
 use crate::keymap::Keymap;
 use crate::model::{Scope, Side};
 
+/// What `--help` prints: the review UI, and the commands an agent answers a review with.
+pub const USAGE: &str = "\
+herdr-reviewr: a code-review pane for herdr.
+
+  herdr-reviewr [path] [--base <branch>] [--theme <name>] [--wrap off]
+      Review the repository, or a folder of repositories, at path (default: here).
+
+  herdr-reviewr --reply <number> [--to <token>] [answer]
+      Answer comment <number> of a review. Without an answer, it is read from stdin.
+
+  herdr-reviewr --comment <path>:<line>[-<end>] [--to <token>] [comment]
+      Comment on lines of the code under review. Without a comment, it is read from stdin.
+
+A review names its pane's token. Without --to, --reply and --comment go to the review pane in
+this herdr tab, else in this workspace, else the one reviewing this folder.
+";
+
 /// Entry point: parse config, set up the terminal, run the loop, restore.
 pub fn run() -> Result<()> {
+    use std::io::IsTerminal;
+    // Without a terminal the UI cannot draw: say so, where an agent would read a crash.
+    if !io::stdout().is_terminal() {
+        anyhow::bail!("no terminal to draw in; for the commands an agent runs, see --help");
+    }
     let mut cfg = Config::from_env();
     log::init();
     // The config settles before the first paint, so the first frame is the final layout; a wedged
@@ -701,6 +725,7 @@ pub fn land_world_completion(
             if app.config_error().is_none() && app.world_input() == completion.input =>
         {
             app.reconcile_world(snapshot);
+            app.land_probes(completion.probed);
             if completion.reveal {
                 // The landing may have moved the cursor.
                 app.settle_tab_entry();
@@ -891,6 +916,29 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
     let mut held: std::collections::VecDeque<Event> = std::collections::VecDeque::new();
     // Window editors reviewr launched, reaped at the next press.
     let mut open_editors: Vec<std::process::Child> = Vec::new();
+    // A send's snapshot of every repository, the start of its round, taken off the loop.
+    let (round_tx, round_rx) = crate::wake::channel::<(
+        u64,
+        std::collections::BTreeMap<String, String>,
+        Vec<(String, String)>,
+    )>(&waker);
+    let mut round_generation = 0_u64;
+    // The agent's answers to sent comments arrive over the reply channel, numbered by thread.
+    let (reply_tx, reply_rx) = crate::wake::channel::<crate::reply::Incoming>(&waker);
+    let open_threads = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Where an agent's command finds this pane without `--to`: its root, its workspace and tab.
+    let review_root = std::fs::canonicalize(&app.repo).unwrap_or_else(|_| app.repo.clone());
+    let socket = std::env::var("HERDR_SOCKET_PATH").ok().filter(|s| !s.is_empty());
+    let whereabouts = |app: &App| crate::reply::Whereabouts {
+        root: review_root.clone(),
+        socket: socket.clone(),
+        workspace: app.herdr.ids.workspace.clone(),
+        tab: app.herdr.ids.tab.clone(),
+    };
+    let mut replies = crate::reply::listen(Arc::clone(&open_threads), &whereabouts(app), reply_tx)
+        .inspect_err(|e| logln!("reply channel did not start: {e}"))
+        .ok();
+    app.reply_token = replies.as_ref().map(|r| r.token().to_string());
     // The last dispatched world job, which completions are tagged against.
     let mut world_live = LiveJob::default();
     // When a background refresh may run: batches gather, then wait out the debounce and the budget.
@@ -1055,6 +1103,42 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
                 }
             }
 
+            while let Ok(incoming) = reply_rx.try_recv() {
+                match incoming {
+                    crate::reply::Incoming::Reply { number, text, agent } => {
+                        app.receive_reply(number, text, agent);
+                    }
+                    crate::reply::Incoming::Comment { path, start, end, text, agent, verdict } => {
+                        let _ = verdict.send(app.receive_comment(&path, start, end, text, agent));
+                    }
+                }
+            }
+            // A pane that moved tab says so, for the commands that look for it there.
+            if let Some(replies) = replies.as_mut() {
+                replies.tell(&whereabouts(app));
+            }
+            // Only the newest send's snapshot starts a round.
+            if std::mem::take(&mut app.snapshot_request) {
+                round_generation = round_generation.wrapping_add(1);
+                let (tx, root, repos) = (round_tx.clone(), app.repo.clone(), app.repos().clone());
+                let generation = round_generation;
+                thread::spawn(move || {
+                    let (baselines, failed) = crate::world::snapshot_all(&root, &repos);
+                    let _ = tx.send((generation, baselines, failed));
+                });
+            }
+            while let Ok((generation, baselines, failed)) = round_rx.try_recv() {
+                if generation == round_generation {
+                    app.land_send_baselines(baselines, &failed);
+                }
+            }
+            // The channel takes answers only for threads still open here.
+            let open = app.store.open_numbers();
+            let mut taken = open_threads.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *taken != open {
+                *taken = open;
+            }
+            drop(taken);
             while let Ok(event) = watch_rx.try_recv() {
                 let search = search_worker.as_ref().map(|(tx, _)| tx);
                 config_dirty |= land_watch_event(event, app, &mut pacer, &mut pr, search);
@@ -1161,6 +1245,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
                     input,
                     reveal: request.reveal,
                     refresh: request.refresh,
+                    probe: app.probe_paths(),
                 };
                 logln!("refresh {:?} background={}", job.refresh, request.background);
                 pacer.on_dispatched(request.background);
@@ -1786,6 +1871,7 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
     // Bound keys resolve through the keymap; the rest fall to the fixed `tab` and `esc`.
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let code = match key.code {
+        Char(' ') => Some(keymap::KeyCode::Space),
         Char(c) => Some(keymap::KeyCode::Char(c)),
         Left => Some(keymap::KeyCode::Left),
         Right => Some(keymap::KeyCode::Right),
@@ -1916,6 +2002,8 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
             }
             (Some(K::Edit), _) => app.start_edit(),
             (Some(K::Delete), _) => app.delete_comment(),
+            (Some(K::Reply), _) => app.start_reply(),
+            (Some(K::Resolve), _) => app.toggle_resolved(),
             _ => {}
         }
         return Ok(());
@@ -1959,6 +2047,7 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
             K::NavigatorShrink => app.resize_navigator(-4),
             K::ScopeUncommitted => app.set_scope(Scope::Uncommitted)?,
             K::ScopeBranch => app.set_scope(Scope::Branch)?,
+            K::ScopeSinceSend => app.toggle_since_send()?,
             K::ScopeLastTurn => app.set_scope(Scope::LastTurn)?,
             K::ScopeCommits => app.set_scope(Scope::Commits)?,
             K::BasePick => app.open_base_picker(),
@@ -1968,6 +2057,10 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
             // `delete` needs the diff focused, never an off-screen cursor; `edit` works anywhere.
             K::Edit => app.start_edit(),
             K::Delete if app.focus == Focus::Diff => app.delete_comment(),
+            K::Reply => app.start_reply(),
+            K::NextAnswer => app.jump_answer(),
+            K::Viewed => app.toggle_viewed(),
+            K::Resolve if app.focus == Focus::Diff => app.toggle_resolved(),
             K::Send => app.send_to_agent(),
             K::Copy => {
                 app.export(&Clipboard);
@@ -1980,7 +2073,7 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
             K::GotoLine => app.open_line(),
             K::Keys => app.toggle_keys(),
             // Inert here; `quit-discard` only answers the quit question.
-            K::Delete | K::OpenPr | K::QuitDiscard => {}
+            K::Delete | K::Resolve | K::OpenPr | K::QuitDiscard => {}
         }
         return Ok(());
     }
@@ -2318,7 +2411,8 @@ fn surface_text(
         Surface::Painted => Some(lines_text(&ui::painted_texts(app, area), a, b)),
         Surface::Card { comment } => {
             let width = ui::read_inner_rect(area, app).width as usize;
-            Some(lines_text(&ui::card_body_lines(app.store.get(comment)?, width), a, b))
+            app.store.get(comment)?;
+            Some(lines_text(&ui::card_body_lines(&app.store, comment, width), a, b))
         }
         Surface::PrNav => {
             let texts = ui::pr_nav_texts(app);

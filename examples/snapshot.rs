@@ -435,7 +435,7 @@ impl ExportTarget for NoClipboard {
     fn label(&self) -> &'static str {
         "none"
     }
-    fn success_message(&self, _count: usize) -> String {
+    fn success_message(&self, _what: &str) -> String {
         String::new()
     }
     fn failure_message(&self, _error: &anyhow::Error, _copy: &str) -> String {

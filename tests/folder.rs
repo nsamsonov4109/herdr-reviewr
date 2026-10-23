@@ -178,8 +178,13 @@ impl Worker {
 
     fn run(&mut self, input: &WorldInput, refresh: Refresh) -> Option<world::WorldSnapshot> {
         self.generation += 1;
-        let job =
-            WorldJob { generation: self.generation, input: input.clone(), reveal: false, refresh };
+        let job = WorldJob {
+            generation: self.generation,
+            input: input.clone(),
+            reveal: false,
+            refresh,
+            probe: std::collections::BTreeMap::new(),
+        };
         self.jobs.send(job).unwrap();
         self.done.recv().unwrap().snapshot.map(|s| s.expect("the build succeeds"))
     }
@@ -361,4 +366,32 @@ fn a_saved_default_base_rebuilds_the_branch_scope() {
     assert!(app.world_request.take().is_some(), "the save asks for a rebuild");
     app.reconcile_world(world::build(&app.world_input()).unwrap());
     assert_eq!(listed(&app), ["api/a.txt"], "dev's own work is no change against dev");
+}
+
+#[test]
+fn a_round_since_the_send_lists_only_what_changed_after_it_in_each_repository() {
+    let f = Folder::new();
+    let api = f.repo("api", &[("a.txt", "one\n")]);
+    let web = f.repo("web", &[("b.txt", "two\n")]);
+    // Before the send: an edit the round must not show.
+    write(&api, "a.txt", "ONE\n");
+    let mut app = app_on(&f.root(), None, Scope::Uncommitted);
+    let (baselines, failed) = world::snapshot_all(&f.root(), app.repos());
+    assert!(failed.is_empty(), "{failed:?}");
+    assert_eq!(baselines.keys().collect::<Vec<_>>(), ["api", "web"]);
+    app.land_send_baselines(baselines, &failed);
+    // After it: the agent edits both repositories, one file new.
+    write(&api, "a.txt", "ONE more\n");
+    write(&web, "b.txt", "TWO\n");
+    write(&web, "c.txt", "new\n");
+    app.toggle_since_send().unwrap();
+    assert_eq!(app.scope, Scope::SinceSend);
+    assert_eq!(listed(&app), ["api/a.txt", "web/b.txt", "web/c.txt"]);
+    let rows = open(&mut app, "api/a.txt");
+    assert!(
+        rows.contains(&"-ONE".to_string()) && rows.contains(&"+ONE more".to_string()),
+        "{rows:?}"
+    );
+    app.toggle_since_send().unwrap();
+    assert_eq!(app.scope, Scope::Uncommitted, "the key goes back where it came from");
 }

@@ -26,9 +26,12 @@ comment on lines, and send the comments back.
 
 - **Diff review** — the agent's changes, syntax-highlighted.
 - **Unified and split views** — one column or side by side, flip with `|`.
-- **Four diff scopes** — uncommitted, branch, last turn, commits.
+- **Five diff scopes** — uncommitted, branch, since send, last turn, commits.
 - **Last-turn diff** — only what the agent's latest turn changed.
 - **Line comments** — on a line or a range, sent to the agent in one go.
+- **Threads** — the agent answers each comment where it sits, and can comment on its own code.
+- **Comments follow the code** — an edit moves them with their lines, or says what changed.
+- **Viewed marks** — tick files off as you go; one the agent changes again comes back.
 - **Text selection** — drag to copy, like an editor.
 - **File viewer** — any file in the worktree.
 - **Search** — files by name and code by content, powered by [fff](https://github.com/dmtrKovalenko/fff).
@@ -77,7 +80,8 @@ herdr-reviewr ~/some/repo
 2. **Focus the diff.** `Tab`.
 3. **Select lines.** `v`, then `j` / `k`, or drag the line numbers.
 4. **Comment.** `c`, type, `Enter`.
-5. **Send.** `s` puts every comment in the agent's input.
+5. **Send.** `s` puts every comment in the input of the agent beside reviewr, the one in its tab.
+   With none there and several in the workspace, a picker asks which.
 
 The footer shows the next step. `?` lists every key.
 
@@ -99,7 +103,7 @@ Every key can be rebound ([Keybindings](#keybindings)).
 | Key | Action |
 | --- | --- |
 | `1` `2` `3` | Tab: Changes / All files / PR |
-| `u` `b` `t` `g` | Scope: uncommitted / branch / last turn / commits |
+| `u` `b` `i` `t` `g` | Scope: uncommitted / branch / since send / last turn / commits |
 | `B` | Pick the base branch |
 | `G` | Pick commits |
 | `j` `k` · `↑` `↓` | Move |
@@ -131,9 +135,13 @@ Every key can be rebound ([Keybindings](#keybindings)).
 | `c` | Comment |
 | `e` | Edit the comment, or open the file in your editor |
 | `d` | Delete comment |
-| `n` `N` | Next / previous comment |
+| `a` | Reply in a sent comment's thread |
+| `D` | Resolve a thread, or reopen it from the list |
+| `A` | Go to the next new answer from the agent |
+| `n` `N` | Next / previous comment, across files |
 | `l` | List comments |
-| `s` | Send comments to the agent |
+| `space` | Mark the file viewed, then open the next |
+| `s` | Send new comments and replies to the agent |
 | `y` | Copy comments |
 | `esc` | Clear selection |
 
@@ -160,6 +168,45 @@ The usual editing keys work: arrows, `Home` / `End`, `Ctrl+A` / `Ctrl+E`, `Alt+b
 **Mouse:** drag to copy, double-click a word, triple-click a line. Click or drag line numbers to
 comment. Click files, tabs, and links. Scroll with the wheel.
 
+## Threads
+
+A sent comment stays on its line as a numbered thread. The send tells the agent how to answer
+each one, and its answer appears under the line it is about. Each message opens under its
+author, `you` or the agent's name, with a bar in that author's color down its lines:
+
+```text
+herdr-reviewr --reply 3 --to 8e9a3 "It runs once the policy attaches."
+```
+
+An answer you haven't read yet marks its thread `new answer` and its file `●`. `A` goes to the
+next one, across files, and `n` / `N` step through every comment the same way.
+
+`a` replies in a thread, and the next `s` sends your reply with any new comments. A sent comment
+isn't edited: you reply instead. `D` resolves a thread, taking it out of the diff. It stays in
+the comments list (`l`), greyed, where `D` reopens it. Threads live in the pane, like comments,
+and end when it closes.
+
+When the agent edits a file, its comments move with their lines. A comment whose lines were
+rewritten or deleted stays where they were, and its title says `code changed`: on a sent comment,
+usually the agent acting on it. A draft like that goes out marked so.
+
+The agent can comment too, on any line of the review, and each send tells it how:
+
+```text
+herdr-reviewr --comment src/app.rs:120-124 "This retry is new; it covers the flaky socket."
+```
+
+Its comment opens a thread marked `new comment`, which `A` goes to. You reply, resolve or delete
+it, but don't edit it. In the agent's tab, the command finds the pane without `--to`, and
+`herdr-reviewr --help` lists both commands.
+
+## Viewed marks
+
+`space` marks the open file viewed and opens the next one you haven't viewed. The file list dims
+a viewed file with `✓` and counts them. When the file changes after that, its mark turns to `!`
+until you view it again. On a viewed file, `space` unmarks it; on a folder, it marks every file
+inside. Marks live in the pane, like comments.
+
 ## The three tabs
 
 - **Changes** — files the current scope changed.
@@ -171,6 +218,8 @@ comment. Click files, tabs, and links. Scroll with the wheel.
 - **uncommitted** — changes since the last commit, including new files.
 - **branch** — everything since the branch left its base, commits included. The base is the
   default branch until you pick another ([Base branch](#base-branch)).
+- **since send** — what changed after your last send: your next review round. `i` again goes
+  back to the scope you came from, so one key flips between the round and all the changes.
 - **last turn** — changes since the agent's latest turn started.
 - **commits** — one commit or a range, picked with `G`.
 
@@ -284,6 +333,7 @@ keys help non-Latin layouts: bind the character your layout types on the same ke
 | `next-hunk` / `prev-hunk` | `]` / `[` |
 | `next-file` / `prev-file` | `f` / `F` |
 | `scope-uncommitted` / `scope-branch` / `scope-last-turn` / `scope-commits` | `u` / `b` / `t` / `g` |
+| `scope-since-send` | `i` |
 | `base-pick` / `commit-pick` | `B` / `G` |
 | `tab-changes` / `tab-all-files` / `tab-pr` | `1` / `2` / `3` |
 | `wrap` | `w` |
@@ -295,8 +345,10 @@ keys help non-Latin layouts: bind the character your layout types on the same ke
 | `select` | `v` |
 | `comment` | `c` |
 | `edit` / `delete` | `e` / `d` |
+| `reply` / `resolve` / `next-answer` | `a` / `D` / `A` |
 | `next-comment` / `prev-comment` | `n` / `N` |
 | `comments` | `l` |
+| `viewed` | `space` |
 | `search` | `/` |
 | `find` | `ctrl+f` |
 | `goto-line` | `:` |
@@ -308,7 +360,8 @@ keys help non-Latin layouts: bind the character your layout types on the same ke
 | `quit` | `q` |
 | `quit-discard` | `Q` |
 
-A key is one character or a `ctrl+` / `alt+` chord. `Tab`, `Esc`, and `Enter` are fixed.
+A key is one character, a named key like `space` or `pagedown`, or a `ctrl+` / `alt+` chord.
+`Tab`, `Esc`, and `Enter` are fixed.
 
 ### GitHub, GitLab, and Azure DevOps
 
@@ -347,8 +400,12 @@ On Windows, point it at the plugin's own `bin` folder.
   history. Each comment list shows its newest 100.
 - **A background pane** catches up 30 seconds after a change, or at once when shown.
 - **A rename can pair with the wrong file** until you press `r`.
-- **Comments live only in the pane.** Closing it loses unsent ones. Send delivers all or none.
-- **Comments don't follow moved code.** reviewr marks them stale instead of dropping them.
+- **Comments live only in the pane.** Closing it loses unsent ones, every thread, and the
+  viewed marks. Send delivers all or none.
+- **An agent answers and comments on macOS and Linux only.** On Windows, sends carry no answer
+  line.
+- **A comment follows its lines within their file.** Moved to another file, or too short or too
+  common to tell apart, they leave it where they were, marked `code changed`.
 - **Files over 2 MB or 50,000 lines** aren't diffed. Neither are binary files.
 - **A folder of repositories** reviews only the repos directly inside it, and no file beside
   them. Its PR tab, **last turn**, and **commits** don't work yet.
@@ -369,7 +426,7 @@ Toggle the pane off and on after every `just install`.
 
 ## Roadmap
 
-JSON export, marking files reviewed, more named keys, automatic light/dark theme, more themes (`kanagawa`,
+JSON export, more named keys, automatic light/dark theme, more themes (`kanagawa`,
 `vesper`, a dark `github`), a theme that follows the terminal, copying through the terminal.
 
 ## Sponsors

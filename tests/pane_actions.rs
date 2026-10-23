@@ -590,8 +590,12 @@ fn a_review_ui_started_with_ui_flags_still_counts() {
 fn a_flag_run_never_counts_as_the_review_ui() {
     let dir = tempfile::tempdir().unwrap();
     // A non-UI flag run is not the review UI, so `open` opens over it.
-    let flag_runs: [&[&str]; 2] =
-        [&["herdr-reviewr", "--action", "toggle"], &["herdr-reviewr", "/repo", "--action"]];
+    let flag_runs: [&[&str]; 3] = [
+        &["herdr-reviewr", "--action", "toggle"],
+        &["herdr-reviewr", "/repo", "--action"],
+        // An agent answering a comment is no review pane either.
+        &["herdr-reviewr", "--reply", "3", "--to", "1f", "because"],
+    ];
     for argv in flag_runs {
         reset(dir.path());
         procinfo(dir.path(), "w1:p1", &json!([process("herdr-reviewr", argv)]));
@@ -626,6 +630,143 @@ fn the_flag_dispatch_matches_the_actions_anywhere_in_argv() {
         .unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output), "reviewr: nothing open in workspace-1\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_agents_reply_run_reaches_the_pane_that_listens() {
+    let open = std::sync::Arc::new(std::sync::Mutex::new(vec![1, 4]));
+    let (tx, rx) = herdr_reviewr::wake::channel(&herdr_reviewr::wake::Waker::detached());
+    let here = herdr_reviewr::reply::Whereabouts::default();
+    let listener = herdr_reviewr::reply::listen(open, &here, tx).unwrap();
+    let token = listener.token().to_string();
+    let reply = |number: &str, args: &[&str]| {
+        Command::new(reviewr_bin()).args(["--reply", number, "--to", &token]).args(args).output()
+    };
+
+    let output = reply("4", &["the", "guard", "is", "needed"]).unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "answered #4\n");
+    let text_of = |incoming: herdr_reviewr::reply::Incoming| match incoming {
+        herdr_reviewr::reply::Incoming::Reply { number, text, .. } => (number, text),
+        other @ herdr_reviewr::reply::Incoming::Comment { .. } => panic!("not a reply: {other:?}"),
+    };
+    assert_eq!(text_of(rx.recv().unwrap()), (4, "the guard is needed".to_string()));
+
+    // The answer can come on stdin, as a heredoc writes it.
+    let mut child = Command::new(reviewr_bin())
+        .args(["--reply", "#1", "--to", &token])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), b"line one\nline two\n").unwrap();
+    assert!(child.wait_with_output().unwrap().status.success());
+    assert_eq!(text_of(rx.recv().unwrap()).1, "line one\nline two");
+
+    let output = reply("9", &["lost"]).unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("no comment #9 is open; open: #1, #4"), "{}", stderr(&output));
+}
+
+#[cfg(unix)]
+#[test]
+fn an_agents_comment_finds_the_pane_in_its_tab_without_a_token() {
+    use herdr_reviewr::reply::{Incoming, Whereabouts};
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    fs::write(root.join("a.rs"), "one\ntwo\nthree\n").unwrap();
+    // A tab no live pane sits in, so only this test's listener answers for it.
+    let tab = format!("test-tab-{}", std::process::id());
+    let here = Whereabouts {
+        root: root.clone(),
+        socket: None,
+        workspace: Some("test-ws".into()),
+        tab: Some(tab.clone()),
+    };
+    let (tx, rx) = herdr_reviewr::wake::channel(&herdr_reviewr::wake::Waker::detached());
+    let open = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _listener = herdr_reviewr::reply::listen(open, &here, tx).unwrap();
+    let pane = std::thread::spawn(move || match rx.recv().unwrap() {
+        Incoming::Comment { path, start, end, text, verdict, .. } => {
+            verdict.send(Ok(3)).unwrap();
+            (path, start, end, text)
+        }
+        other @ Incoming::Reply { .. } => panic!("not a comment: {other:?}"),
+    });
+
+    let output = Command::new(reviewr_bin())
+        .args(["--comment", "a.rs:2-3", "this", "reads", "twice"])
+        .current_dir(&root)
+        .env("HERDR_TAB_ID", &tab)
+        .env_remove("HERDR_PANE_ID")
+        .env("HERDR_BIN_PATH", "false")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "commented #3\n");
+    let landed = pane.join().unwrap();
+    assert_eq!(landed, (root.join("a.rs"), 2, 3, "this reads twice".to_string()));
+}
+
+#[test]
+fn help_names_the_commands_an_agent_answers_with() {
+    for flag in ["--help", "-h"] {
+        let output = Command::new(reviewr_bin()).arg(flag).output().unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        let usage = stdout(&output);
+        assert!(
+            usage.contains("--reply <number>") && usage.contains("--comment <path>"),
+            "{usage}"
+        );
+    }
+}
+
+#[test]
+fn the_review_ui_without_a_terminal_says_so_instead_of_crashing() {
+    let output =
+        Command::new(reviewr_bin()).stdin(Stdio::null()).stdout(Stdio::piped()).output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stderr(&output).contains("no terminal to draw in"), "{}", stderr(&output));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_command_finds_only_its_own_herdr_sessions_pane() {
+    use herdr_reviewr::reply::Whereabouts;
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    fs::write(root.join("a.rs"), "one\n").unwrap();
+    // Two sessions reuse tab ids; the socket tells them apart.
+    let tab = format!("shared-tab-{}", std::process::id());
+    let here = Whereabouts {
+        root: root.clone(),
+        socket: Some("/sessions/one.sock".into()),
+        workspace: None,
+        tab: Some(tab.clone()),
+    };
+    let (tx, _rx) = herdr_reviewr::wake::channel::<herdr_reviewr::reply::Incoming>(
+        &herdr_reviewr::wake::Waker::detached(),
+    );
+    let open = std::sync::Arc::new(std::sync::Mutex::new(vec![1]));
+    let _listener = herdr_reviewr::reply::listen(open, &here, tx).unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let reply_from = |socket: &str| {
+        Command::new(reviewr_bin())
+            .args(["--reply", "1", "hello"])
+            .current_dir(elsewhere.path())
+            .env("HERDR_TAB_ID", &tab)
+            .env("HERDR_SOCKET_PATH", socket)
+            .env_remove("HERDR_PANE_ID")
+            .env("HERDR_BIN_PATH", "false")
+            .output()
+            .unwrap()
+    };
+    let other = reply_from("/sessions/two.sock");
+    assert_eq!(other.status.code(), Some(1), "another session's pane takes nothing");
+    let same = reply_from("/sessions/one.sock");
+    assert!(same.status.success(), "{}", stderr(&same));
+    assert_eq!(stdout(&same), "answered #1\n");
 }
 
 #[test]

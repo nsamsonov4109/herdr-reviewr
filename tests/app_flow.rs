@@ -7,7 +7,7 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 use common::{Repo, UnifiedRow as _, app_on, app_on_rendered, enter_tab, typed};
-use herdr_reviewr::app::{App, Band, Focus, FooterAction, Mode};
+use herdr_reviewr::app::{App, Band, Focus, FooterAction, Mode, ViewedMark};
 use herdr_reviewr::config::NavigatorPosition;
 use herdr_reviewr::diff::{Bar, MarkerKind, RenderedKind, Row};
 use herdr_reviewr::export::ExportTarget;
@@ -44,9 +44,8 @@ impl ExportTarget for FakeTarget {
     fn label(&self) -> &'static str {
         "fake"
     }
-    fn success_message(&self, count: usize) -> String {
-        let noun = if count == 1 { "comment" } else { "comments" };
-        format!("exported {count} {noun}")
+    fn success_message(&self, what: &str) -> String {
+        format!("exported {what}")
     }
     fn failure_message(&self, _error: &anyhow::Error, _copy: &str) -> String {
         "fake not found".to_string()
@@ -1404,7 +1403,7 @@ fn a_refresh_while_composing_freezes_input_and_diff() {
 }
 
 #[test]
-fn a_failed_export_keeps_comments_and_success_consumes_them() {
+fn a_failed_export_keeps_comments_and_success_sends_them_into_threads() {
     let r = edited_repo();
     let mut app = app_on(&r);
     comment_on(&mut app, '+', "one");
@@ -1416,13 +1415,14 @@ fn a_failed_export_keeps_comments_and_success_consumes_them() {
 
     let target = FakeTarget::ok();
     app.export(&target);
-    assert!(app.store.is_empty(), "a successful export consumes the comments");
+    assert_eq!(app.store.len(), 2, "a successful export keeps each comment as its thread");
+    assert_eq!(app.unsent(), 0, "and nothing waits to go");
     assert_eq!(app.status, "exported 2 comments", "the target owns the success confirmation");
 
     // The sent text is the real export block format, end to end through App::export.
     let sent = target.last();
     assert!(sent.contains("one") && sent.contains("two"), "both comment texts present: {sent:?}");
-    assert!(sent.lines().next().is_some_and(|l| l.starts_with("a.rs:")), "leads with a location");
+    assert!(sent.lines().next().is_some_and(|l| l.starts_with("#1 a.rs:")), "numbered: {sent:?}");
     assert!(sent.contains("\n\n"), "blocks separated by a blank line: {sent:?}");
     assert!(
         sent.lines().any(|l| l.starts_with('+') || l.starts_with('-')),
@@ -1430,15 +1430,213 @@ fn a_failed_export_keeps_comments_and_success_consumes_them() {
     );
 }
 
+// ---- threads: a sent comment stays as a thread its answers join ----------
+
+/// A pane over `edited_repo` with one comment on the `BETA` line, sent.
+fn sent_thread() -> (Repo, App) {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    comment_on(&mut app, '+', "why upper case?");
+    let target = FakeTarget::ok();
+    assert!(app.export(&target));
+    assert!(target.last().starts_with("#1 a.rs:2\n"), "{}", target.last());
+    (r, app)
+}
+
 #[test]
-fn send_consumes_the_whole_set() {
+fn a_sent_comment_stays_on_its_line_as_a_numbered_thread() {
+    let (_r, app) = sent_thread();
+    assert_eq!(app.card_rows().len(), 1, "its card stays under its line");
+    let thread = app.store.thread(0).expect("a thread");
+    assert!(thread.replies.is_empty() && !thread.resolved);
+    assert_eq!(app.store.open_numbers(), [1]);
+}
+
+#[test]
+fn an_answer_lands_in_its_thread_and_one_for_no_thread_is_dropped() {
+    let (_r, mut app) = sent_thread();
+    app.receive_reply(1, "it names a constant".into(), None);
+    let thread = app.store.thread(0).unwrap();
+    assert_eq!(thread.replies.len(), 1);
+    assert!(thread.answered());
+    assert_eq!(app.status, "agent answered #1 · A goes there");
+    app.receive_reply(7, "lost".into(), None);
+    assert_eq!(app.store.thread(0).unwrap().replies.len(), 1, "there is no thread #7");
+}
+
+#[test]
+fn a_reply_waits_for_the_next_send_which_carries_only_what_is_new() {
+    let (_r, mut app) = sent_thread();
+    app.receive_reply(1, "it names a constant".into(), None);
+    app.focus = Focus::Diff;
+    app.diff_cursor = row_with(&app, '+');
+    app.start_reply();
+    assert_eq!(app.replying_to(), Some(1));
+    typed(&mut app, "then name it so");
+    app.submit_comment();
+    assert_eq!(app.unsent(), 1, "the reply waits for a send");
+    comment_on(&mut app, '-', "and this one?");
+    let target = FakeTarget::ok();
+    assert!(app.export(&target));
+    let sent = target.last();
+    assert!(sent.contains("#1 reply · a.rs:2\nthen name it so"), "{sent}");
+    assert!(sent.contains("#2 a.rs:2 (removed)\n-beta\nand this one?"), "{sent}");
+    assert!(!sent.contains("why upper case?"), "the first send never goes again: {sent}");
+    assert_eq!(app.unsent(), 0);
+}
+
+#[test]
+fn a_resolved_thread_leaves_the_diff_but_stays_listed_and_reopens() {
+    let (_r, mut app) = sent_thread();
+    app.focus = Focus::Diff;
+    app.diff_cursor = row_with(&app, '+');
+    app.toggle_resolved();
+    assert_eq!(app.status, "#1 resolved");
+    assert!(app.card_rows().is_empty(), "gone from the diff");
+    assert!(app.store.open_numbers().is_empty(), "and closed to answers");
+    app.open_list();
+    assert_eq!(app.mode, Mode::List, "still listed");
+    app.toggle_resolved();
+    assert_eq!(app.status, "#1 reopened");
+    app.close_list();
+    assert_eq!(app.card_rows().len(), 1);
+}
+
+/// A pane with `a.rs` and `b.rs` changed, one comment on each's added line, both sent.
+fn two_sent_threads() -> (Repo, App) {
+    let r = Repo::init();
+    r.write("a.rs", "one\n");
+    r.write("b.rs", "two\n");
+    r.commit_all("init");
+    r.write("a.rs", "ONE\n");
+    r.write("b.rs", "TWO\n");
+    let mut app = app_on(&r);
+    for file in ["a.rs", "b.rs"] {
+        app.select_file(file_row(&app, file)).unwrap();
+        comment_on(&mut app, '+', &format!("about {file}"));
+    }
+    assert!(app.export(&FakeTarget::ok()));
+    (r, app)
+}
+
+#[test]
+fn next_comment_crosses_to_the_next_file_holding_one_and_back() {
+    let (_r, mut app) = two_sent_threads();
+    app.select_file(file_row(&app, "a.rs")).unwrap();
+    app.jump_comment(1);
+    assert_eq!(app.diff_path.as_deref(), Some("a.rs"), "a's own comment first");
+    app.jump_comment(1);
+    assert_eq!(app.diff_path.as_deref(), Some("b.rs"), "past a's last comment, b's first");
+    assert_eq!(app.card_rows().first().map(|&(row, _)| row), Some(app.diff_cursor));
+    app.jump_comment(1);
+    assert_eq!(app.diff_path.as_deref(), Some("a.rs"), "around the review");
+    app.jump_comment(-1);
+    assert_eq!(app.diff_path.as_deref(), Some("b.rs"), "and back");
+}
+
+#[test]
+fn a_new_answer_is_marked_until_the_reviewer_goes_to_it() {
+    let (_r, mut app) = two_sent_threads();
+    app.receive_reply(2, "b is fine".into(), None);
+    app.receive_reply(1, "a is fine".into(), None);
+    assert_eq!(app.store.unread(), 2);
+    assert!(app.has_new_answer("a.rs") && app.has_new_answer("b.rs"));
+    assert!(app.footer_bands().iter().any(|&(a, _)| a == FooterAction::NextAnswer));
+
+    // From the top of `a.rs`, its answer comes first, then `b.rs`'s.
+    app.select_file(file_row(&app, "a.rs")).unwrap();
+    app.diff_cursor = 0;
+    app.jump_answer();
+    assert_eq!(app.diff_path.as_deref(), Some("a.rs"));
+    assert!(!app.has_new_answer("a.rs"), "going there reads it");
+    assert_eq!(app.status, "1 more new answer");
+    app.jump_answer();
+    assert_eq!(app.diff_path.as_deref(), Some("b.rs"));
+    assert_eq!(app.status, "no more new answers");
+    app.jump_answer();
+    assert_eq!(app.status, "no new answers");
+    assert!(!app.footer_bands().iter().any(|&(a, _)| a == FooterAction::NextAnswer));
+
+    // Replying reads a thread too, and resolving one takes it off the list.
+    app.receive_reply(1, "more".into(), None);
+    app.receive_reply(2, "more".into(), None);
+    app.select_file(file_row(&app, "a.rs")).unwrap();
+    app.focus = Focus::Diff;
+    app.diff_cursor = row_with(&app, '+');
+    app.start_reply();
+    app.cancel_comment();
+    assert!(!app.has_new_answer("a.rs"));
+    app.select_file(file_row(&app, "b.rs")).unwrap();
+    app.focus = Focus::Diff;
+    app.diff_cursor = row_with(&app, '+');
+    app.toggle_resolved();
+    assert_eq!(app.store.unread(), 0);
+}
+
+#[test]
+fn a_send_starts_a_round_that_shows_only_what_changed_after_it() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    app.toggle_since_send().unwrap();
+    assert!(app.awaiting_send() && app.entries.is_empty(), "nothing sent yet");
+    app.toggle_since_send().unwrap();
+    assert_eq!(app.scope, Scope::Uncommitted);
+
+    comment_on(&mut app, '+', "rename it");
+    assert!(app.export(&FakeTarget::ok()));
+    assert!(std::mem::take(&mut app.snapshot_request), "a send asks for its round's snapshot");
+    let (baselines, failed) = herdr_reviewr::world::snapshot_all(&app.repo, app.repos());
+    app.land_send_baselines(baselines, &failed);
+    assert_eq!(app.send_round(), 1);
+
+    r.write("b.rs", "fixed\n");
+    app.set_scope(Scope::Branch).unwrap();
+    app.toggle_since_send().unwrap();
+    assert_eq!(app.scope, Scope::SinceSend);
+    let paths: Vec<&str> = app.entries.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths, ["b.rs"], "a.rs changed before the send");
+    app.toggle_since_send().unwrap();
+    assert_eq!(app.scope, Scope::Branch, "and back to all the changes");
+}
+
+#[test]
+fn a_sent_comment_is_answered_never_rewritten() {
+    let (_r, mut app) = sent_thread();
+    app.focus = Focus::Diff;
+    app.diff_cursor = row_with(&app, '+');
+    app.start_edit();
+    assert!(!app.composing(), "no edit opens");
+    assert!(app.status.contains("a replies"), "{}", app.status);
+    assert!(app.footer_bands().iter().any(|&(a, _)| a == FooterAction::Reply), "reply leads");
+}
+
+#[test]
+fn the_send_says_how_to_answer_while_the_channel_listens() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    app.reply_token = Some("1f2e".into());
+    comment_on(&mut app, '+', "why?");
+    let target = FakeTarget::ok();
+    app.export(&target);
+    let sent = target.last();
+    assert!(sent.contains("herdr-reviewr --reply <number> --to 1f2e \"<answer>\"\n"), "{sent}");
+    let own = "herdr-reviewr --comment <path>:<line> --to 1f2e \"<comment>\".";
+    assert!(sent.contains(own), "the agent learns it can comment too: {sent}");
+    assert!(sent.ends_with("herdr-reviewr --help explains both."), "{sent}");
+}
+
+#[test]
+fn send_carries_the_whole_set_once() {
     let r = edited_repo();
     let mut app = app_on(&r);
     comment_on(&mut app, '+', "first");
     comment_on(&mut app, '-', "second");
 
     app.export(&FakeTarget::ok());
-    assert!(app.store.is_empty(), "send takes every comment, not just one");
+    assert_eq!(app.unsent(), 0, "send takes every comment, not just one");
+    let again = FakeTarget::ok();
+    assert!(!app.export(&again), "a sent set does not go twice");
+    assert_eq!(app.status, "nothing new to send");
 }
 
 #[test]
@@ -1454,13 +1652,16 @@ fn the_review_prefix_heads_every_export_from_the_current_config() {
     let target = FakeTarget::ok();
     app.export(&target);
     let sent = target.last();
-    assert!(sent.starts_with("/address-review\n\na.rs:"), "prefix, blank line, comments: {sent:?}");
+    assert!(
+        sent.starts_with("/address-review\n\n#1 a.rs:"),
+        "prefix, blank line, comments: {sent:?}"
+    );
 
     std::fs::write(&path, "theme = \"nord\"\n").unwrap();
     app.set_plugin_config(herdr_reviewr::config::plugin_config_in(dir.path()).unwrap());
     comment_on(&mut app, '+', "two");
     app.export(&target);
-    assert!(target.last().starts_with("a.rs:"), "unset, the review leads with a comment");
+    assert!(target.last().starts_with("#2 a.rs:"), "unset, the review leads with the new comment");
 }
 
 #[test]
@@ -4670,13 +4871,16 @@ fn live(generation: u64) -> herdr_reviewr::LiveJob {
 fn completion_for(app: &App, generation: u64) -> herdr_reviewr::world::WorldCompletion {
     let input = app.world_input();
     let snapshot = herdr_reviewr::world::build(&input).unwrap();
+    let full = herdr_reviewr::world::Refresh::Full;
+    let probed = herdr_reviewr::world::probe(&input.repo, &input.repos, &app.probe_paths(), &full);
     herdr_reviewr::world::WorldCompletion {
         generation,
         input,
         reveal: false,
         snapshot: Some(Ok(snapshot)),
-        refresh: herdr_reviewr::world::Refresh::Full,
+        refresh: full,
         took: std::time::Duration::ZERO,
+        probed,
     }
 }
 
@@ -4749,7 +4953,11 @@ fn herdrs_session_moves_the_pane_ids_and_input_proves_the_pane_on_screen() {
     use herdr_reviewr::herdr_socket::{HerdrEvent, Session};
     let r = edited_repo();
     let mut app = app_on(&r);
-    let moved = PaneIds { workspace: Some("w2".into()), pane: Some("w2:p9".into()) };
+    let moved = PaneIds {
+        workspace: Some("w2".into()),
+        pane: Some("w2:p9".into()),
+        tab: Some("w2:t1".into()),
+    };
     let session = |me, visible| HerdrEvent::Session(Session { me, visible });
     herdr_reviewr::land_herdr_event(&mut app, session(Some(moved.clone()), false));
     assert_eq!(app.herdr.ids, moved, "Send and the label follow the move");
@@ -4935,8 +5143,13 @@ fn the_worker_coalesces_queued_jobs_keeping_their_flags() {
     newer.scope = Scope::Branch;
     // Both jobs queue before the worker starts, so the coalescing path is deterministic.
     let full = herdr_reviewr::world::Refresh::Full;
-    let job =
-        |generation, input, reveal| WorldJob { generation, input, reveal, refresh: full.clone() };
+    let job = |generation, input, reveal| WorldJob {
+        generation,
+        input,
+        reveal,
+        refresh: full.clone(),
+        probe: std::collections::BTreeMap::new(),
+    };
     job_tx.send(job(1, input, true)).unwrap();
     job_tx.send(job(2, newer, false)).unwrap();
     let worker = world::spawn(dir.path().to_path_buf(), job_rx, res_tx);
@@ -6647,8 +6860,8 @@ impl ExportTarget for SelClipboard {
     fn label(&self) -> &'static str {
         "clipboard"
     }
-    fn success_message(&self, count: usize) -> String {
-        format!("copied {count}")
+    fn success_message(&self, what: &str) -> String {
+        format!("copied {what}")
     }
     fn failure_message(&self, _error: &anyhow::Error, _copy: &str) -> String {
         "clipboard failed".to_string()
@@ -6766,32 +6979,33 @@ fn ts_one_surface_a_drag_clamps_to_its_pane_and_skips_cards() {
     let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, &app);
     let (c0, r0) = sel_cell(&app, 0, 0);
     sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
-    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), inner.x + 5 + 5, inner.y + 5);
+    // Rows 0 and 1, the card's four (border, author, text, border), then row 2.
+    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), inner.x + 5 + 5, inner.y + 6);
     let drag = app.text_drag().expect("drag still live");
     assert_eq!(drag.extent.row, 2, "the extent lands on row 2's code below the card");
-    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), inner.x + 5 + 5, inner.y + 5);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), inner.x + 5 + 5, inner.y + 6);
     assert_eq!(app.status, "copied 23 chars");
     let text = last_copy().unwrap();
     assert_eq!(text, "alpha beta\n\tif x {\n日本 z");
     assert!(!text.contains("watch this"), "spanned cards contribute nothing");
 
-    // A drag that starts on the card selects that card's text, confined to it.
+    // A drag that starts on the card's text, under its author line, selects it, confined to it.
     app.status.clear();
-    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), inner.x + 4, inner.y + 3);
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), inner.x + 4, inner.y + 4);
     assert!(matches!(
         app.text_drag().expect("card drag armed").surface,
         Surface::Card { comment: 0 }
     ));
-    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), inner.x + 4 + 9, inner.y + 3);
-    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), inner.x + 4 + 9, inner.y + 3);
+    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), inner.x + 4 + 9, inner.y + 4);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), inner.x + 4 + 9, inner.y + 4);
     assert_eq!(app.status, "copied 10 chars");
     assert_eq!(last_copy().as_deref(), Some("watch this"), "the card's own text copies");
 
     // A double on the card copies the word under the cell; no composer opens over the card
-    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), inner.x + 4, inner.y + 3);
-    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), inner.x + 4, inner.y + 3);
-    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), inner.x + 4, inner.y + 3);
-    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), inner.x + 4, inner.y + 3);
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), inner.x + 4, inner.y + 4);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), inner.x + 4, inner.y + 4);
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), inner.x + 4, inner.y + 4);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), inner.x + 4, inner.y + 4);
     assert!(!app.composing(), "a card double-click never opens the composer");
     assert_eq!(last_copy().as_deref(), Some("watch"), "the card word copies");
 }
@@ -11824,4 +12038,225 @@ fn a_split_text_drag_scrolls_sideways_at_its_own_halfs_edges() {
     split_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), divider);
     assert_eq!(app.h_scroll, 2, "the new half's left edge scrolls left");
     split_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), divider);
+}
+
+// --- Comments follow the code: an edit carries them with their lines ---
+
+/// The open `a.rs` with a comment on its `BETA`, line 2.
+fn commented_beta() -> (Repo, App) {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    comment_on(&mut app, '+', "why upper case?");
+    assert_eq!(app.store.get(0).unwrap().start, 2);
+    (r, app)
+}
+
+#[test]
+fn a_comment_rides_an_edit_above_its_lines() {
+    let (r, mut app) = commented_beta();
+    r.write("a.rs", "new one\nnew two\nalpha\nBETA\ngamma\ndelta\nepsilon\n");
+    common::land_world(&mut app);
+    let c = app.store.get(0).unwrap();
+    assert_eq!((c.start, c.end), (4, 4), "the comment moved down with its line");
+    assert!(!app.store.changed(0), "its line still reads the same");
+    let (row, _) = app.card_rows()[0];
+    assert_eq!(app.visible[row].new_no(), Some(4), "its card sits under the line it is about");
+}
+
+#[test]
+fn a_comment_on_rewritten_lines_says_its_code_changed() {
+    let (r, mut app) = commented_beta();
+    r.write("a.rs", "alpha\nBeta, rewritten\ngamma\ndelta\nepsilon\n");
+    common::land_world(&mut app);
+    assert_eq!(app.store.get(0).unwrap().start, 2, "it stays where its line was");
+    assert!(app.store.changed(0), "the line under it changed");
+    let target = FakeTarget::ok();
+    assert!(app.export(&target));
+    let sent = target.last();
+    assert!(sent.starts_with("#1 a.rs:2 (the code changed since)\n+BETA\n"), "{sent}");
+    // The line reads as it did again, and the note goes.
+    r.write("a.rs", "alpha\nBETA\ngamma\ndelta\nepsilon\n");
+    common::land_world(&mut app);
+    assert!(!app.store.changed(0));
+}
+
+#[test]
+fn a_comment_in_a_file_not_open_follows_its_lines() {
+    let r = Repo::init();
+    r.write("a.rs", "one\n");
+    r.write("b.rs", "alpha\nbeta\n");
+    r.commit_all("init");
+    r.write("a.rs", "ONE\n");
+    r.write("b.rs", "alpha\nbeta\nthe line under review\n");
+    let mut app = app_on(&r);
+    app.select_file(file_row(&app, "b.rs")).unwrap();
+    comment_on(&mut app, '+', "why this?");
+    app.select_file(file_row(&app, "a.rs")).unwrap();
+    r.write("b.rs", "inserted\nalpha\nbeta\nthe line under review\n");
+    common::land_world(&mut app);
+    assert_eq!(app.diff_path.as_deref(), Some("a.rs"), "b.rs stays closed");
+    assert_eq!(app.store.get(0).unwrap().start, 4, "its comment followed the edit");
+    assert!(!app.store.changed(0));
+}
+
+#[test]
+fn a_fold_holding_a_comment_opens() {
+    let r = folded_repo();
+    let mut app = app_on(&r);
+    // `line 18` (line 19) shows as context beside the change at line 21.
+    app.focus = Focus::Diff;
+    app.diff_cursor = app.visible.iter().position(|v| v.new_no() == Some(19)).expect("line 19");
+    app.start_comment();
+    typed(&mut app, "keep this");
+    app.submit_comment();
+    // The change moves to line 36: line 19 is unchanged context far from it.
+    let text: String = (0..40)
+        .map(|i| if i == 35 { "LINE 35\n".to_string() } else { format!("line {i}\n") })
+        .collect();
+    r.write("big.rs", &text);
+    common::land_world(&mut app);
+    assert!(app.visible.iter().any(|v| v.new_no() == Some(19)), "the fold holding it opened");
+    let (row, _) = app.card_rows()[0];
+    assert_eq!(app.visible[row].new_no(), Some(19), "its card shows under its line");
+    assert!(!app.store.changed(0));
+}
+
+// --- Viewed marks: `space` marks a file and moves on; a change clears the mark ---
+
+/// Three changed files, `a.rs` open.
+fn three_files() -> (Repo, App) {
+    let r = Repo::init();
+    for name in ["a.rs", "b.rs", "c.rs"] {
+        r.write(name, "one\n");
+    }
+    r.commit_all("init");
+    for name in ["a.rs", "b.rs", "c.rs"] {
+        r.write(name, "two\n");
+    }
+    let app = app_on(&r);
+    assert_eq!(app.diff_path.as_deref(), Some("a.rs"));
+    (r, app)
+}
+
+#[test]
+fn space_marks_the_file_viewed_and_opens_the_next() {
+    let (_r, mut app) = three_files();
+    let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+    handle_key(&mut app, space, Rect::new(0, 0, 120, 40), &Keymap::default()).unwrap();
+    assert_eq!(app.viewed_mark("a.rs"), Some(ViewedMark::Viewed));
+    assert_eq!(app.diff_path.as_deref(), Some("b.rs"), "the next file opens");
+    assert_eq!(app.status, "1/3 viewed");
+    app.toggle_viewed();
+    app.toggle_viewed();
+    assert_eq!(app.viewed_counts(), (3, 0));
+    assert_eq!(app.status, "all 3 files viewed");
+    assert_eq!(app.diff_path.as_deref(), Some("c.rs"), "nothing left: it stays");
+}
+
+#[test]
+fn a_viewed_file_that_changes_shows_it_changed_since() {
+    let (r, mut app) = three_files();
+    app.toggle_viewed();
+    r.write("a.rs", "three\n");
+    common::land_world(&mut app);
+    assert_eq!(app.viewed_mark("a.rs"), Some(ViewedMark::Changed));
+    assert_eq!(app.viewed_counts(), (0, 1));
+    // Viewing it again marks it as it reads now.
+    app.select_file(file_row(&app, "a.rs")).unwrap();
+    app.toggle_viewed();
+    assert_eq!(app.viewed_mark("a.rs"), Some(ViewedMark::Viewed));
+}
+
+#[test]
+fn space_on_a_viewed_file_unmarks_it_in_place() {
+    let (_r, mut app) = three_files();
+    app.toggle_viewed();
+    app.select_file(file_row(&app, "a.rs")).unwrap();
+    app.toggle_viewed();
+    assert_eq!(app.viewed_mark("a.rs"), None);
+    assert_eq!(app.diff_path.as_deref(), Some("a.rs"), "unmarking moves nowhere");
+}
+
+#[test]
+fn space_on_a_folder_marks_every_file_under_it() {
+    let r = Repo::init();
+    r.write("src/x.rs", "1\n");
+    r.write("src/y.rs", "1\n");
+    r.write("root.rs", "1\n");
+    r.commit_all("init");
+    for name in ["src/x.rs", "src/y.rs", "root.rs"] {
+        r.write(name, "2\n");
+    }
+    let mut app = app_on(&r);
+    app.focus = Focus::Files;
+    app.file_cursor = app.file_rows.iter().position(|row| row.dir_path() == Some("src")).unwrap();
+    app.toggle_viewed();
+    assert_eq!(app.viewed_counts(), (2, 0));
+    assert_eq!(app.viewed_mark("root.rs"), None);
+    app.toggle_viewed();
+    assert_eq!(app.viewed_counts(), (0, 0), "all viewed: the same key unmarks them");
+}
+
+// --- The agent comments: its own words on its own lines, a thread you answer ---
+
+/// The canonical path of `rel` in `r`, as the agent's command sends it.
+fn spot(r: &Repo, rel: &str) -> std::path::PathBuf {
+    std::fs::canonicalize(r.path().join(rel)).unwrap()
+}
+
+#[test]
+fn an_agents_comment_lands_as_a_new_thread_on_its_lines() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    let said = "I upper-cased it to match the constant";
+    let number = app.receive_comment(&spot(&r, "a.rs"), 2, 2, said.into(), Some("claude".into()));
+    assert_eq!(number, Ok(1));
+    let thread = app.store.thread(0).expect("it opens as a thread");
+    assert_eq!(thread.opener, herdr_reviewr::model::Author::Agent("claude".into()));
+    assert!(thread.unread && app.has_new_answer("a.rs"), "it waits unread");
+    assert!(app.status.starts_with("claude commented on a.rs:2"), "{}", app.status);
+    let (row, ci) = app.card_rows()[0];
+    assert_eq!((app.visible[row].new_no(), ci), (Some(2), 0), "its card sits under its line");
+    assert_eq!(app.store.unsent(), 0, "nothing of the reviewer's waits");
+
+    // `A` goes there and reads it; it is the agent's, so it takes a reply, never an edit.
+    app.jump_answer();
+    assert!(!app.store.thread(0).unwrap().unread);
+    app.start_edit();
+    assert!(!app.composing());
+    assert!(app.status.contains("claude's comment"), "{}", app.status);
+    app.start_reply();
+    typed(&mut app, "keep it lower");
+    app.submit_comment();
+    let target = FakeTarget::ok();
+    assert!(app.export(&target));
+    assert!(target.last().starts_with("#1 reply · a.rs:2\nkeep it lower"), "{}", target.last());
+}
+
+#[test]
+fn an_agents_comment_is_refused_where_no_line_is() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("x.rs"), "x\n").unwrap();
+    let elsewhere = std::fs::canonicalize(outside.path().join("x.rs")).unwrap();
+    let refused = app.receive_comment(&elsewhere, 1, 1, "x".into(), None).unwrap_err();
+    assert!(refused.contains("is outside"), "{refused}");
+    let past = app.receive_comment(&spot(&r, "a.rs"), 4, 9, "x".into(), None).unwrap_err();
+    assert_eq!(past, "a.rs has 5 lines");
+    assert!(app.store.is_empty(), "nothing landed");
+}
+
+#[test]
+fn an_agents_comment_on_an_unchanged_file_reads_with_its_content() {
+    let r = edited_repo();
+    r.write("calm.rs", "steady\n");
+    r.commit_all("calm");
+    r.write("a.rs", "alpha\nBETA\ngamma\ndelta\nepsilon\n");
+    let mut app = app_on(&r);
+    assert_eq!(app.receive_comment(&spot(&r, "calm.rs"), 1, 1, "see".into(), None), Ok(1));
+    assert!(!app.store.get(0).unwrap().diff_anchored, "no diff shows it: All files does");
+    assert!(
+        app.store.thread(0).is_some_and(|t| t.opener != herdr_reviewr::model::Author::Reviewer)
+    );
 }
