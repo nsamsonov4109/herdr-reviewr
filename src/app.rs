@@ -701,8 +701,10 @@ pub struct CardPlace {
     pub side: Side,
     pub start: u32,
     pub end: u32,
-    /// Made in this view, where it follows its lines: only here can they change under it.
+    /// Made in this view, where it follows its lines.
     pub native: bool,
+    /// Its lines read otherwise here than when it was made.
+    pub changed: bool,
     /// What it was made on, when this view shows another: `1a2b3c4`, `the worktree`.
     pub from: Option<String>,
 }
@@ -842,8 +844,9 @@ pub struct App {
     view_reload_held: bool,
     /// The open file's two sides as read: the text a new comment's lines count in.
     open_text: OpenText,
-    /// Where the open view shows the comments made in other views, by id: their lines found here.
-    placed: HashMap<u64, Span>,
+    /// Where the open view shows the comments made in other views, by id: their lines found here,
+    /// and whether they read otherwise now.
+    placed: HashMap<u64, (Span, bool)>,
     /// The files marked viewed, each with what its bytes hashed to then (`None`: no file).
     viewed: HashMap<String, Option<u64>>,
     /// What each viewed file's bytes hash to as last read.
@@ -868,6 +871,8 @@ pub struct App {
     send_baselines: std::collections::BTreeMap<String, String>,
     /// How many sends' snapshots landed: the round `since send` names.
     send_round: u64,
+    /// The readers a send explained the review to: agent panes, `""` for copies.
+    introduced: HashSet<String>,
     /// The scope `since send` was entered from by its key, which the key returns to.
     scope_before_send: Option<Scope>,
     /// A send succeeded: the loop snapshots every repository for its round.
@@ -1081,6 +1086,7 @@ impl App {
             reply_to: None,
             send_baselines: std::collections::BTreeMap::new(),
             send_round: 0,
+            introduced: HashSet::new(),
             scope_before_send: None,
             snapshot_request: false,
             base_picker: None,
@@ -1233,6 +1239,7 @@ impl App {
         // The round is session memory, like the threads it follows.
         self.send_baselines = std::mem::take(&mut old.send_baselines);
         self.send_round = old.send_round;
+        self.introduced = std::mem::take(&mut old.introduced);
         self.scope_before_send = old.scope_before_send.take();
         // The commit pick is session memory like the comments: replaced, never cleared
         self.commit_picks = std::mem::take(&mut old.commit_picks);
@@ -1478,6 +1485,7 @@ impl App {
             })
         });
         self.changeset = snapshot.changeset;
+        self.follow_renames();
         self.entries = snapshot.entries;
         self.adopt_branch_base(snapshot.branch_base, snapshot.repo_bases);
         self.adopt_pick_status(snapshot.pick_status);
@@ -2058,28 +2066,93 @@ impl App {
         }
     }
 
+    /// Worktree comments follow their file to the path a rename gave it, once the old path is gone:
+    /// a copy's source, or a path made again, keeps its own (Comments survive).
+    fn follow_renames(&mut self) {
+        let moves: Vec<(String, String)> = (self.changeset.files.values())
+            .filter(|f| f.kind == ChangeKind::Renamed)
+            .filter_map(|f| Some((f.previous_path.clone()?, f.path.clone())))
+            .filter(|(from, _)| {
+                !self.changeset.files.contains_key(from)
+                    && std::fs::symlink_metadata(self.repo.join(from)).is_err()
+            })
+            .collect();
+        for (from, to) in moves {
+            let carried = self.store.rename(&from, &to, |c| c.rev == Rev::Worktree);
+            if carried > 0 {
+                logln!("{carried} comments follow {from} to {to}");
+            }
+        }
+    }
+
     /// Find where the open view reads each other view's comment, its own side first, moving none.
     fn place_foreign(&mut self) {
         self.placed.clear();
         let Some(file) = self.diff_path.as_deref() else { return };
         let new = crate::anchor::lines(&self.open_text.new);
         let old = crate::anchor::lines(&self.open_text.old);
-        for (i, c) in self.store.iter().enumerate() {
-            if c.file != file || self.comment_in_view(c) {
-                continue;
+        let placed: Vec<(u64, (Span, bool))> = (self.store.iter().enumerate())
+            .filter(|(_, c)| c.file == file && (!self.comment_in_view(c) || self.side_gone(c)))
+            .filter_map(|(i, c)| Some((self.store.id(i)?, self.locate_in(i, c, &new, &old)?)))
+            .collect();
+        self.placed.extend(placed);
+    }
+
+    /// Whether the open diff has no side of `c`'s: a deleted file's new side, an added one's old.
+    fn side_gone(&self, c: &Comment) -> bool {
+        let Some(file) = self.changeset.files.get(&c.file) else { return false };
+        let kind = file.kind;
+        self.diff.view == View::Diff
+            && match c.side {
+                Side::New => kind == ChangeKind::Deleted,
+                Side::Old => matches!(kind, ChangeKind::Added | ChangeKind::Untracked),
             }
-            let held = self.store.held(i);
-            let sides = match c.side {
-                Side::New => [(Side::New, &new), (Side::Old, &old)],
-                Side::Old => [(Side::Old, &old), (Side::New, &new)],
-            };
-            let found = sides.into_iter().find_map(|(side, text)| {
-                crate::anchor::locate(held, c.start, text).map(|(start, end)| (side, start, end))
-            });
-            if let (Some(id), Some(span)) = (self.store.id(i), found) {
-                self.placed.insert(id, span);
-            }
+    }
+
+    /// Where a view whose sides read `new` and `old` shows comment `i`, made in another view,
+    /// and whether its lines read otherwise there: a side that reads them as made comes first.
+    fn locate_in(&self, i: usize, c: &Comment, new: &[&str], old: &[&str]) -> Option<(Span, bool)> {
+        let held = self.store.held(i);
+        let made_on = self.store.counted_in(i).map(crate::anchor::lines);
+        let sides = match c.side {
+            Side::New => [(Side::New, new), (Side::Old, old)],
+            Side::Old => [(Side::Old, old), (Side::New, new)],
+        };
+        let found: Vec<(Span, bool)> = (sides.into_iter())
+            .filter_map(|(side, text)| {
+                let p = crate::anchor::locate(held, c.start, c.end, made_on.as_deref(), text)?;
+                Some(((side, p.start, p.end), p.changed))
+            })
+            .collect();
+        found.iter().find(|(_, changed)| !changed).or(found.first()).copied()
+    }
+
+    /// The comments `path` shows opened in this tab, with their lines: another file's read from
+    /// its sides, the way opening it places them.
+    fn spans_in(&self, path: &str) -> Vec<(usize, Span)> {
+        if self.diff_path.as_deref() == Some(path) {
+            return self.shown_comments();
         }
+        let view = if self.tab == Tab::AllFiles { View::File } else { View::Diff };
+        let ours = (self.store.iter().enumerate())
+            .filter(|&(i, c)| c.file == path && self.store.thread(i).is_none_or(|t| !t.resolved));
+        let (made, others): (Vec<_>, Vec<_>) = ours.partition(|(_, c)| self.made_in(c, view));
+        let mut out: Vec<(usize, Span)> =
+            made.into_iter().map(|(i, c)| (i, (c.side, c.start, c.end))).collect();
+        if !others.is_empty() {
+            let (old, new) = match view {
+                View::Diff => self.content_sides(path).unwrap_or_default(),
+                View::File => {
+                    (String::new(), worktree_content(&self.repo, path).unwrap_or_default())
+                }
+            };
+            let (old, new) = (crate::anchor::lines(&old), crate::anchor::lines(&new));
+            let placed = others
+                .into_iter()
+                .filter_map(|(i, c)| self.locate_in(i, c, &new, &old).map(|(span, _)| (i, span)));
+            out.extend(placed);
+        }
+        out
     }
 
     /// `path`'s sides from the landed build's record: a notice, or one `git diff` of the scope's ends.
@@ -4025,6 +4098,23 @@ impl App {
         }
     }
 
+    /// [`Self::receive_comment`] unless `until` passed: the agent then heard "busy, try again",
+    /// and its retry would land a second copy.
+    pub fn receive_comment_until(
+        &mut self,
+        path: &std::path::Path,
+        start: u32,
+        end: u32,
+        text: String,
+        agent: Option<String>,
+        until: Instant,
+    ) -> Result<u64, String> {
+        if Instant::now() > until {
+            return Err("the review pane was busy; try again".to_string());
+        }
+        self.receive_comment(path, start, end, text, agent)
+    }
+
     /// The agent's own comment on `path`'s lines `start..=end`, landed as its thread; its number.
     pub fn receive_comment(
         &mut self,
@@ -4038,7 +4128,9 @@ impl App {
         let inside = path
             .strip_prefix(&root)
             .map_err(|_| format!("{} is outside {}", path.display(), root.display()))?;
-        let file = inside.to_string_lossy().replace('\\', "/");
+        // Windows separates with `\`; elsewhere it is a name's own character.
+        let file = inside.to_string_lossy();
+        let file = if cfg!(windows) { file.replace('\\', "/") } else { file.into_owned() };
         let content =
             worktree_content(&self.repo, &file).map_err(|n| format!("{file}: {}", n.message()))?;
         let lines = crate::anchor::lines(&content);
@@ -4459,7 +4551,9 @@ impl App {
     pub fn submit_comment(&mut self) {
         let Mode::Composing { editing } = self.mode else { return };
         let text = self.input.trim().to_string();
-        if text.is_empty() {
+        // Zero-width marks alone would save a comment no one can see.
+        let invisible = |c: char| matches!(c, '\u{200b}'..='\u{200d}' | '\u{2060}' | '\u{feff}');
+        if text.chars().all(|c| c.is_whitespace() || invisible(c)) {
             self.cancel_comment();
             return;
         }
@@ -4626,10 +4720,12 @@ impl App {
 
     /// Whether `c` belongs to this view: its kind matches, and a diff comment's `rev` is current.
     fn comment_in_view(&self, c: &Comment) -> bool {
-        if c.diff_anchored != (self.diff.view == View::Diff) {
-            return false;
-        }
-        self.rev_is_current(c)
+        self.made_in(c, self.diff.view)
+    }
+
+    /// Whether `c` was made in a `view` of this scope: the one view whose text it follows.
+    fn made_in(&self, c: &Comment, view: View) -> bool {
+        c.diff_anchored == (view == View::Diff) && self.rev_is_current(c)
     }
 
     /// Whether the scope reads the diff `c` was made on.
@@ -4648,10 +4744,11 @@ impl App {
         if self.diff_path.as_deref() != Some(c.file.as_str()) {
             return None;
         }
-        if self.comment_in_view(c) {
-            return Some((c.side, c.start, c.end));
+        // A comment whose side this diff lacks sits where its lines read on the other.
+        if let Some(&(span, _)) = self.placed.get(&self.store.id(i)?) {
+            return Some(span);
         }
-        self.placed.get(&self.store.id(i)?).copied()
+        self.comment_in_view(c).then_some((c.side, c.start, c.end))
     }
 
     /// Where comment `i`'s card sits in the open view, and what its title says of the view.
@@ -4666,7 +4763,10 @@ impl App {
             Rev::Worktree => Some("the worktree".to_string()),
             Rev::Commit(pick) => Some(pick.label()),
         };
-        Some(CardPlace { side, start, end, native: self.comment_in_view(c), from })
+        let native = self.comment_in_view(c);
+        let placed = self.store.id(i).and_then(|id| self.placed.get(&id));
+        let changed = placed.map_or(native && self.store.changed(i), |&(_, changed)| changed);
+        Some(CardPlace { side, start, end, native, changed, from })
     }
 
     /// The comments the open view shows, by store index, each with its lines here.
@@ -4864,30 +4964,25 @@ impl App {
         let order = self.file_order();
         let open = self.diff_path.clone();
         let here = open.as_deref().and_then(|p| order.get(p)).copied();
-        let mut by_file: std::collections::BTreeMap<usize, Vec<usize>> =
-            std::collections::BTreeMap::new();
-        for (i, c) in self.store.iter().enumerate() {
-            let shown = self.store.thread(i).is_none_or(|t| !t.resolved) && self.comment_in_view(c);
-            if open.as_deref() == Some(c.file.as_str()) || !shown {
-                continue;
-            }
-            if let Some(&at) = order.get(c.file.as_str()) {
-                by_file.entry(at).or_default().push(i);
-            }
-        }
-        let pick = if dir >= 0 {
-            here.and_then(|h| by_file.range(h + 1..).next()).or_else(|| by_file.iter().next())
+        let files: BTreeMap<usize, String> = (self.store.iter())
+            .filter(|c| open.as_deref() != Some(c.file.as_str()))
+            .filter_map(|c| Some((*order.get(c.file.as_str())?, c.file.clone())))
+            .collect();
+        // Past this file, around the list: the first whose card shows, wherever it was made.
+        let (after, before): (Vec<_>, Vec<_>) =
+            files.into_iter().partition(|(at, _)| here.is_some_and(|h| *at > h));
+        let ordered: Vec<String> = if dir >= 0 {
+            after.into_iter().chain(before).map(|(_, path)| path).collect()
         } else {
-            here.and_then(|h| by_file.range(..h).next_back()).or_else(|| by_file.iter().next_back())
+            before.into_iter().rev().chain(after.into_iter().rev()).map(|(_, path)| path).collect()
         };
-        let Some((_, comments)) = pick else { return false };
-        let start = |i: usize| self.store.get(i).map_or(0, |c| c.start);
-        let ci = if dir >= 0 {
-            comments.iter().copied().min_by_key(|&i| start(i))
-        } else {
-            comments.iter().copied().max_by_key(|&i| start(i))
+        let Some(path) = ordered.into_iter().find(|path| !self.spans_in(path).is_empty()) else {
+            return false;
         };
-        let Some(ci) = ci else { return false };
+        self.open_file_by_path(&path);
+        let cards = self.card_rows();
+        let card = if dir >= 0 { cards.iter().min() } else { cards.iter().max() };
+        let Some(&(_, ci)) = card else { return false };
         self.land_on_comment(ci);
         true
     }
@@ -4896,19 +4991,18 @@ impl App {
     /// review; landing there reads it.
     pub fn jump_answer(&mut self) {
         let order = self.file_order();
-        let mut unread: Vec<(usize, u32, usize)> = self
-            .store
-            .iter()
-            .enumerate()
-            .filter(|&(i, _)| self.store.thread(i).is_some_and(|t| t.unread && !t.resolved))
-            // The open file shows what it places; another file, what it was made in.
-            .filter_map(|(i, c)| match self.view_span(i) {
-                Some((_, start, _)) => Some((i, c, start)),
-                None if self.diff_path.as_deref() == Some(c.file.as_str()) => None,
-                None => self.comment_in_view(c).then_some((i, c, c.start)),
-            })
-            .filter_map(|(i, c, start)| Some((*order.get(c.file.as_str())?, start, i)))
+        let waiting = |i: usize| self.store.thread(i).is_some_and(|t| t.unread && !t.resolved);
+        let files: BTreeSet<&str> = (self.store.iter().enumerate())
+            .filter(|&(i, _)| waiting(i))
+            .map(|(_, c)| c.file.as_str())
             .collect();
+        // Each file's answers where opening it shows them, wherever they were made.
+        let mut unread: Vec<(usize, u32, usize)> = Vec::new();
+        for path in files {
+            let Some(&at) = order.get(path) else { continue };
+            let shown = self.spans_in(path).into_iter().filter(|&(i, _)| waiting(i));
+            unread.extend(shown.map(|(i, (_, start, _))| (at, start, i)));
+        }
         if unread.is_empty() {
             self.status = "no new answers".to_string();
             return;
@@ -6234,7 +6328,16 @@ impl App {
         }
         let blocks = self.outgoing();
         let prefix = self.plugin_config().and_then(crate::config::PluginConfig::review_prefix);
-        let answer = self.reply_token.as_deref().map(crate::export::answer_line);
+        let token = self.reply_token.clone();
+        // Each reader's first send explains the review; later ones only how to answer.
+        let first = !self.introduced.contains(target.reader().unwrap_or_default());
+        let answer = token.as_deref().map(|token| {
+            if first {
+                crate::export::intro_lines(token)
+            } else {
+                crate::export::answer_line(token)
+            }
+        });
         let text = format_send(prefix, &blocks, answer.as_deref());
         let n = blocks.len();
         let replies =
@@ -6243,6 +6346,9 @@ impl App {
         logln!("export ({n}) -> {} ::\n{text}", target.label());
         let delivered = match target.export(&text) {
             Ok(()) => {
+                if token.is_some() {
+                    self.introduced.insert(target.reader().unwrap_or_default().to_string());
+                }
                 // Sent, each comment stays as a thread its answers join, and a new round starts.
                 self.store.mark_sent();
                 self.snapshot_request = true;
@@ -6555,6 +6661,11 @@ fn is_markdown_path(path: &str) -> bool {
 fn worktree_content(repo: &std::path::Path, path: &str) -> Result<String, crate::diff::Notice> {
     use std::io::{ErrorKind, Read};
     let at = repo.join(path);
+    // A link reads as git stores it, the path it names, never what it points at: maybe outside.
+    if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+        let target = std::fs::read_link(&at).map_err(|_| crate::diff::Notice::Unreadable)?;
+        return Ok(target.to_string_lossy().into_owned());
+    }
     let meta = match std::fs::metadata(&at) {
         Ok(meta) if meta.is_file() => meta,
         Ok(_) => return Ok(String::new()),

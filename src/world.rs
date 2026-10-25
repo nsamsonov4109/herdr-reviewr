@@ -330,7 +330,7 @@ fn scope_build(input: &WorldInput, head: Option<String>) -> Result<ScopeBuild> {
             None => Ok(ScopeBuild::default()),
         },
         Scope::Uncommitted => {
-            let base = git::diff_base(head);
+            let base = git::diff_base(&input.repo, head);
             at_ends(&input.repo, DiffEnds { old: base, new: None })
         }
         Scope::Branch => {
@@ -383,7 +383,7 @@ fn build_pick(repo: &Path, pick: &CommitPick) -> Result<ScopeBuild> {
     let Some(old) = git::parent_or_empty(repo, &pick.oldest) else {
         return Ok(gone(&pick.oldest));
     };
-    if old != git::EMPTY_TREE && !git::commit_exists(repo, &old) {
+    if old != git::empty_tree(repo) && !git::commit_exists(repo, &old) {
         return Ok(gone(&old));
     }
     let subject = git::commit_subject(repo, &pick.newest).unwrap_or_default();
@@ -458,15 +458,18 @@ fn rename_partners(
     paths: &BTreeSet<String>,
     fresh: &[ChangedFile],
 ) -> Option<BTreeSet<String>> {
-    let found =
-        |kind| fresh.iter().any(|f: &ChangedFile| f.kind == kind || f.kind == ChangeKind::Renamed);
-    let (added, deleted) = (found(ChangeKind::Added), found(ChangeKind::Deleted));
+    let found = |kinds: &[ChangeKind]| {
+        fresh.iter().any(|f: &ChangedFile| kinds.contains(&f.kind) || f.kind == ChangeKind::Renamed)
+    };
+    // An untracked file is a move's candidate too: the worktree diff pairs it with a deletion.
+    let added = found(&[ChangeKind::Added, ChangeKind::Untracked]);
+    let deleted = found(&[ChangeKind::Deleted]);
     let mut partners = BTreeSet::new();
     for f in last.values() {
         let touched = f.touched_by(paths);
         let pairs = match f.kind {
             ChangeKind::Deleted => added,
-            ChangeKind::Added => deleted,
+            ChangeKind::Added | ChangeKind::Untracked => deleted,
             ChangeKind::Renamed => added || deleted,
             _ => false,
         };

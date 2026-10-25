@@ -37,6 +37,16 @@ impl LineMap {
         Self { ops, new_len: new.len() }
     }
 
+    /// Map 1-based old line `line` to its new line, and whether it is there, the same or
+    /// rewritten in place, rather than deleted.
+    #[must_use]
+    pub fn place(&self, line: u32) -> (u32, bool) {
+        let i = line.saturating_sub(1) as usize;
+        let op = self.ops.iter().find(|op| op.as_tag_tuple().1.contains(&i));
+        let kept = op.is_some_and(|op| op.as_tag_tuple().0 != similar::DiffTag::Delete);
+        (self.line(line), kept)
+    }
+
     /// Map 1-based old line `line` to its 1-based new line.
     #[must_use]
     pub fn line(&self, line: u32) -> u32 {
@@ -89,26 +99,55 @@ pub fn follow(
         let end = if held.is_empty() { end } else { start + held.len() as u32 - 1 };
         return Placed { start, end, changed: false };
     }
-    match lone_match(held, now) {
+    match moved_to(held, before, now) {
         Some(at) => Placed { start: at, end: at + held.len() as u32 - 1, changed: false },
         None => Placed { start, end, changed: true },
     }
 }
 
-/// Where another view shows `held` in `now`, never moving the comment: at `near` while it reads
-/// there, else at its one match; `None` when `now` holds no such lines.
+/// Where another view shows `held`, lines `start..=end` of `before` if known, in `now`: where the
+/// edit put them while they read the same, else their one match, else where it rewrote them.
 #[must_use]
-pub fn locate(held: &[String], near: u32, now: &[&str]) -> Option<(u32, u32)> {
+pub fn locate(
+    held: &[String],
+    start: u32,
+    end: u32,
+    before: Option<&[&str]>,
+    now: &[&str],
+) -> Option<Placed> {
     let last = held.len().checked_sub(1)? as u32;
-    let at = if reads_at(now, near, held) { near } else { lone_match(held, now)? };
-    Some((at, at + last))
+    let map = before.map(|before| LineMap::of_lines(before, now));
+    // Without the text they were made on, a line number alone proves nothing for `}`.
+    let (at, kept) = map.as_ref().map_or((start, false), |map| map.place(start));
+    if reads_at(now, at, held) && (map.is_some() || distinct(held)) {
+        return Some(Placed { start: at, end: at + last, changed: false });
+    }
+    if let Some(at) = moved_to(held, before, now) {
+        return Some(Placed { start: at, end: at + last, changed: false });
+    }
+    let map = map.filter(|_| kept)?;
+    let bound = (now.len() as u32).max(1);
+    let start = at.clamp(1, bound);
+    Some(Placed { start, end: map.line(end).clamp(start, bound), changed: true })
+}
+
+/// Whether `held` shows enough to prove its lines anywhere but where they were made.
+fn distinct(held: &[String]) -> bool {
+    let visible: usize =
+        held.iter().map(|l| l.chars().filter(|c| !c.is_whitespace()).count()).sum();
+    visible >= DISTINCT
+}
+
+/// Where `held` moved in `now`: its one match there, when it was one of a kind in `before` too, so
+/// a rewritten line never lands on the twin it left behind.
+fn moved_to(held: &[String], before: Option<&[&str]>, now: &[&str]) -> Option<u32> {
+    let unique_before = before.is_none_or(|before| lone_match(held, before).is_some());
+    lone_match(held, now).filter(|_| unique_before)
 }
 
 /// The one line `held` reads from in `now`, when it is distinct enough to prove anything.
 fn lone_match(held: &[String], now: &[&str]) -> Option<u32> {
-    let visible: usize =
-        held.iter().map(|l| l.chars().filter(|c| !c.is_whitespace()).count()).sum();
-    if visible < DISTINCT {
+    if !distinct(held) {
         return None;
     }
     let mut found = (1..=now.len() as u32).filter(|&at| reads_at(now, at, held));
@@ -226,14 +265,62 @@ mod tests {
 
     #[test]
     fn another_view_shows_the_lines_where_they_read_the_same_or_nowhere() {
+        let at = |start, end| Some(Placed { start, end, changed: false });
         let now = lines("a\n    let total = items.len();\nc\n    let total = items.len();\n");
         let total = held(&["    let total = items.len();"]);
-        assert_eq!(locate(&total, 2, &now), Some((2, 2)), "at its own line while it reads there");
-        assert_eq!(locate(&total, 1, &now), None, "two matches elsewhere: neither is it");
+        assert_eq!(
+            locate(&total, 2, 2, None, &now),
+            at(2, 2),
+            "at its own line while it reads there"
+        );
+        assert_eq!(locate(&total, 1, 1, None, &now), None, "two matches elsewhere: neither is it");
         let now = lines("x\ny\n    let total = items.len();\n");
-        assert_eq!(locate(&total, 1, &now), Some((3, 3)), "its one match");
-        assert_eq!(locate(&held(&["}"]), 1, &lines("{\n}\n")), None, "a short line proves nothing");
-        assert_eq!(locate(&held(&["}"]), 2, &lines("{\n}\n")), Some((2, 2)), "but reads in place");
-        assert_eq!(locate(&[], 1, &now), None);
+        assert_eq!(locate(&total, 1, 1, None, &now), at(3, 3), "its one match");
+        // A short line proves nothing by its number alone, only through the text it was made on.
+        let brace = held(&["}"]);
+        assert_eq!(locate(&brace, 2, 2, None, &lines("{\n}\n")), None);
+        let made_on = lines("{\n}\n");
+        assert_eq!(locate(&brace, 2, 2, Some(&made_on), &lines("x\n{\n}\n")), at(3, 3));
+        assert_eq!(locate(&[], 1, 1, None, &now), None);
+    }
+
+    #[test]
+    fn a_rewritten_line_shows_where_it_went_not_where_a_twin_now_sits() {
+        // An amend rewrote the commented `return;` and moved it; another `return;` took its number.
+        let made_on = lines("fn first() {\n  if a {\n    return;\n  }\n}\n");
+        let now = lines(
+            "fn zero() {\n  if z {\n    return;\n  }\n}\n\
+             fn first() {\n  if a {\n    return;  // not ours\n  }\n}\n",
+        );
+        let placed = locate(&held(&["    return;"]), 3, 3, Some(&made_on), &now);
+        assert_eq!(placed, Some(Placed { start: 8, end: 8, changed: true }));
+        // Deleted outright, it shows nowhere.
+        let made_on = lines("a\nkeep this line here\nb\n");
+        let gone = locate(&held(&["keep this line here"]), 2, 2, Some(&made_on), &lines("a\nb\n"));
+        assert_eq!(gone, None);
+    }
+
+    #[test]
+    fn a_rewritten_or_deleted_line_never_lands_on_its_twin() {
+        let made_on = "fn a() {\n    cleanup_resources(handle);\n}\nfn b() {\n    cleanup_resources(handle);\n}\n";
+        let before = lines(made_on);
+        let line = held(&["    cleanup_resources(handle);"]);
+        // Rewritten: it stays on its own line, changed, never on fn b's copy.
+        let now = lines(
+            "fn a() {\n    release(handle);\n}\nfn b() {\n    cleanup_resources(handle);\n}\n",
+        );
+        assert_eq!(
+            follow(&line, 2, 2, Some(&before), &now),
+            Placed { start: 2, end: 2, changed: true }
+        );
+        assert_eq!(
+            locate(&line, 2, 2, Some(&before), &now),
+            Some(Placed { start: 2, end: 2, changed: true })
+        );
+        // Deleted: where the edit put it, changed.
+        let now = lines("fn a() {\n}\nfn b() {\n    cleanup_resources(handle);\n}\n");
+        let placed = follow(&line, 2, 2, Some(&before), &now);
+        assert!(placed.changed && placed.start != 4, "{placed:?}");
+        assert_ne!(locate(&line, 2, 2, Some(&before), &now).map(|p| p.start), Some(4));
     }
 }

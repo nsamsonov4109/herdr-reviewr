@@ -225,6 +225,11 @@ pub fn over_byte_budget(len: usize) -> bool {
     len > MAX_BYTES
 }
 
+/// Whether git calls `text` binary: a NUL within its first 8000 bytes, as the file list counts.
+fn binary(text: &str) -> bool {
+    text.as_bytes()[..text.len().min(8000)].contains(&0)
+}
+
 impl Default for FileDiff {
     fn default() -> Self {
         Self::empty()
@@ -278,7 +283,7 @@ impl FileDiff {
     ) -> Self {
         let language = language_of(&path);
         let notice = |n| Self::rowless(path.clone(), previous_path.clone(), Some(n), View::Diff);
-        if old.contains('\0') || new.contains('\0') {
+        if binary(old) || binary(new) {
             return notice(Notice::Binary);
         }
         if over_byte_budget(old.len() + new.len()) {
@@ -345,7 +350,7 @@ impl FileDiff {
     /// Build the File view: all of `content` as `Context` rows, under the same budgets.
     fn build_file(path: String, content: &str, hl: &Highlighter) -> Self {
         let notice = |n| Self::rowless(path.clone(), None, Some(n), View::File);
-        if content.contains('\0') {
+        if binary(content) {
             return notice(Notice::Binary);
         }
         if over_byte_budget(content.len()) {
@@ -607,7 +612,9 @@ fn collapse_context(rows: &[Row]) -> Vec<Row> {
 
 /// The extension that picks a syntax, e.g. `rs` for `src/app.rs`.
 pub(crate) fn language_of(path: &str) -> Option<String> {
-    Path::new(path).extension().and_then(|e| e.to_str()).map(str::to_string)
+    let path = Path::new(path);
+    // `Makefile`, `Dockerfile` and `.bashrc` name their syntax by the whole file name.
+    path.extension().or_else(|| path.file_name()).and_then(|e| e.to_str()).map(str::to_string)
 }
 
 /// Built `FileDiff`s by content, so an unchanged refresh rebuilds nothing.
@@ -818,6 +825,14 @@ mod tests {
     }
 
     #[test]
+    fn a_file_without_an_extension_names_its_syntax_by_its_name() {
+        assert_eq!(super::language_of("src/main.rs").as_deref(), Some("rs"));
+        assert_eq!(super::language_of("Makefile").as_deref(), Some("Makefile"));
+        assert_eq!(super::language_of("ops/Dockerfile").as_deref(), Some("Dockerfile"));
+        assert_eq!(super::language_of("home/.bashrc").as_deref(), Some(".bashrc"));
+    }
+
+    #[test]
     fn long_unchanged_runs_collapse_to_a_fold() {
         use std::fmt::Write as _;
         let mut old = String::new();
@@ -960,12 +975,14 @@ mod tests {
         let d = build("ok\n", "bin\0ary\n");
         assert_eq!(d.notice, Some(Notice::Binary));
         assert!(d.rows.is_empty());
+        // Past git's first 8000 bytes a NUL is text, as git diffs it.
+        let late = format!("{}\0x\n", "a\n".repeat(4000));
+        assert_eq!(build("ok\n", &late).notice, None);
     }
 
     #[test]
     fn language_comes_from_the_extension() {
         assert_eq!(language_of("src/app.rs").as_deref(), Some("rs"));
-        assert_eq!(language_of("Makefile"), None);
         assert_eq!(language_of("a/b.tar.gz").as_deref(), Some("gz"));
     }
 

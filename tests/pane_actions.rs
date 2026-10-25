@@ -731,6 +731,8 @@ fn an_agents_comment_reads_a_path_from_the_review_root_when_its_shell_moved() {
         other => panic!("not a comment: {other:?}"),
     });
 
+    // A `shop/billing.py` of its own must not win over the root's, which the send named.
+    fs::write(root.join("shop").join("billing.py"), "shop\n").unwrap();
     // The agent's shell sits in `shop`; the path is the one the send named, from the root.
     let output = Command::new(reviewr_bin())
         .args(["--comment", "billing.py:2", "rounds", "toward", "zero"])

@@ -13,6 +13,8 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1"
+# Already in the tree through syntect's plist. A copy reaches the terminal's clipboard as OSC 52.
+base64 = "0.23"
 dirs = "7"
 fff-search = "0.11.0"
 # Already in the tree. Names each workspace's action lock file one-to-one.
@@ -48,6 +50,8 @@ time = { version = "0.3", features = ["parsing"] }
 toml = "1.1"
 two-face = "0.5.2"
 unicode-width = "0.2"
+# Already in the tree through crossterm. Widths by grapheme cluster, as the terminal paints them.
+unicode-segmentation = "1"
 # Program lookup the way a shell does it: the executable bit on unix, PATHEXT on Windows
 # (so `az` finds `az.cmd`), and never the current directory for a bare name.
 which = "8.0.6"

@@ -959,6 +959,7 @@ version = "0.48.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "base64 0.23.1",
  "crossterm_winapi",
  "dirs 7.0.0",
  "fff-search",
@@ -985,6 +986,7 @@ dependencies = [
  "time",
  "toml",
  "two-face",
+ "unicode-segmentation",
  "unicode-width",
  "which",
  "windows-sys 0.61.2",

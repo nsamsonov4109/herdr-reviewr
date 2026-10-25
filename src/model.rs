@@ -1,6 +1,7 @@
 //! The review model: scopes, changed files, and the session's comments, never lost to a refresh.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 /// Which set of changes the Changes view shows.
@@ -66,13 +67,13 @@ impl CommitPick {
         self.oldest == self.newest
     }
 
-    /// `1a2b3c4`, or `1a2b3c4..5d6e7f8` for a run, oldest first.
+    /// `1a2b3c4`, or `1a2b3c4 to 5d6e7f8` for a run, oldest first: git's `..` would leave it out.
     pub fn label(&self) -> String {
         let short = crate::git::abbreviate_oid;
         if self.is_single() {
             short(&self.newest)
         } else {
-            format!("{}..{}", short(&self.oldest), short(&self.newest))
+            format!("{} to {}", short(&self.oldest), short(&self.newest))
         }
     }
 }
@@ -126,6 +127,8 @@ pub struct ChangedFile {
     pub old_size: u64,
     /// The bytes git stores on the new side, 0 where there is none; `None` for the worktree.
     pub new_size: Option<u64>,
+    /// Its git mode at each end when the change moved it, as `100644` to `100755`.
+    pub mode: Option<(u32, u32)>,
 }
 
 impl ChangedFile {
@@ -162,10 +165,11 @@ pub struct Comment {
 impl Comment {
     /// `path:start-end` or `path:line`, saying ` (removed)` and ` (in commit 1a2b3c4)` as they apply.
     pub fn location(&self) -> String {
+        let file = quoted(&self.file);
         let range = if self.start == self.end {
-            format!("{}:{}", self.file, self.start)
+            format!("{file}:{}", self.start)
         } else {
-            format!("{}:{}-{}", self.file, self.start, self.end)
+            format!("{file}:{}-{}", self.start, self.end)
         };
         let commit = match &self.rev {
             Rev::Worktree => None,
@@ -179,6 +183,30 @@ impl Comment {
             (Side::Old, Some(commit)) => format!("{range} (removed in {commit})"),
         }
     }
+}
+
+/// `path` as a send names it: quoted as git quotes it when a control character in it would split
+/// or garble the header line, else as is.
+fn quoted(path: &str) -> std::borrow::Cow<'_, str> {
+    if !path.chars().any(char::is_control) {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let mut out = String::from("\"");
+    for c in path.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\{:03o}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    std::borrow::Cow::Owned(out)
 }
 
 /// Who wrote one message of a thread.
@@ -295,6 +323,16 @@ impl CommentStore {
         i
     }
 
+    /// Move the comments `wants` picks on `from` to `to`, a rename's new path; how many moved.
+    pub fn rename(&mut self, from: &str, to: &str, wants: impl Fn(&Comment) -> bool) -> usize {
+        let mut moved = 0;
+        for c in self.items.iter_mut().filter(|c| c.file == from && wants(c)) {
+            c.file = to.to_string();
+            moved += 1;
+        }
+        moved
+    }
+
     /// Whether the lines under comment `index` changed since it was made.
     pub fn changed(&self, index: usize) -> bool {
         self.anchors.get(index).is_some_and(|a| a.changed)
@@ -303,6 +341,12 @@ impl CommentStore {
     /// The lines comment `index` was made on, as they read then.
     pub fn held(&self, index: usize) -> &[String] {
         self.anchors.get(index).map_or(&[], |a| a.held.as_slice())
+    }
+
+    /// The text comment `index`'s line numbers count in, while the store holds it.
+    pub fn counted_in(&self, index: usize) -> Option<&str> {
+        let version = self.anchors.get(index)?.version?;
+        self.texts.get(&version).map(|text| &**text)
     }
 
     /// Carry the comments `wants` picks into `text`, their side as it reads now; whether any moved.
@@ -387,13 +431,15 @@ impl CommentStore {
         }
     }
 
-    /// Append `reply` to the thread of the comment at `index`; `false` when it has none. An
-    /// agent's is unread until the reviewer goes to it; the reviewer's own reads the thread.
+    /// Append `reply` to the thread of the comment at `index`, reopening it; `false` when it has
+    /// none. An agent's is unread until the reviewer goes to it; the reviewer's own reads the thread.
     pub fn reply(&mut self, index: usize, reply: Reply) -> bool {
         match self.threads.get_mut(index) {
             Some(Some(thread)) => {
                 thread.unread = matches!(reply.author, Author::Agent(_));
                 thread.replies.push(reply);
+                // A reply is a question still open: the agent's answer must reach it.
+                thread.resolved = false;
                 true
             }
             _ => false,
@@ -536,7 +582,12 @@ mod tests {
         assert_eq!(c.location(), "a.rs:40 (removed in commit 1a2b3c4)");
         c.side = Side::New;
         c.rev = Rev::Commit(super::CommitPick { oldest: one, newest: two });
-        assert_eq!(c.location(), "a.rs:40 (in commits 1a2b3c4..5d6e7f8)");
+        assert_eq!(c.location(), "a.rs:40 (in commits 1a2b3c4 to 5d6e7f8)");
+        // A control character in the name would split the header: quoted as git quotes it.
+        let mut odd = comment("two\nlines\t\u{1b}x.rs", 3, 3, "x");
+        assert_eq!(odd.location(), "\"two\\nlines\\t\\033x.rs\":3");
+        odd.file = "back\\slash \"q\".rs".into();
+        assert_eq!(odd.location(), "back\\slash \"q\".rs:3", "printable names stay as they are");
     }
 
     #[test]

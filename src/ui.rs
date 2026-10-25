@@ -774,8 +774,7 @@ fn paint_text_span(
     p: &Palette,
 ) {
     let mut x = x0;
-    for (i, ch) in text.chars().enumerate() {
-        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+    for (i, (_, w)) in char_widths(text).enumerate() {
         let sel = i >= from && to.is_none_or(|t| i <= t);
         if sel {
             for dx in 0..w {
@@ -803,9 +802,9 @@ fn line_text(line: &Line<'_>) -> String {
 fn char_at_col(text: &str, col: usize) -> usize {
     let mut acc = 0usize;
     let mut last = 0usize;
-    for (i, ch) in text.chars().enumerate() {
+    for (i, (_, w)) in char_widths(text).enumerate() {
         last = i;
-        acc += UnicodeWidthChar::width(ch).unwrap_or(0);
+        acc += w;
         if acc > col {
             return i;
         }
@@ -816,14 +815,15 @@ fn char_at_col(text: &str, col: usize) -> usize {
 /// `text` without its first `cols` display columns.
 fn skip_display_cols(text: &str, cols: usize) -> String {
     let mut acc = 0usize;
-    text.chars()
-        .skip_while(|ch| {
+    char_widths(text)
+        .skip_while(|&(_, w)| {
             if acc >= cols {
-                return false;
+                return w == 0;
             }
-            acc += UnicodeWidthChar::width(*ch).unwrap_or(0);
+            acc += w;
             true
         })
+        .map(|(ch, _)| ch)
         .collect()
 }
 
@@ -1514,7 +1514,7 @@ fn folder_base_label(app: &App) -> (String, String, String, String) {
     }
 }
 
-/// The pick label: `1a2b3c4 <subject>` or `896626a..a49ed7b (N)`, plus any verdict.
+/// The pick label: `1a2b3c4 <subject>` or `896626a to a49ed7b (N)`, plus any verdict.
 fn pick_label(app: &App) -> Option<(String, String, String, String)> {
     use crate::world::PickVerdict;
     let pick = app.commit_pick()?;
@@ -1945,30 +1945,34 @@ fn comment_card_lines(app: &App, ci: usize, width: usize, p: &Palette) -> Vec<Li
     let number = format!(" #{}", store.number(ci).unwrap_or_default());
     let (state, state_ink) = card_state(store, ci);
     let room = box_w.saturating_sub(4);
-    let mut changed = match &place.from {
-        // Shown from another version, where its lines read as they did.
-        Some(from) => format!("· from {from} "),
-        None if place.native && store.changed(ci) => CODE_CHANGED_NOTE.to_string(),
-        None => String::new(),
-    };
-    let changed_ink = if place.from.is_some() { Ink::TextMuted } else { Ink::Warning };
+    // Shown from another version, what it was made on; its lines rewritten since, a warning.
+    let mut from = place.from.as_ref().map(|from| format!("· from {from} ")).unwrap_or_default();
+    let mut changed = if place.changed { CODE_CHANGED_NOTE.to_string() } else { String::new() };
     let mut place = format!(" · {} ", line_ref(&place));
     let mut badge = format!(" {state} ");
-    if number.width() + place.width() + changed.width() + badge.width() > room {
+    let wide = |notes: usize, place: &str, badge: &str| {
+        number.width() + place.width() + notes + badge.width() > room
+    };
+    if wide(from.width() + changed.width(), &place, &badge) {
+        from.clear();
+    }
+    if wide(changed.width(), &place, &badge) {
         changed.clear();
     }
-    if number.width() + place.width() + badge.width() > room {
+    if wide(0, &place, &badge) {
         badge.clear();
         place = truncate_width(&place, room.saturating_sub(number.width()));
     }
-    let fill =
-        room.saturating_sub(number.width() + place.width() + changed.width() + badge.width());
+    let fill = room.saturating_sub(
+        number.width() + place.width() + from.width() + changed.width() + badge.width(),
+    );
     let mut lines = vec![Line::from(vec![
         pad(),
         Span::styled("╭─", border),
         Span::styled(number, ink(Ink::Comment).add_modifier(Modifier::BOLD)),
         Span::styled(place, ink(Ink::TextSecondary)),
-        Span::styled(changed, ink(changed_ink)),
+        Span::styled(from, ink(Ink::TextMuted)),
+        Span::styled(changed, ink(Ink::Warning)),
         Span::styled("─".repeat(fill), border),
         Span::styled(badge, ink(state_ink)),
         Span::styled("─╮", border),
@@ -2030,8 +2034,7 @@ fn truncate_width(s: &str, max: usize) -> String {
     }
     let mut out = String::new();
     let mut w = 0;
-    for ch in s.chars() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+    for (ch, cw) in char_widths(s) {
         if w + cw > max.saturating_sub(1) {
             break;
         }
@@ -2056,6 +2059,11 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
         }
         .to_string(),
     };
+    // A mode change has no line to show, so the title says it.
+    let moved = app.diff_path.as_deref().and_then(|p| app.changed_annotation(p)?.mode);
+    if let (Some((old, new)), crate::diff::View::Diff) = (moved, app.diff.view) {
+        let _ = write!(title, " · mode {old:o} → {new:o}");
+    }
     if app.rendered_active() {
         title.push_str(" · rendered");
     }
@@ -2652,6 +2660,16 @@ pub(crate) fn rgb(c: crate::diff::Rgb) -> Color {
 /// Tabs expand to this many columns.
 const TAB: usize = 4;
 
+/// Each char of `text` with the columns it paints: a cluster's whole width on its first char and
+/// none on the rest, as the terminal paints `⚠️` (2 cells, though its chars sum to 1).
+fn char_widths(text: &str) -> impl Iterator<Item = (char, usize)> + '_ {
+    use unicode_segmentation::UnicodeSegmentation;
+    text.graphemes(true).flat_map(|cluster| {
+        let w = unicode_width::UnicodeWidthStr::width(cluster);
+        cluster.chars().enumerate().map(move |(i, ch)| (ch, if i == 0 { w } else { 0 }))
+    })
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ContinuationSpaces {
     Keep,
@@ -2718,6 +2736,10 @@ fn skip_columns(cells: &[Cell], cols: usize) -> usize {
         col += cells[i].w;
         i += 1;
     }
+    // A skipped cluster's marks go with it, never opening the row.
+    while i > 0 && i < cells.len() && cells[i].w == 0 {
+        i += 1;
+    }
     i
 }
 
@@ -2746,7 +2768,7 @@ fn code_cells(row: &Row, emph_on: bool, hl_ranges: &[(u32, u32)], marker_fg: Col
         _ => row.spans().iter().map(|s| (rgb(s.color), s.text.as_str())).collect(),
     };
     for (fg, text) in runs {
-        for ch in text.chars() {
+        for (ch, w) in char_widths(text) {
             let emph = in_emph(idx);
             let hl = in_hl(idx);
             let src = idx as usize;
@@ -2756,7 +2778,6 @@ fn code_cells(row: &Row, emph_on: bool, hl_ranges: &[(u32, u32)], marker_fg: Col
                     col += 1;
                 }
             } else {
-                let w = UnicodeWidthChar::width(ch).unwrap_or(0);
                 cells.push(Cell { ch, w, fg, emph, hl, src });
                 col += w;
             }

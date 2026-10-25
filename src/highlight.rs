@@ -110,10 +110,17 @@ impl Highlighter {
 
     /// Highlight `lines` into spans per line, plain with no known language or theme.
     pub fn highlight_lines(&self, lines: &[&str], language: Option<&str>) -> Vec<Vec<Span>> {
+        // A minified line costs syntect about a second per 500 KB and reads no better in color.
+        const MAX_COLORED_LINE: usize = 4096;
         let syntaxes = syntaxes();
-        let syntax = language.and_then(|lang| {
-            syntaxes.find_syntax_by_extension(lang).or_else(|| syntaxes.find_syntax_by_token(lang))
-        });
+        let syntax = language
+            .and_then(|lang| {
+                syntaxes
+                    .find_syntax_by_extension(lang)
+                    .or_else(|| syntaxes.find_syntax_by_token(lang))
+            })
+            // A `#!` line names a script's language when its name does not.
+            .or_else(|| lines.first().and_then(|first| syntaxes.find_syntax_by_first_line(first)));
         let (Some(syntax), Some(theme)) = (syntax, self.theme.as_ref()) else {
             return lines
                 .iter()
@@ -130,6 +137,12 @@ impl Highlighter {
         for &line in lines {
             // A CR-ended line highlights as its LF form.
             let (text, cr) = crate::text::line_body(line);
+            if text.len() > MAX_COLORED_LINE {
+                out.push(vec![Span { text: text.to_string(), color: self.default_fg }]);
+                // It may close a string or comment it never read: what follows starts afresh.
+                h = HighlightLines::new(syntax, theme);
+                continue;
+            }
             let line: Cow<'_, str> =
                 if cr { Cow::Owned(format!("{text}\n")) } else { Cow::Borrowed(line) };
             let spans = match h.highlight_line(&line, syntaxes) {
@@ -169,6 +182,33 @@ mod tests {
         assert_eq!(spans.iter().map(|s| s.text.as_str()).collect::<String>(), "let x = 1;");
         // The Catppuccin keyword color (purple) differs from the default text color.
         assert!(spans.iter().any(|s| s.text == "let" && s.color != (0xcd, 0xd6, 0xf4)));
+    }
+
+    #[test]
+    fn a_minified_line_is_one_plain_span_and_the_lines_around_it_still_color() {
+        let h = Highlighter::new(mocha());
+        let long = "value=1;".repeat(1_000);
+        let text = format!("let a = 1;\n{long}\nlet b = 2;\n");
+        let lines = h.highlight(&text, Some("js"));
+        assert_eq!(lines[1].len(), 1, "past the bound, plain");
+        assert_eq!(lines[1][0].text, long);
+        assert!(lines[0].len() > 1 && lines[2].len() > 1, "its neighbours tokenize");
+        // A comment the long line closes never runs on into the code after it.
+        let text = format!("let a = 1; /* begin\n{long} */\nlet after = 1;\n");
+        let lines = h.highlight(&text, Some("js"));
+        let keyword = |line: &[super::Span]| line.iter().find(|s| s.text == "let").map(|s| s.color);
+        assert!(keyword(&lines[0]).is_some());
+        assert_eq!(keyword(&lines[2]), keyword(&lines[0]), "{:?}", lines[2]);
+    }
+
+    #[test]
+    fn a_makefile_and_a_shebang_script_color_without_an_extension() {
+        let h = Highlighter::new(mocha());
+        let make = h.highlight("all: build\n\tcargo build\n", Some("Makefile"));
+        assert!(make[0].len() > 1, "{:?}", make[0]);
+        let script =
+            h.highlight("#!/usr/bin/env bash\nif true; then echo hi; fi\n", Some("deploy"));
+        assert!(script[1].len() > 1, "the `#!` line names bash: {:?}", script[1]);
     }
 
     #[test]

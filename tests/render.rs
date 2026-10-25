@@ -4219,14 +4219,14 @@ fn the_commits_header_names_the_pick_and_its_verdict() {
     assert!(expanded.contains("G commits"), "and the picker key:\n{expanded}");
     app.keys_expanded = false;
 
-    // A run paints `a..b (N)`.
+    // A run paints `a to b (N)`.
     app.open_commit_picker();
     app.commit_picker_anchor();
     app.commit_picker_move(2);
     app.commit_picker_pick().unwrap();
     let line0 = render(&app).lines().next().unwrap().to_string();
     assert!(
-        line0.contains(&format!("[commits] {}..{} (3)", short(&shas[1]), short(&shas[3]))),
+        line0.contains(&format!("[commits] {} to {} (3)", short(&shas[1]), short(&shas[3]))),
         "a run paints its ends and count: {line0}"
     );
 
@@ -4289,7 +4289,8 @@ fn a_gone_run_paints_no_count_and_a_verdict_paints_only_in_commits() {
     app.set_scope(Scope::Uncommitted).unwrap();
     app.open_commit_picker();
     let out = render(&app);
-    let pick_line = out.lines().find(|l| l.contains("..")).expect("the pick row");
+    let run = format!("{} to {}", short(&shas[2]), short(&shas[3]));
+    let pick_line = out.lines().find(|l| l.contains(&run)).expect("the pick row");
     assert!(pick_line.contains("(2)") && !pick_line.contains("off branch"), "{pick_line}");
     app.close_commit_picker();
     // Pruned: no count beside `· gone`.

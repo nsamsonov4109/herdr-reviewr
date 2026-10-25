@@ -171,8 +171,10 @@ comment. Click files, tabs, and links. Scroll with the wheel.
 ## Threads
 
 A sent comment stays on its line as a numbered thread. The send tells the agent how to answer
-each one, and its answer appears under the line it is about. Each message opens under its
-author, `you` or the agent's name, with a bar in that author's color down its lines:
+each one, and its answer appears under the line it is about. The pane's first send to an agent
+also explains how the review goes, that your comments are views rather than orders it must
+follow, and every command it can run; later sends end with the short version. Each message opens under its author, `you` or the agent's name, with a bar in that
+author's color down its lines:
 
 ```text
 herdr-reviewr --reply 3 --to 8e9a3 "It runs once the policy attaches."
@@ -192,8 +194,10 @@ usually the agent acting on it. A draft like that goes out marked so.
 
 A comment shows in every view that reads its lines, not only the one it was made in. Made on a
 commit, it shows on a later commit that rewrote those lines, on the removed side, and in
-**uncommitted** or **All files** while the worktree still reads them. A view that reads them
-nowhere, or in several places, leaves it to the comments list. Shown from another version, its
+**uncommitted** or **All files** while the worktree still reads them. Each view follows the
+lines from the text the comment was made on, so an amended or rebased commit keeps it on its own
+line, and where that line was rewritten the card says `code changed`. A view that lost the
+lines leaves it to the comments list. Shown from another version, its
 title says so, `from 1a2b3c4` or `from the worktree`, and a send names the commit a comment was
 made on.
 
@@ -206,7 +210,9 @@ herdr-reviewr --comment src/app.rs:120-124 "This retry is new; it covers the fla
 Its comment opens a thread marked `new comment`, which `A` goes to. You reply, resolve or delete
 it, but don't edit it.
 
-The agent can also point you at commits to review together, by sha, `a..b` for a run, or a list:
+The agent can also point you at commits to review together: by sha, by a range as git reads it
+(`a..b` is the commits after `a` up to `b`), or by a list, the run from its oldest commit to its
+newest. The header names a run by its ends, `1a2b3c4 to 5d6e7f8`, both included:
 
 ```text
 herdr-reviewr --suggest 1a2b3c4,5d6e7f8 "The retry step, in both repos."
@@ -415,7 +421,9 @@ On Windows, point it at the plugin's own `bin` folder.
 
 - **Colors need a 24-bit terminal**, and the theme must be matched to the background by hand.
 - **Added and removed lines differ only by color.**
-- **Copying** needs `pbcopy`, `wl-copy`, `xclip`, or `xsel` (Windows needs none). Send works without.
+- **Copying** goes through the terminal (OSC 52), the way herdr's own copy does, so it reaches
+  your machine over SSH. A terminal that ignores OSC 52 needs `pbcopy`, `wl-copy`, `xclip`, or
+  `xsel` where reviewr runs (Windows needs none). Send works without.
 - **Windows:** a reviewr started by hand in a PowerShell pane isn't recognized, so toggle opens
   another. Toggle may open on the pane's launch folder, not where you `cd`'d.
 - **Network drives send no file events.** macOS and Linux check every five seconds. On Windows,
@@ -455,7 +463,7 @@ Toggle the pane off and on after every `just install`.
 ## Roadmap
 
 JSON export, more named keys, automatic light/dark theme, more themes (`kanagawa`,
-`vesper`, a dark `github`), a theme that follows the terminal, copying through the terminal.
+`vesper`, a dark `github`), a theme that follows the terminal.
 
 ## Sponsors
 

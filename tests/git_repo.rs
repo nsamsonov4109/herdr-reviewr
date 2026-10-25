@@ -1042,14 +1042,15 @@ fn an_untracked_link_to_a_device_lists_without_reading_it() {
     std::os::unix::fs::symlink("/dev/zero", r.path().join("zero")).unwrap();
     let files = changed_files(r.path(), Scope::Uncommitted, None).unwrap();
     let zero = files.iter().find(|f| f.path == "zero").expect("the link lists");
-    assert_eq!((zero.kind, zero.additions), (ChangeKind::Untracked, 0));
+    // One line, the path it names, as git counts a link.
+    assert_eq!((zero.kind, zero.additions), (ChangeKind::Untracked, 1));
     // A link to a FIFO would block the open itself. git lists the link, never a bare FIFO.
     let elsewhere = tempfile::tempdir().unwrap();
     let fifo = elsewhere.path().join("pipe");
     assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
     std::os::unix::fs::symlink(&fifo, r.path().join("pipe")).unwrap();
     let files = changed_files(r.path(), Scope::Uncommitted, None).unwrap();
-    assert!(files.iter().any(|f| f.path == "pipe" && f.additions == 0), "{files:?}");
+    assert!(files.iter().any(|f| f.path == "pipe" && f.additions == 1), "{files:?}");
 }
 
 /// Past git's default threshold an untracked file is binary, unread; sparse files.
@@ -1660,10 +1661,10 @@ fn a_run_of_three_diffs_its_oldest_parent_against_its_newest() {
 
 #[test]
 fn a_root_commit_diffs_against_the_empty_tree() {
-    use herdr_reviewr::git::{EMPTY_TREE, changed_between, parent_or_empty, run_length};
+    use herdr_reviewr::git::{changed_between, empty_tree, parent_or_empty, run_length};
     let (r, shas) = run_repo();
     let old = parent_or_empty(r.path(), &shas[0]).unwrap();
-    assert_eq!(old, EMPTY_TREE);
+    assert_eq!(old, empty_tree(r.path()));
     let files = changed_between(r.path(), &old, &shas[0]).unwrap();
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].path, "root.rs");
@@ -1707,7 +1708,7 @@ fn a_merge_commit_contributes_its_tree_change() {
 
 #[test]
 fn a_shallow_cut_is_gone_not_a_root() {
-    use herdr_reviewr::git::{EMPTY_TREE, commit_exists, parent_or_empty};
+    use herdr_reviewr::git::{commit_exists, empty_tree, parent_or_empty};
     let (r, shas) = run_repo();
     let shallow = tempfile::tempdir().unwrap();
     // `file:///C:/…` on Windows, `file:///…` elsewhere.
@@ -1724,7 +1725,7 @@ fn a_shallow_cut_is_gone_not_a_root() {
     // A shallow clone's missing parent reads `gone`, never the empty tree.
     let parent = parent_or_empty(&w, &shas[3]).unwrap();
     assert_eq!(parent, shas[2]);
-    assert_ne!(parent, EMPTY_TREE);
+    assert_ne!(parent, empty_tree(&w));
     assert!(!commit_exists(&w, &parent), "the cut parent is not in the clone");
     assert_eq!(parent_or_empty(&w, &shas[0]), None, "the root itself is not in the clone");
 }

@@ -1360,6 +1360,10 @@ pub fn diff_sides(
             },
             new: match new_side {
                 Side::Text(text) => text,
+                // A move paired from an untracked file: git printed no side, the worktree holds it.
+                Side::Absent if new.is_none() && source.is_some() => std::fs::read(repo.join(path))
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .unwrap_or_default(),
                 _ => String::new(),
             },
         },
@@ -1678,8 +1682,22 @@ pub fn snapshot_worktree(repo: &Path) -> Result<String> {
     let copied = session.copy_file.lock().unwrap_or_else(PoisonError::into_inner).clone();
     let seed = copied.filter(|copy| copy.exists()).unwrap_or_else(|| session.git_dir.join("index"));
     index.seed(&seed)?;
-    index.git(repo, &["add", "-A"])?;
+    index.git(repo, &[add(repo), vec!["-A"]].concat())?;
     Ok(index.git(repo, &["write-tree"])?.trim().to_string())
+}
+
+/// `add` for a private copy, taking every file: past `core.safecrlf`, and outside a sparse cone.
+fn add(repo: &Path) -> Vec<&'static str> {
+    let read = || {
+        let value = git_line(repo, &["config", "--bool", "--get", "core.sparseCheckout"]);
+        value.as_deref() == Some("true")
+    };
+    let sparse = match session(repo) {
+        Ok(session) => *session.sparse.get_or_init(read),
+        Err(_) => read(),
+    };
+    let args = vec!["-c", "core.safecrlf=false", "add"];
+    if sparse { [args, vec!["--sparse"]].concat() } else { args }
 }
 
 /// The tree `seed` with `paths` re-read from the worktree: a full snapshot's tree when nothing
@@ -1696,7 +1714,8 @@ pub fn snapshot_worktree_in(repo: &Path, seed: &str, paths: &[String]) -> Result
         return Ok(None);
     }
     if !files.is_empty() {
-        index.git(repo, &with_pathspecs(vec!["add", "-A"], &literal_pathspecs(&files)))?;
+        let args = [add(repo), vec!["-A"]].concat();
+        index.git(repo, &with_pathspecs(args, &literal_pathspecs(&files)))?;
     }
     Ok(Some(index.git(repo, &["write-tree"])?.trim().to_string()))
 }
@@ -1907,6 +1926,13 @@ struct RepoSession {
     copy_file: Mutex<Option<PathBuf>>,
     counts: Mutex<Arc<Counts>>,
     sizes: Mutex<HashMap<String, u64>>,
+    /// How a changeset finds renames: `-C` where the user's `diff.renames` asks for copies, else
+    /// `-M`, so `diff.renames=false` never splits a rename into a delete and an add.
+    renames: OnceLock<&'static str>,
+    /// The empty tree in the repository's object format.
+    empty_tree: OnceLock<&'static str>,
+    /// Whether the worktree is a sparse checkout.
+    sparse: OnceLock<bool>,
 }
 
 /// Every live session by worktree.
@@ -1986,32 +2012,94 @@ fn write_turn_ref(repo: &Path, name: &'static str, sha: &str) -> Result<()> {
     Ok(())
 }
 
-/// git's well-known empty-tree object, used as the diff base when a repo has no commits.
-pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+/// git's empty tree in a sha1 repository, the diff base where a side has no commit.
+const EMPTY_TREE_SHA1: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+/// The empty tree in a sha256 repository, where the sha1 one names nothing.
+const EMPTY_TREE_SHA256: &str = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321";
+
+/// `repo`'s empty tree, in the object format it stores.
+pub fn empty_tree(repo: &Path) -> &'static str {
+    let read = || match git_line(repo, &["rev-parse", "--show-object-format"]).as_deref() {
+        Some("sha256") => EMPTY_TREE_SHA256,
+        _ => EMPTY_TREE_SHA1,
+    };
+    match session(repo) {
+        Ok(session) => session.empty_tree.get_or_init(read),
+        Err(_) => read(),
+    }
+}
 
 /// The old end of `uncommitted`: `head`, the [`head_oid`] read, else the empty tree.
 #[must_use]
-pub fn diff_base(head: Option<String>) -> String {
-    head.unwrap_or_else(|| EMPTY_TREE.to_string())
+pub fn diff_base(repo: &Path, head: Option<String>) -> String {
+    head.unwrap_or_else(|| empty_tree(repo).to_string())
 }
 
 /// The changeset from `base` to the worktree, untracked files included.
 pub fn changed_from(repo: &Path, base: &str) -> Result<Vec<ChangedFile>> {
-    let out = IndexCopy::with(repo, |index| index.git(repo, &diff_args(&[base])))?;
-    assemble(repo, &out, true, None)
+    let out = IndexCopy::with(repo, |index| index.git(repo, &diff_args(repo, &[base])))?;
+    pair_moves(repo, base, assemble(repo, &out, true, None)?)
 }
 
 /// [`changed_from`] limited to `paths`, each a file or a directory.
 pub fn changed_from_in(repo: &Path, base: &str, paths: &[String]) -> Result<Vec<ChangedFile>> {
     let specs = literal_pathspecs(paths);
-    let args = with_pathspecs(diff_args(&[base]), &specs);
+    let args = with_pathspecs(diff_args(repo, &[base]), &specs);
     let out = IndexCopy::with(repo, |index| index.git(repo, &args))?;
-    assemble(repo, &out, true, Some(paths))
+    pair_moves(repo, base, assemble(repo, &out, true, Some(paths))?)
+}
+
+/// Moves a worktree diff can't see: a tracked file deleted beside the untracked one it became,
+/// paired by `-M` on a scratch copy holding the untracked paths as intent-to-add.
+fn pair_moves(repo: &Path, base: &str, mut files: Vec<ChangedFile>) -> Result<Vec<ChangedFile>> {
+    let paths = |kind| -> Vec<String> {
+        files.iter().filter(|f| f.kind == kind).map(|f| f.path.clone()).collect()
+    };
+    let (gone, new) = (paths(ChangeKind::Deleted), paths(ChangeKind::Untracked));
+    if gone.is_empty() || new.is_empty() {
+        return Ok(files);
+    }
+    let mut scratch = IndexCopy::new(repo)?;
+    scratch.seed(&session(repo)?.git_dir.join("index"))?;
+    let new_specs = literal_pathspecs(&new);
+    let intent = with_pathspecs([add(repo), vec!["--intent-to-add"]].concat(), &new_specs);
+    let specs = literal_pathspecs(&[gone, new].concat());
+    let diff = with_pathspecs(diff_args(repo, &[base]), &specs);
+    // A failed pairing costs the pairs, never the changeset; the log keeps why.
+    let Ok(out) = scratch.git(repo, &intent).and_then(|_| scratch.git(repo, &diff)) else {
+        return Ok(files);
+    };
+    let (rows, numstat) = parse_raw(&out);
+    let counts = parse_numstat(numstat);
+    let moves: Vec<RawRow> = rows.into_iter().filter(|r| r.kind == ChangeKind::Renamed).collect();
+    let sizes = blob_sizes(repo, &moves.iter().map(|r| r.old_oid.as_str()).collect::<Vec<_>>())?;
+    let halves: HashSet<&str> = moves
+        .iter()
+        .flat_map(|r| [Some(r.path.as_str()), r.previous_path.as_deref()])
+        .flatten()
+        .collect();
+    files.retain(|f| !halves.contains(f.path.as_str()));
+    for row in &moves {
+        let verdict = counts.get(&row.path).copied().unwrap_or(Some((0, 0)));
+        let (additions, deletions) = verdict.unwrap_or((0, 0));
+        files.push(ChangedFile {
+            kind: ChangeKind::Renamed,
+            additions,
+            deletions,
+            binary: verdict.is_none(),
+            old_size: sizes.get(&row.old_oid).copied().unwrap_or(0),
+            new_size: None,
+            mode: moved_mode(row.modes),
+            path: row.path.clone(),
+            previous_path: row.previous_path.clone(),
+        });
+    }
+    Ok(files)
 }
 
 /// The changeset between two trees: `commits`, and `last-turn` against its snapshot.
 pub fn changed_between(repo: &Path, old: &str, new: &str) -> Result<Vec<ChangedFile>> {
-    assemble(repo, &git(repo, &diff_args(&[old, new]))?, false, None)
+    assemble(repo, &git(repo, &diff_args(repo, &[old, new]))?, false, None)
 }
 
 /// [`changed_between`] limited to `paths`.
@@ -2022,16 +2110,29 @@ pub fn changed_between_in(
     paths: &[String],
 ) -> Result<Vec<ChangedFile>> {
     let specs = literal_pathspecs(paths);
-    let out = git(repo, &with_pathspecs(diff_args(&[old, new]), &specs))?;
+    let out = git(repo, &with_pathspecs(diff_args(repo, &[old, new]), &specs))?;
     assemble(repo, &out, false, Some(paths))
 }
 
-/// One `git diff` per changeset: raw records, then line counts.
-fn diff_args<'a>(ends: &[&'a str]) -> Vec<&'a str> {
+/// One `git diff` per changeset: raw records, then line counts, renames found as the user's config
+/// finds them, or by `-M` where it turns them off.
+fn diff_args<'a>(repo: &Path, ends: &[&'a str]) -> Vec<&'a str> {
     let mut args = vec!["diff"];
     args.extend(ends);
-    args.extend(["--raw", "--numstat", "--no-abbrev", "-z"]);
+    args.extend(["--raw", "--numstat", "--no-abbrev", "-z", rename_flag(repo)]);
     args
+}
+
+/// `-C` where `diff.renames` asks for copies, else `-M`, read once per session.
+fn rename_flag(repo: &Path) -> &'static str {
+    let read = || {
+        let value = git_line(repo, &["config", "--get", "diff.renames"]).unwrap_or_default();
+        if matches!(value.trim(), "copies" | "copy") { "-C" } else { "-M" }
+    };
+    match session(repo) {
+        Ok(session) => session.renames.get_or_init(read),
+        Err(_) => read(),
+    }
 }
 
 /// `sha`'s first parent, or the empty tree for a root; a missing parent is named, not taken for a root.
@@ -2041,7 +2142,7 @@ pub fn parent_or_empty(repo: &Path, sha: &str) -> Option<String> {
         .lines()
         .take_while(|l| !l.is_empty())
         .find_map(|l| l.strip_prefix("parent "))
-        .map_or(EMPTY_TREE, str::trim);
+        .map_or(empty_tree(repo), str::trim);
     Some(parent.to_string())
 }
 
@@ -2052,7 +2153,7 @@ pub fn head_oid(repo: &Path) -> Option<String> {
 
 /// `sha`'s subject line, for the header paint.
 pub fn commit_subject(repo: &Path, sha: &str) -> Option<String> {
-    git_line(repo, &["log", "-1", "--format=%s", sha])
+    git_line(repo, &["log", "-1", "--no-show-signature", "--encoding=UTF-8", "--format=%s", sha])
 }
 
 /// Whether `sha` names a commit the repository still holds (`gone`).
@@ -2078,7 +2179,7 @@ pub fn run_length_from(repo: &Path, old: &str, oldest: &str, newest: &str) -> Op
     }
     let mut args = vec!["rev-list", "--count", "--first-parent", newest];
     let exclude;
-    if old != EMPTY_TREE {
+    if old != empty_tree(repo) {
         if !git_ok(repo, &["merge-base", "--is-ancestor", oldest, newest]) {
             return None;
         }
@@ -2086,6 +2187,13 @@ pub fn run_length_from(repo: &Path, old: &str, oldest: &str, newest: &str) -> Op
         args.push(&exclude);
     }
     git_line(repo, &args)?.parse().ok()
+}
+
+/// The oldest commit of git's `from..newest` along `newest`'s first parents, `None` when it has none.
+pub fn oldest_after(repo: &Path, from: &str, newest: &str) -> Option<String> {
+    let exclude = format!("^{from}");
+    let listed = git(repo, &["rev-list", "--first-parent", newest, &exclude]).ok()?;
+    listed.lines().last().map(str::to_string)
 }
 
 /// One commit picker row.
@@ -2128,6 +2236,10 @@ pub fn list_commits(repo: &Path, merge_base: Option<&str>) -> Result<Vec<CommitR
     let range = merge_base.map(|mb| format!("{mb}..HEAD"));
     let mut args = vec![
         "log",
+        // A user's `log.showSignature` would print the verdict ahead of the first field.
+        "--no-show-signature",
+        // A user's `i18n.logOutputEncoding` would hand the subject over in another charset.
+        "--encoding=UTF-8",
         "--first-parent",
         "--decorate=full",
         "--format=%H%x00%s%x00%ct%x00%an%x00%D%x00%P",
@@ -2208,15 +2320,9 @@ fn all_files_listed(repo: &Path, specs: &[String]) -> Result<Vec<WorktreeEntry>>
             out.push(WorktreeEntry { path, ignored: false, is_dir: false });
         }
     }
-    let ignored = limit(vec![
-        "ls-files",
-        "--others",
-        "--ignored",
-        "--exclude-standard",
-        "--directory",
-        "--no-empty-directory",
-        "-z",
-    ]);
+    // Not `--no-empty-directory`: git 2.43 then drops every file a negation leaves ignored.
+    let ignored =
+        limit(vec!["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"]);
     for (path, is_dir) in ignored_entries(repo, &ignored)? {
         if seen.insert(path.clone()) {
             out.push(WorktreeEntry { path, ignored: true, is_dir });
@@ -2235,6 +2341,10 @@ fn ignored_entries(repo: &Path, args: &[&str]) -> Result<Vec<(String, bool)>> {
         .map(|path| match path.strip_suffix('/') {
             Some(dir) => (dir.to_string(), true),
             None => (path.to_string(), false),
+        })
+        // An empty ignored directory holds nothing to show.
+        .filter(|(path, is_dir)| {
+            !is_dir || std::fs::read_dir(repo.join(path)).is_ok_and(|mut d| d.next().is_some())
         })
         .collect())
 }
@@ -2284,6 +2394,7 @@ fn assemble(
             binary: verdict.is_none(),
             old_size: size(&row.old_oid),
             new_size: (!worktree).then(|| size(&row.new_oid)),
+            mode: moved_mode(row.modes),
             path: row.path,
             previous_path: row.previous_path,
         });
@@ -2336,6 +2447,7 @@ fn assemble(
                 binary,
                 old_size: 0,
                 new_size: None,
+                mode: None,
             });
         }
         *session.counts.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(fresh);
@@ -2405,7 +2517,11 @@ fn untracked_additions(
     fresh: &mut Counts,
 ) -> Option<u32> {
     let at = repo.join(path);
-    // Only a regular file has lines: a link to a device would read without end.
+    // A link has one line, the path it names, as git counts it.
+    if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Some(1);
+    }
+    // Only a regular file has lines.
     let Some(meta) = std::fs::metadata(&at).ok().filter(std::fs::Metadata::is_file) else {
         return Some(0);
     };
@@ -2502,12 +2618,19 @@ fn parse_numstat(out: &str) -> HashMap<String, Option<(u32, u32)>> {
 #[derive(Debug, PartialEq, Eq)]
 struct RawRow {
     kind: ChangeKind,
+    /// Each side's git mode, 0 where the side is absent.
+    modes: (u32, u32),
     path: String,
     /// The old path of a rename or copy, whose content is the old side.
     previous_path: Option<String>,
     /// Each side's blob, all zeros where the side is absent or is the worktree.
     old_oid: String,
     new_oid: String,
+}
+
+/// The two modes when both ends hold the file and they differ: `chmod +x` and the like.
+fn moved_mode((old, new): (u32, u32)) -> Option<(u32, u32)> {
+    (old != 0 && new != 0 && old != new).then_some((old, new))
 }
 
 /// The raw records of a [`diff_args`] run, and the numstat records after them.
@@ -2524,7 +2647,8 @@ fn parse_raw(out: &str) -> (Vec<RawRow>, &str) {
         let mut next = rest;
         let Some(meta) = field(&mut next) else { break };
         let fields: Vec<&str> = meta[1..].split(' ').collect();
-        let [_, _, old_oid, new_oid, status] = fields[..] else { break };
+        let [old_mode, new_mode, old_oid, new_oid, status] = fields[..] else { break };
+        let mode = |m: &str| u32::from_str_radix(m, 8).unwrap_or(0);
         let (kind, previous_path) = match status.chars().next() {
             Some('A') => (ChangeKind::Added, None),
             Some('D') => (ChangeKind::Deleted, None),
@@ -2540,6 +2664,7 @@ fn parse_raw(out: &str) -> (Vec<RawRow>, &str) {
         rest = next;
         rows.push(RawRow {
             kind,
+            modes: (mode(old_mode), mode(new_mode)),
             path: path.to_string(),
             previous_path,
             old_oid: old_oid.to_string(),

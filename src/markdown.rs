@@ -92,6 +92,8 @@ pub fn render_expanded<S: std::hash::BuildHasher>(
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
+    // A skill's or a plan's `---` frontmatter, else a rule and a setext heading.
+    opts.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
     let mut line_starts = vec![0usize];
     line_starts.extend(text.char_indices().filter(|(_, c)| *c == '\n').map(|(i, _)| i + 1));
     let expanded: HashSet<String> = expanded.iter().cloned().collect();
@@ -290,6 +292,7 @@ fn shows_whole(tag: &Tag<'_>) -> bool {
             | Tag::Heading { .. }
             | Tag::Item
             | Tag::CodeBlock(_)
+            | Tag::MetadataBlock(_)
             | Tag::Table(_)
             | Tag::HtmlBlock
     )
@@ -422,11 +425,16 @@ impl Renderer<'_> {
         // A block-level tag stamps the source line its rendered lines map to.
         if matches!(
             tag,
-            Tag::Paragraph | Tag::Heading { .. } | Tag::Item | Tag::CodeBlock(_) | Tag::Table(_)
+            Tag::Paragraph
+                | Tag::Heading { .. }
+                | Tag::Item
+                | Tag::CodeBlock(_)
+                | Tag::MetadataBlock(_)
+                | Tag::Table(_)
         ) {
             self.block_src = self.src_line(range.start);
             self.block_end = self.end_line(&range);
-            if matches!(tag, Tag::CodeBlock(_)) && self.emitting() {
+            if matches!(tag, Tag::CodeBlock(_) | Tag::MetadataBlock(_)) && self.emitting() {
                 self.out.code_blocks.push((self.block_src, self.block_end));
             }
         }
@@ -465,6 +473,12 @@ impl Renderer<'_> {
                     CodeBlockKind::Indented => (None, false),
                 };
                 self.code = Some(CodeBlock { lang, content: String::new(), fenced });
+            }
+            // Frontmatter shows as the YAML it is, a fenced block of its own.
+            Tag::MetadataBlock(_) => {
+                self.flush_block(true);
+                let lang = Some("yaml".to_string());
+                self.code = Some(CodeBlock { lang, content: String::new(), fenced: true });
             }
             Tag::Emphasis => self.push_style(|s| s.add_modifier(Modifier::ITALIC)),
             Tag::Strong => self.push_style(|s| s.add_modifier(Modifier::BOLD)),
@@ -520,7 +534,7 @@ impl Renderer<'_> {
                 self.flush_block(false);
                 self.marker = None;
             }
-            TagEnd::CodeBlock => self.end_code(),
+            TagEnd::CodeBlock | TagEnd::MetadataBlock(_) => self.end_code(),
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
                 self.styles.pop();
             }
@@ -1621,6 +1635,21 @@ mod tests {
         let j = t.iter().position(|l| l.contains("Confidence Score")).unwrap();
         let span = lines[j].spans.iter().find(|s| s.content.contains("Confidence")).unwrap();
         assert_eq!(span.style.fg, Some(Color::Rgb(0xf9, 0xe2, 0xaf)));
+    }
+
+    #[test]
+    fn frontmatter_renders_as_its_yaml_never_a_rule_and_a_heading() {
+        let (hl, p) = setup();
+        let md = "---\nname: review\ndescription: Reviews code\n---\n\n# Review\n\nBody.\n";
+        let t = texts(&render(md, 80, &hl, &p).lines);
+        let at = |needle: &str| t.iter().position(|l| l.contains(needle));
+        let (name, title) = (at("name: review"), t.iter().position(|l| l == "Review"));
+        assert!(name.is_some() && at("description: Reviews code").is_some(), "{t:?}");
+        assert!(title.is_some_and(|i| i > name.unwrap()), "the heading after it: {t:?}");
+        assert!(!t.iter().any(|l| l.chars().all(|c| c == '─') && !l.is_empty()), "no rule: {t:?}");
+        // A `---` past the first line is still a rule.
+        let t = texts(&render("Intro.\n\n---\n\nAfter.\n", 80, &hl, &p).lines);
+        assert!(t.iter().any(|l| !l.is_empty() && l.chars().all(|c| c == '─')), "{t:?}");
     }
 
     #[test]

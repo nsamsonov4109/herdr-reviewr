@@ -26,7 +26,7 @@ impl Outgoing<'_> {
             Self::Comment(n, c, true) => format!(
                 "#{n} {}{CHANGED_NOTE}\n{}\n{}",
                 c.location(),
-                c.lines,
+                printable(&c.lines),
                 normalize_text(&c.text)
             ),
             Self::Reply(n, c, text) => {
@@ -57,6 +57,23 @@ pub fn format_send(prefix: Option<&str>, blocks: &[Outgoing<'_>], answer: Option
         .join("\n\n")
 }
 
+/// A reader's first send: how the review goes, then the commands, at the pane `token` names.
+pub fn intro_lines(token: &str) -> String {
+    format!(
+        "This review came from herdr-reviewr, the pane beside you that reviews your work. How it \
+         goes: you work and commit; the reviewer reads your changes there and comments on lines; \
+         each send brings the new comments here, numbered, and replies to earlier ones. Answer \
+         each comment by its number. A comment is the reviewer's view, not an order: where you \
+         think the code is right, keep it and make your case; change it where you agree.\n\
+         Answer: herdr-reviewr --reply <number> --to {token} \"<answer>\"\n\
+         Comment on a line yourself: herdr-reviewr --comment <path>:<line> --to {token} \
+         \"<comment>\"\n\
+         Suggest commits to review together, one call per step of the review: herdr-reviewr \
+         --suggest <sha>[,<sha>...] --to {token} \"<why>\"\n\
+         herdr-reviewr --help explains all three."
+    )
+}
+
 /// How the agent answers, comments, and suggests commits, at the pane `token` names.
 pub fn answer_line(token: &str) -> String {
     format!(
@@ -70,17 +87,44 @@ pub fn answer_line(token: &str) -> String {
 
 /// One comment as its export block: location, snippet, then text.
 pub fn format_comment(comment: &Comment) -> String {
-    format!("{}\n{}\n{}", comment.location(), comment.lines, normalize_text(&comment.text))
+    let snippet = printable(&comment.lines);
+    format!("{}\n{snippet}\n{}", comment.location(), normalize_text(&comment.text))
 }
 
-/// Comment text without blank lines, which would read as the separator between comments.
+/// `text` with each control character but tab and newline shown as its symbol (`␛` for ESC), so
+/// raw escape bytes never reach the agent's terminal as keys or sequences.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\t' | '\n' => c,
+            '\u{7f}' => '\u{2421}',
+            c if u32::from(c) < 0x20 => char::from_u32(0x2400 + u32::from(c)).unwrap_or('\u{fffd}'),
+            c if c.is_control() => '\u{fffd}',
+            c => c,
+        })
+        .collect()
+}
+
+/// Comment text without blank lines, the separator between comments, but those in a code fence.
 fn normalize_text(text: &str) -> String {
-    text.replace('\r', "")
-        .lines()
-        .map(str::trim_end)
-        .filter(|line| !line.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    let text = printable(&text.replace('\r', ""));
+    let mut fence: Option<&str> = None;
+    let mut kept = Vec::new();
+    for line in text.lines().map(str::trim_end) {
+        let marker = ["```", "~~~"].into_iter().find(|m| line.trim_start().starts_with(m));
+        match (fence, marker) {
+            (None, Some(m)) => fence = Some(m),
+            (Some(open), Some(m)) if open == m => fence = None,
+            (None, _) if line.is_empty() => continue,
+            _ => {}
+        }
+        kept.push(line);
+    }
+    // An unclosed fence's trailing blanks would still read as a separator.
+    while kept.last() == Some(&"") {
+        kept.pop();
+    }
+    kept.join("\n")
 }
 
 /// The exported review: the trimmed prefix, then comments by file and start line, a blank line between.
@@ -101,6 +145,10 @@ pub fn format_review(prefix: Option<&str>, comments: &[&Comment]) -> String {
 pub trait ExportTarget {
     fn export(&self, text: &str) -> Result<()>;
     fn label(&self) -> &'static str;
+    /// The agent pane that reads the send, `None` for a copy; each one's first explains the review.
+    fn reader(&self) -> Option<&str> {
+        None
+    }
     /// Destination-specific confirmation shown after a successful export.
     fn success_message(&self, what: &str) -> String;
     /// The status after a failed export, `copy` naming the copy key; the cause goes to the log.
@@ -142,7 +190,7 @@ pub fn counted_send(comments: usize, replies: usize) -> String {
     }
 }
 
-/// The system clipboard: the first tool on `PATH`, or the Win32 clipboard on Windows.
+/// The reviewer's clipboard: the terminal's and the first tool on `PATH`, or Win32's on Windows.
 #[derive(Debug)]
 pub struct Clipboard;
 
@@ -167,10 +215,10 @@ impl ExportTarget for Clipboard {
     }
 }
 
-/// macOS and Linux copy through a clipboard tool.
+/// macOS and Linux copy through the terminal, which reaches past SSH and herdr, and a clipboard tool.
 #[cfg(not(windows))]
 mod clipboard {
-    use std::io::Write;
+    use std::io::{IsTerminal, Write};
     use std::process::Stdio;
 
     use anyhow::{Context, Result, bail};
@@ -199,9 +247,32 @@ mod clipboard {
         error.is::<NoTool>().then_some("install wl-clipboard, xclip, or xsel")
     }
 
-    /// Pipe `text` into the first tool on `PATH`, succeeding only when it exits clean.
+    /// Copy `text` through the terminal and the first tool on `PATH`; either one is enough.
     pub(super) fn write(text: &str) -> Result<()> {
-        let (cmd, args) = select_tool(TOOLS, crate::proc::on_path).ok_or(NoTool)?;
+        let told = tell_terminal(text);
+        let piped = match select_tool(TOOLS, crate::proc::on_path) {
+            Some((cmd, args)) => pipe(cmd, args, text),
+            None => Err(NoTool.into()),
+        };
+        // A tool without a display fails where the terminal still copies, as herdr's own does.
+        if told { Ok(()) } else { piped }
+    }
+
+    /// The terminal's clipboard set to `text`: `false` without a terminal to tell.
+    fn tell_terminal(text: &str) -> bool {
+        let mut out = std::io::stdout();
+        out.is_terminal()
+            && out.write_all(osc52(text).as_bytes()).and_then(|()| out.flush()).is_ok()
+    }
+
+    /// The escape sequence that sets the terminal's clipboard to `text`.
+    pub(super) fn osc52(text: &str) -> String {
+        use base64::Engine;
+        format!("\x1b]52;c;{}\x07", base64::engine::general_purpose::STANDARD.encode(text))
+    }
+
+    /// Pipe `text` into `cmd`, succeeding only when it exits clean.
+    fn pipe(cmd: &str, args: &[&str], text: &str) -> Result<()> {
         let mut child = crate::proc::command(cmd)
             .args(args)
             .stdin(Stdio::piped())
@@ -259,6 +330,10 @@ impl ExportTarget for Agent {
         "agent"
     }
 
+    fn reader(&self) -> Option<&str> {
+        Some(&self.pane)
+    }
+
     /// Names the agent: the reviewer's only record of where the review went.
     fn success_message(&self, what: &str) -> String {
         format!("sent {what} to {}", self.name)
@@ -285,7 +360,7 @@ impl ExportTarget for Agent {
 mod tests {
     use super::{
         Agent, Clipboard, ExportTarget, Outgoing, answer_line, format_comment, format_review,
-        format_send, send_failure,
+        format_send, intro_lines, send_failure,
     };
     use crate::model::{Comment, Side};
 
@@ -305,6 +380,15 @@ mod tests {
             select_tool(TOOLS, |c| c == "pbcopy" || c == "xclip").map(|(cmd, _)| cmd),
             Some("pbcopy")
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_copy_asks_the_terminal_in_one_escape_with_the_text_in_base64() {
+        use super::clipboard::osc52;
+        assert_eq!(osc52("hi"), "\x1b]52;c;aGk=\x07");
+        // Line breaks and wide text ride inside the payload, never as raw bytes on the screen.
+        assert_eq!(osc52("a\n日"), "\x1b]52;c;YQrml6U=\x07");
     }
 
     #[test]
@@ -407,12 +491,52 @@ mod tests {
     }
 
     #[test]
+    fn blank_lines_inside_a_code_fence_are_the_codes_own() {
+        let text = "try:\n\n```rust\nfn a() {}\n\nfn b() {}\n```\n\nthen\n~~~\nx\n  \n```\n\n";
+        let c = comment("a.rs", Side::New, 1, 1, "+x", text);
+        assert_eq!(
+            format_comment(&c),
+            "a.rs:1\n+x\ntry:\n```rust\nfn a() {}\n\nfn b() {}\n```\nthen\n~~~\nx\n\n```"
+        );
+    }
+
+    #[test]
     fn all_sorts_by_file_then_start_with_blank_separator() {
         let b = comment("b.rs", Side::New, 5, 5, "+x", "two");
         let a2 = comment("a.rs", Side::New, 20, 20, "+y", "later");
         let a1 = comment("a.rs", Side::New, 3, 3, "+z", "earlier");
         let out = format_review(None, &[&b, &a2, &a1]);
         assert_eq!(out, "a.rs:3\n+z\nearlier\n\na.rs:20\n+y\nlater\n\nb.rs:5\n+x\ntwo");
+    }
+
+    #[test]
+    fn control_bytes_reach_the_agent_as_their_symbols() {
+        let c = comment(
+            "log.txt",
+            Side::New,
+            2,
+            2,
+            "+\u{1b}[31mred\u{1b}[0m\tok",
+            "see \u{7}\u{9b}2J here",
+        );
+        let block = format_comment(&c);
+        assert_eq!(
+            block,
+            "log.txt:2\n+\u{241b}[31mred\u{241b}[0m\tok\nsee \u{2407}\u{fffd}2J here"
+        );
+        assert!(!block.chars().any(|ch| ch.is_control() && ch != '\n' && ch != '\t'));
+    }
+
+    #[test]
+    fn the_intro_says_how_the_review_goes_then_names_each_command_with_the_token() {
+        let intro = intro_lines("1f2e");
+        let lines: Vec<&str> = intro.lines().collect();
+        assert_eq!(lines.len(), 5, "{intro}");
+        assert!(lines[0].starts_with("This review came from herdr-reviewr"), "{intro}");
+        for (line, command) in lines[1..4].iter().zip(["--reply", "--comment", "--suggest"]) {
+            assert!(line.contains(command) && line.contains("--to 1f2e"), "{line}");
+        }
+        assert_eq!(lines[4], "herdr-reviewr --help explains all three.");
     }
 
     #[test]

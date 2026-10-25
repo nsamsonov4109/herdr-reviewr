@@ -20,6 +20,8 @@ pub enum Incoming {
         text: String,
         agent: Option<String>,
         verdict: std::sync::mpsc::Sender<Result<u64, String>>,
+        /// Past this the command has told the agent to try again, so the pane must not place it.
+        until: std::time::Instant,
     },
     /// Commits the agent suggests the reviewer look at, one run per repository, and why.
     Suggest { picks: crate::model::Picks, text: String, agent: Option<String> },
@@ -27,6 +29,9 @@ pub enum Incoming {
 
 /// The most one request carries: one answer, never a stream.
 const MAX_REQUEST: u64 = 1 << 20;
+
+/// Why a message over [`MAX_REQUEST`] is refused whole, never cut.
+const TOO_LONG: &str = "the message is over 1 MiB: shorten it";
 
 /// How long a comment waits for the pane to place it: a frame, unless an editor holds the pane.
 #[cfg(unix)]
@@ -151,9 +156,16 @@ fn serve(
         let Ok(mut stream) = stream else { continue };
         // A client that never finishes its line cannot hold the channel.
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-        let mut line = String::new();
-        let read = BufReader::new((&stream).take(MAX_REQUEST)).read_line(&mut line);
-        let verdict = match read.map_err(|e| e.to_string()).and_then(|_| parse_request(&line)) {
+        let mut line = Vec::new();
+        let read = BufReader::new((&stream).take(MAX_REQUEST)).read_until(b'\n', &mut line);
+        let request = match read {
+            Err(e) => Err(e.to_string()),
+            Ok(n) if n as u64 >= MAX_REQUEST && !line.ends_with(b"\n") => Err(TOO_LONG.to_string()),
+            Ok(_) => {
+                String::from_utf8(line).map_err(|e| e.to_string()).and_then(|l| parse_request(&l))
+            }
+        };
+        let verdict = match request {
             Ok(request) => match answer(request, open, tx) {
                 Some(verdict) => verdict,
                 None => return,
@@ -184,7 +196,10 @@ fn answer(
     }
     if let Some(Spot { path, start, end }) = comment {
         let (verdict, heard) = std::sync::mpsc::channel();
-        tx.send(Incoming::Comment { path, start, end, text, agent, verdict }).ok()?;
+        // A margin short of the wait, so a comment placed is always one the command hears of.
+        let until =
+            std::time::Instant::now() + VERDICT_WAIT.saturating_sub(Duration::from_millis(500));
+        tx.send(Incoming::Comment { path, start, end, text, agent, verdict, until }).ok()?;
         return Some(match heard.recv_timeout(VERDICT_WAIT) {
             Ok(Ok(number)) => format!("ok #{number}"),
             Ok(Err(why)) => format!("error: {why}"),
@@ -269,7 +284,7 @@ enum What {
         start: u32,
         end: u32,
     },
-    /// Each a commit, or `a..b` for the run from `a` to `b`, both included.
+    /// Each a commit, or a range as git reads one: `a..b` leaves out what `a` reaches.
     Suggest(Vec<String>),
 }
 
@@ -300,9 +315,8 @@ fn parse_args(args: &[OsString]) -> Result<(What, Option<String>, String), Strin
                     .filter(|s| !s.is_empty())
                     .map(String::from)
                     .collect();
-                if specs.is_empty()
-                    || specs.iter().any(|s| s.starts_with("..") || s.ends_with(".."))
-                {
+                // Git's `a..` and `..b` mean `HEAD` at the missing end; a bare `..` names nothing.
+                if specs.is_empty() || specs.iter().any(|s| s.trim_matches('.').is_empty()) {
                     return Err(format!(
                         "not a <commit>, <commit>..<commit>, or a list of them: {value}"
                     ));
@@ -336,10 +350,15 @@ fn deliver(args: &[OsString]) -> Result<String, String> {
     let (what, token, mut text) = parse_args(args)?;
     if text.trim().is_empty() {
         use std::io::Read;
+        let mut read = Vec::new();
         std::io::stdin()
-            .take(MAX_REQUEST)
-            .read_to_string(&mut text)
+            .take(MAX_REQUEST + 1)
+            .read_to_end(&mut read)
             .map_err(|e| format!("reading the message: {e}"))?;
+        if read.len() as u64 > MAX_REQUEST {
+            return Err(TOO_LONG.to_string());
+        }
+        text = String::from_utf8(read).map_err(|e| format!("reading the message: {e}"))?;
     }
     let text = text.trim().to_string();
     if text.is_empty() {
@@ -361,10 +380,10 @@ fn deliver(args: &[OsString]) -> Result<String, String> {
     let (request, done) = match what {
         What::Reply(number) => (request(Some(number), None, None), "answered".to_string()),
         What::Comment { path, start, end } => {
-            // A path the shell's folder lacks reads from the review's root, as sends spell it.
+            // From the review's root first, as sends spell it, then from the shell's folder.
             let root = || reviewed_root(&token).ok();
-            let in_root = || root().and_then(|r| std::fs::canonicalize(r.join(&path)).ok());
-            let Some(file) = here_file.or_else(in_root) else {
+            let in_root = root().and_then(|r| std::fs::canonicalize(r.join(&path)).ok());
+            let Some(file) = in_root.or(here_file) else {
                 return Err(match root() {
                     Some(root) => {
                         format!("no file at {} here or in {}", path.display(), root.display())
@@ -436,19 +455,30 @@ fn resolve_commits(root: &Path, specs: &[String]) -> Result<crate::model::Picks,
     let names = if repos.is_folder() { repos.names().to_vec() } else { vec![String::new()] };
     let mut ends: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for spec in specs {
-        let (from, to) = spec.split_once("..").unwrap_or((spec, spec));
+        // `a...b` reads as `git diff` reads it, from the merge base, so as `a..b` for one line.
+        let range = spec.split_once("...").or_else(|| spec.split_once(".."));
+        // Per repository: whether it has the commits, then the run they hold, if any.
         let found = crate::repos::par_map(&names, |name| {
             let dir = root.join(name);
-            let sha = |rev: &str| crate::git::resolve_commit(&dir, rev).ok().flatten();
-            let newest = sha(to)?;
-            Some((if from == to { newest.clone() } else { sha(from)? }, newest))
+            let sha = |rev: &str| {
+                let rev = if rev.is_empty() { "HEAD" } else { rev };
+                crate::git::resolve_commit(&dir, rev).ok().flatten()
+            };
+            match range {
+                None => sha(spec).map(|c| Some((c.clone(), c))),
+                Some((from, to)) => {
+                    let (from, newest) = (sha(from)?, sha(to)?);
+                    Some(crate::git::oldest_after(&dir, &from, &newest).map(|o| (o, newest)))
+                }
+            }
         });
-        let hits: Vec<(&str, (String, String))> =
+        let hits: Vec<(&str, Option<(String, String)>)> =
             names.iter().zip(found).filter_map(|(name, f)| Some((name.as_str(), f?))).collect();
         match hits.as_slice() {
             [] if repos.is_folder() => return Err(format!("no repository here has {spec}")),
             [] => return Err(format!("no commit {spec} here")),
-            [(name, (a, b))] => ends.entry(name).or_default().extend([a.clone(), b.clone()]),
+            [(_, None)] => return Err(format!("{spec} names no commits")),
+            [(name, Some((a, b)))] => ends.entry(name).or_default().extend([a.clone(), b.clone()]),
             many => {
                 let names: Vec<&str> = many.iter().map(|(name, _)| *name).collect();
                 return Err(format!("{spec} names commits in {}: give its sha", names.join(", ")));
@@ -552,10 +582,14 @@ fn exchange(token: &str, request: &Request) -> Result<String, String> {
     if token.is_empty() || !token.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
         return Err(format!("not a review pane's token: {token}"));
     }
+    let line = serde_json::to_string(request).map_err(|e| e.to_string())?;
+    // The pane reads one line up to the cap, its newline included.
+    if line.len() as u64 >= MAX_REQUEST {
+        return Err(TOO_LONG.to_string());
+    }
     let mut stream = std::os::unix::net::UnixStream::connect(socket_path(token))
         .map_err(|_| format!("no review pane answers at {token}: it closed"))?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let line = serde_json::to_string(request).map_err(|e| e.to_string())?;
     writeln!(stream, "{line}").map_err(|e| format!("sending the message: {e}"))?;
     let mut verdict = String::new();
     BufReader::new(&stream)
@@ -620,12 +654,34 @@ mod tests {
     }
 
     #[test]
+    fn a_message_over_the_cap_is_refused_whole_never_cut() {
+        use std::io::{BufRead, BufReader, Write};
+        let (tx, rx) = crate::wake::channel::<Incoming>(&crate::wake::Waker::detached());
+        let listener = listen(Arc::new(Mutex::new(vec![1])), &Whereabouts::default(), tx).unwrap();
+        let token = listener.token().to_string();
+        let long = "x".repeat(super::MAX_REQUEST as usize);
+        let said = super::deliver(&args(&["--reply", "1", "--to", &token, &long]));
+        assert_eq!(said, Err(super::TOO_LONG.to_string()));
+        // A writer past the cap anyway hears why, and nothing lands.
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(super::socket_path(&token)).unwrap();
+        let _ = stream.write_all(format!("{long}xx\n").as_bytes());
+        let mut verdict = String::new();
+        BufReader::new(&stream).read_line(&mut verdict).unwrap();
+        assert_eq!(verdict.trim_end(), format!("error: {}", super::TOO_LONG));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn a_suggestion_names_commits_runs_or_a_list_of_them() {
         let parsed = parse_args(&args(&["--suggest", "a1,b2..c3", "--to", "1f", "one", "step"]));
         let specs = What::Suggest(vec!["a1".into(), "b2..c3".into()]);
         assert_eq!(parsed, Ok((specs, Some("1f".to_string()), "one step".into())));
-        for bad in [",", "..a1", "a1..", "a1,..b2"] {
+        for bad in [",", "..", "...", "a1,.."] {
             assert!(parse_args(&args(&["--suggest", bad])).is_err(), "{bad}");
+        }
+        for open in ["a1..", "..a1", "a1..."] {
+            assert!(parse_args(&args(&["--suggest", open])).is_ok(), "git reads {open} with HEAD");
         }
     }
 
@@ -665,26 +721,34 @@ mod tests {
         let token = listener.token().to_string();
         let suggest =
             |spec: &str| super::deliver(&args(&["--suggest", spec, "--to", &token, "why"]));
-        // Two specs in `api` make one run from the oldest end to the newest.
+        // Two specs in `api` make one run from the oldest end to the newest; `a..b` leaves `a` out.
         let spec =
             format!("{},{}..{},{}", &api[2][..10], &api[0][..10], &api[1][..10], &web[0][..9]);
         let short = |sha: &str| sha[..7].to_string();
         let said = format!(
-            "suggested {}..{} in api, {} in web",
-            short(&api[0]),
+            "suggested {} to {} in api, {} in web",
+            short(&api[1]),
             short(&api[2]),
             short(&web[0])
         );
         assert_eq!(suggest(&spec), Ok(said));
         match rx.recv().unwrap() {
             Incoming::Suggest { picks, text, .. } => {
-                let run = CommitPick { oldest: api[0].clone(), newest: api[2].clone() };
+                let run = CommitPick { oldest: api[1].clone(), newest: api[2].clone() };
                 let want =
                     Picks::from([("api".into(), run), ("web".into(), CommitPick::single(&web[0]))]);
                 assert_eq!((picks, text.as_str()), (want, "why"));
             }
             other => panic!("not a suggestion: {other:?}"),
         }
+        // A missing end is `HEAD`, and `...` counts from the merge base, as git reads them.
+        for open in [format!("{}..", &api[0][..10]), format!("{}...{}", &api[0][..10], api[2])] {
+            let said = format!("suggested {} to {} in api", short(&api[1]), short(&api[2]));
+            assert_eq!(suggest(&open), Ok(said), "{open}");
+            assert!(matches!(rx.recv().unwrap(), Incoming::Suggest { .. }));
+        }
+        let empty = suggest(&format!("{}..{}", &api[2][..10], &api[1][..10])).unwrap_err();
+        assert!(empty.contains("names no commits"), "{empty}");
         let both = suggest("main").unwrap_err();
         assert!(both.contains("api, web"), "a branch every repository has: {both}");
         let none = suggest("0123456789abcdef").unwrap_err();

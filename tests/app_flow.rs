@@ -26,14 +26,19 @@ use ratatui::layout::Rect;
 struct FakeTarget {
     ok: bool,
     captured: RefCell<Vec<String>>,
+    /// The agent pane it stands for, `None` for a copy.
+    reader: Option<&'static str>,
 }
 
 impl FakeTarget {
     fn ok() -> Self {
-        Self { ok: true, captured: RefCell::new(Vec::new()) }
+        Self { ok: true, captured: RefCell::new(Vec::new()), reader: None }
     }
     fn failing() -> Self {
-        Self { ok: false, captured: RefCell::new(Vec::new()) }
+        Self { ok: false, captured: RefCell::new(Vec::new()), reader: None }
+    }
+    fn agent(pane: &'static str) -> Self {
+        Self { reader: Some(pane), ..Self::ok() }
     }
     fn last(&self) -> String {
         self.captured.borrow().last().cloned().unwrap_or_default()
@@ -43,6 +48,9 @@ impl FakeTarget {
 impl ExportTarget for FakeTarget {
     fn label(&self) -> &'static str {
         "fake"
+    }
+    fn reader(&self) -> Option<&str> {
+        self.reader
     }
     fn success_message(&self, what: &str) -> String {
         format!("exported {what}")
@@ -1444,6 +1452,26 @@ fn sent_thread() -> (Repo, App) {
 }
 
 #[test]
+fn an_answer_landing_while_composing_leaves_the_draft_and_the_view_alone() {
+    let (r, mut app) = sent_thread();
+    app.focus = Focus::Diff;
+    app.diff_cursor = row_with(&app, ' ');
+    app.start_comment();
+    typed(&mut app, "half a tho");
+    let place = (app.diff_cursor, app.diff_scroll, app.input.clone(), app.mode.clone());
+    // The agent edits and answers at once: the draft's open diff stays frozen.
+    r.write("a.rs", "zero\nalpha\nBETA\ngamma\ndelta\nepsilon\n");
+    common::land_world(&mut app);
+    app.receive_reply(1, "it names a constant".into(), None);
+    assert_eq!((app.diff_cursor, app.diff_scroll, app.input.clone(), app.mode.clone()), place);
+    typed(&mut app, "ught");
+    app.submit_comment();
+    let texts: Vec<&str> = app.store.iter().map(|c| c.text.as_str()).collect();
+    assert_eq!(texts, ["why upper case?", "half a thought"]);
+    assert_eq!(app.store.thread(0).unwrap().replies.len(), 1, "the answer kept too");
+}
+
+#[test]
 fn a_sent_comment_stays_on_its_line_as_a_numbered_thread() {
     let (_r, app) = sent_thread();
     assert_eq!(app.card_rows().len(), 1, "its card stays under its line");
@@ -1483,6 +1511,30 @@ fn a_reply_waits_for_the_next_send_which_carries_only_what_is_new() {
     assert!(sent.contains("#2 a.rs:2 (removed)\n-beta\nand this one?"), "{sent}");
     assert!(!sent.contains("why upper case?"), "the first send never goes again: {sent}");
     assert_eq!(app.unsent(), 0);
+}
+
+#[test]
+fn a_reply_on_a_resolved_thread_reopens_it_for_the_agents_answer() {
+    let (_r, mut app) = sent_thread();
+    app.focus = Focus::Diff;
+    app.diff_cursor = row_with(&app, '+');
+    app.toggle_resolved();
+    assert!(app.store.open_numbers().is_empty(), "resolved: closed to answers");
+    app.open_list();
+    app.start_reply();
+    typed(&mut app, "actually, not done");
+    app.submit_comment();
+    assert_eq!(app.store.open_numbers(), [1], "the reply's answer can reach it");
+    assert!(!app.store.thread(0).unwrap().resolved);
+    assert_eq!(app.card_rows().len(), 1, "back in the diff");
+}
+
+#[test]
+fn a_comment_of_only_invisible_marks_is_blank() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    comment_on(&mut app, '+', "\u{200b}\u{feff} \u{2060}");
+    assert!(app.store.is_empty(), "nothing anyone could read");
 }
 
 #[test]
@@ -1532,6 +1584,70 @@ fn next_comment_crosses_to_the_next_file_holding_one_and_back() {
     assert_eq!(app.diff_path.as_deref(), Some("a.rs"), "around the review");
     app.jump_comment(-1);
     assert_eq!(app.diff_path.as_deref(), Some("b.rs"), "and back");
+}
+
+#[test]
+fn next_comment_crosses_to_a_file_whose_card_another_view_made() {
+    // A worktree comment on `a.rs`, then `commits` on the commit both files came from.
+    let r = Repo::init();
+    r.write("a.rs", "fn a_one() { first(); }\n");
+    r.write("b.rs", "fn b_one() { second(); }\n");
+    r.commit_all("init");
+    r.write("a.rs", "fn a_one() { first(); }\nfn a_two() { third(); }\n");
+    r.write("b.rs", "fn b_one() { second(); }\nfn b_two() { fourth(); }\n");
+    r.commit_all("more");
+    r.write("a.rs", "// note\nfn a_one() { first(); }\nfn a_two() { third(); }\n");
+    let mut app = app_on(&r);
+    app.select_file(file_row(&app, "a.rs")).unwrap();
+    comment_on_line(&mut app, "fn a_two() { third(); }", "why third?");
+    app.open_commit_picker();
+    app.commit_picker_pick().unwrap();
+    app.select_file(file_row(&app, "b.rs")).unwrap();
+    assert!(app.card_rows().is_empty(), "b holds no card");
+    app.jump_comment(1);
+    assert_eq!(app.diff_path.as_deref(), Some("a.rs"), "a's card, made in the worktree");
+    assert_eq!(app.card_rows().first().map(|&(row, _)| row), Some(app.diff_cursor));
+    app.select_file(file_row(&app, "b.rs")).unwrap();
+    app.jump_comment(-1);
+    assert_eq!(app.diff_path.as_deref(), Some("a.rs"), "and backward");
+    // An answer to it is reached the same way.
+    app.store.mark_sent();
+    app.receive_reply(1, "it counts".into(), None);
+    app.select_file(file_row(&app, "b.rs")).unwrap();
+    app.jump_answer();
+    assert_eq!(app.diff_path.as_deref(), Some("a.rs"), "{}", app.status);
+    assert_eq!(app.store.unread(), 0, "going there reads it");
+}
+
+#[test]
+fn previous_comment_reaches_a_comment_made_on_an_earlier_commit() {
+    // #1 on `add`'s conf.h; `drop` removes those lines and adds role.h with #2.
+    let r = Repo::init();
+    r.write("conf.h", "struct Base {};\n");
+    r.commit_all("base");
+    r.write("conf.h", "struct Base {};\nstruct CoinSpotName {\n  std::string btc_fut;\n};\n");
+    r.commit_all("add");
+    let add = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.write("conf.h", "struct Base {};\n");
+    r.write("role.h", "enum class Role : uint8_t { BtcFut, EthFut };\n");
+    r.commit_all("drop");
+    let drop = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    let mut app = app_on(&r);
+    let open_on = |app: &mut App, sha: &str, file: &str| {
+        app.open_commit_picker();
+        let at = picker(app).index_of(sha).expect("listed");
+        app.commit_picker_goto(at);
+        app.commit_picker_pick().unwrap();
+        app.select_file(file_row(app, file)).unwrap();
+    };
+    open_on(&mut app, &add, "conf.h");
+    comment_on_line(&mut app, "struct CoinSpotName {", "why its own struct?");
+    open_on(&mut app, &drop, "role.h");
+    comment_on_line(&mut app, "enum class Role : uint8_t { BtcFut, EthFut };", "hardcoded?");
+    app.jump_comment(-1);
+    assert_eq!(app.diff_path.as_deref(), Some("conf.h"), "back to the earlier commit's comment");
+    let place = app.card_place(0).expect("on the lines `drop` removed");
+    assert_eq!((place.side, place.start, place.changed), (Side::Old, 2, false), "{place:?}");
 }
 
 #[test]
@@ -1615,16 +1731,35 @@ fn the_send_says_how_to_answer_while_the_channel_listens() {
     let r = edited_repo();
     let mut app = app_on(&r);
     app.reply_token = Some("1f2e".into());
+    let claude = FakeTarget::agent("w1:p1");
+    // The first send to an agent explains the review: how it goes, then each command.
     comment_on(&mut app, '+', "why?");
-    let target = FakeTarget::ok();
-    app.export(&target);
-    let sent = target.last();
+    assert!(app.export(&claude));
+    let sent = claude.last();
+    assert!(sent.contains("This review came from herdr-reviewr"), "{sent}");
+    assert!(sent.contains("How it goes: you work and commit;"), "{sent}");
+    assert!(sent.contains("A comment is the reviewer's view, not an order"), "{sent}");
     assert!(sent.contains("herdr-reviewr --reply <number> --to 1f2e \"<answer>\"\n"), "{sent}");
-    let own = "herdr-reviewr --comment <path>:<line> --to 1f2e \"<comment>\".";
+    let own = "herdr-reviewr --comment <path>:<line> --to 1f2e \"<comment>\"\n";
     assert!(sent.contains(own), "the agent learns it can comment too: {sent}");
-    let suggest = "herdr-reviewr --suggest <sha>[,<sha>...] --to 1f2e \"<why>\".";
+    let suggest = "--suggest <sha>[,<sha>...] --to 1f2e \"<why>\"\n";
     assert!(sent.contains(suggest), "and point at commits: {sent}");
     assert!(sent.ends_with("herdr-reviewr --help explains all three."), "{sent}");
+    // Later sends to it end with the short lines.
+    comment_on(&mut app, '+', "and this?");
+    assert!(app.export(&claude));
+    let sent = claude.last();
+    assert!(!sent.contains("How it goes"), "{sent}");
+    assert!(sent.contains("herdr-reviewr --reply <number> --to 1f2e \"<answer>\"\n"), "{sent}");
+    let suggest = "herdr-reviewr --suggest <sha>[,<sha>...] --to 1f2e \"<why>\".";
+    assert!(sent.contains(suggest), "{sent}");
+    assert!(sent.ends_with("herdr-reviewr --help explains all three."), "{sent}");
+    // Another agent, or a copy, is a reader of its own.
+    for other in [FakeTarget::agent("w1:p2"), FakeTarget::ok()] {
+        comment_on(&mut app, '+', "one more");
+        assert!(app.export(&other));
+        assert!(other.last().contains("How it goes"), "{}", other.last());
+    }
 }
 
 #[test]
@@ -3706,18 +3841,21 @@ fn a_diff_comment_shows_in_the_file_view_where_the_worktree_reads_its_line() {
     assert!(app.store.get(0).unwrap().diff_anchored, "made in the Changes diff");
     assert_eq!(app.card_rows().len(), 2, "both render in their own diff view");
 
-    // In All files the worktree reads BETA on line 2, and the removed line nowhere: on the
+    // In All files the worktree reads BETA on line 2, which rewrote the removed beta: on the
     // first open, read from the diff's view, and on any after.
     app.set_tab(Tab::AllFiles).unwrap();
     assert_eq!((app.diff_path.as_deref(), app.diff.view), (Some("a.rs"), View::File));
     let shown = |app: &App| app.card_rows().iter().map(|&(_, ci)| ci).collect::<Vec<_>>();
-    assert_eq!(shown(&app), [0]);
+    assert_eq!(shown(&app), [0, 1]);
     common::land_world(&mut app);
     let row = file_row_of(&app, "a.rs").expect("a.rs listed");
     app.select_file(row).unwrap();
-    assert_eq!(shown(&app), [0]);
-    let place = CardPlace { side: Side::New, start: 2, end: 2, native: false, from: None };
-    assert_eq!(app.card_place(0), Some(place), "the same worktree, so nothing to name");
+    assert_eq!(shown(&app), [0, 1]);
+    let place =
+        CardPlace { side: Side::New, start: 2, end: 2, native: false, changed: false, from: None };
+    assert_eq!(app.card_place(0), Some(place.clone()), "the same worktree, so nothing to name");
+    let rewritten = CardPlace { changed: true, ..place };
+    assert_eq!(app.card_place(1), Some(rewritten), "the removed line, where BETA rewrote it");
 }
 
 #[test]
@@ -6265,6 +6403,28 @@ fn based_repo() -> Repo {
 }
 
 #[test]
+fn a_base_that_swallows_a_commented_file_keeps_its_comment_for_the_way_back() {
+    let r = based_repo();
+    r.git(&["branch", "landed"]);
+    let mut app = app_on(&r);
+    app.set_scope(Scope::Branch).unwrap();
+    app.select_file(file_row(&app, "a.rs")).unwrap();
+    comment_on(&mut app, '+', "why two?");
+    app.open_base_picker();
+    goto_row(&mut app, "landed");
+    app.base_picker_pick().unwrap();
+    assert!(app.entries.is_empty(), "the base holds the change");
+    assert_eq!(app.store.len(), 1, "Comments survive");
+    app.open_base_picker();
+    goto_row(&mut app, "main");
+    app.base_picker_pick().unwrap();
+    app.select_file(file_row(&app, "a.rs")).unwrap();
+    let cards = cards(&app);
+    assert_eq!(cards.len(), 1, "back on its line");
+    assert_eq!((cards[0].1.start, cards[0].1.changed), (1, false));
+}
+
+#[test]
 fn the_base_picker_opens_on_every_scope_without_a_flag_and_a_pick_switches_to_branch() {
     let r = based_repo();
     let mut app = app_on(&r);
@@ -8285,7 +8445,7 @@ fn a_suggestion_waits_for_g_and_any_pick_answers_it() {
     let run = CommitPick { oldest: shas[1].clone(), newest: shas[2].clone() };
     let picks = Picks::from([(String::new(), run.clone())]);
     app.receive_suggestion(picks, "the two\nadds", Some("claude".into()));
-    let said = format!("claude suggests {}..{} · G opens them", &shas[1][..7], &shas[2][..7]);
+    let said = format!("claude suggests {} to {} · G opens them", &shas[1][..7], &shas[2][..7]);
     assert_eq!(app.status, said);
     assert_eq!((app.scope, app.diff_path.clone(), app.mode.clone()), (scope, open, Mode::Normal));
     let bands = app.footer_bands();
@@ -8385,6 +8545,7 @@ fn a_comment_shows_in_every_view_that_reads_its_lines() {
         start: line,
         end: line,
         native,
+        changed: false,
         from,
     };
     pick_commit(&mut app, &shas[1]);
@@ -8394,10 +8555,11 @@ fn a_comment_shows_in_every_view_that_reads_its_lines() {
     pick_commit(&mut app, &shas[2]);
     let from_add = Some(short(&shas[1]));
     assert_eq!(cards(&app), [("why zero?".into(), at(Side::Old, 2, false, from_add))]);
-    // The worktree reads it nowhere: the diff shows no card, the list keeps the comment.
+    // The worktree holds that line as `fix` rewrote it: there, its code changed.
     app.set_scope(Scope::Uncommitted).unwrap();
     app.select_file(file_row(&app, "lib.rs")).unwrap();
-    assert!(cards(&app).is_empty());
+    let rewritten = CardPlace { changed: true, ..at(Side::New, 3, false, Some(short(&shas[1]))) };
+    assert_eq!(cards(&app), [("why zero?".into(), rewritten)]);
     comment_on_line(
         &mut app,
         "fn total(items: &[u32]) -> u32 { items.iter().sum() }",
@@ -8409,11 +8571,39 @@ fn a_comment_shows_in_every_view_that_reads_its_lines() {
     let worktree = Some("the worktree".to_string());
     assert!(cards(&app).contains(&("sum is fine".into(), at(Side::New, 2, false, worktree))));
     pick_commit(&mut app, &shas[1]);
-    assert!(!cards(&app).iter().any(|(text, _)| text == "sum is fine"), "`add` never read it");
+    // `add` holds that line as it read before `fix`: the card sits there, its code changed.
+    let older = CardPlace { changed: true, ..at(Side::New, 2, false, Some("the worktree".into())) };
+    assert!(cards(&app).contains(&("sum is fine".into(), older)), "{:?}", cards(&app));
     // Neither moved: each still sits where it was made, and the send names the commit.
     let location = app.store.get(0).unwrap().location();
     assert_eq!(location, format!("lib.rs:2 (in commit {})", short(&shas[1])));
     assert_eq!(app.store.get(1).unwrap().location(), "lib.rs:3");
+}
+
+#[test]
+fn an_amended_commit_shows_a_comment_where_its_line_went_not_on_a_twin() {
+    let r = Repo::init();
+    r.write("base.txt", "base\n");
+    r.commit_all("base");
+    r.write("lib.rs", "fn first() {\n  if a {\n    return;\n  }\n}\n");
+    r.commit_all("add first");
+    let made = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    let mut app = app_on(&r);
+    pick_commit(&mut app, &made);
+    comment_on_line(&mut app, "    return;", "is this return ok?");
+    // The agent amends: a function above it, and the commented return rewritten.
+    r.write(
+        "lib.rs",
+        "fn zero() {\n  if z {\n    return;\n  }\n}\n\
+         fn first() {\n  if a {\n    return;  // not ours\n  }\n}\n",
+    );
+    r.git(&["commit", "-q", "-a", "--amend", "--no-edit"]);
+    let amended = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    pick_commit(&mut app, &amended);
+    // Line 3 reads `return;` again, but zero's: the card follows its own to line 8.
+    let place = app.card_place(0).expect("the amended commit shows it");
+    assert_eq!((place.side, place.start, place.changed), (Side::New, 8, true), "{place:?}");
+    assert_eq!(place.from.as_deref(), Some(&made[..7]));
 }
 
 #[test]

@@ -473,7 +473,7 @@ fn a_folder_selection_adds_and_drops_rows_and_reopens_as_picked() {
     app.commit_picker_pick().unwrap();
     let sha = |rev: &str| git(&api, &["rev-parse", rev]);
     let run = CommitPick { oldest: sha("HEAD~1"), newest: sha("HEAD") };
-    let label = format!("{}..{} (2) · api", &run.oldest[..7], &run.newest[..7]);
+    let label = format!("{} to {} (2) · api", &run.oldest[..7], &run.newest[..7]);
     assert_eq!(app.commit_picks, Picks::from([("api".to_string(), run)]));
     assert_eq!(listed(&app), ["api/a.txt"]);
     let header = painted(&app).0.remove(0);

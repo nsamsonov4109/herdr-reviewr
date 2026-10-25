@@ -222,6 +222,7 @@ mod tests {
             binary: false,
             old_size: 0,
             new_size: None,
+            mode: None,
         }
     }
 

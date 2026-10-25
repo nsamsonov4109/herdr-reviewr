@@ -83,11 +83,12 @@ herdr-reviewr: a code-review pane for herdr.
       Comment on lines of the code under review. Without a comment, it is read from stdin.
 
   herdr-reviewr --suggest <commit>[..<commit>][,<commit>...] [--to <token>] [why]
-      Suggest commits for the reviewer to look at together: a..b is the run from a to b, both
-      included. In a folder of repositories, each commit is found in its own repository. For a
-      review in steps, suggest each step on its own: they wait in the order sent, and the
-      reviewer opens each from the pane; nothing moves by itself. Without a why, it is read
-      from stdin.
+      Suggest commits for the reviewer to look at together. Ranges read as git reads them: a..b
+      is the commits after a up to b, a...b counts from their merge base, and a missing end is
+      HEAD. A list is the run from its oldest commit to its newest, both included. In a folder
+      of repositories, each commit is found in its own repository. For a review in steps,
+      suggest each step on its own: they wait in the order sent, and the reviewer opens each
+      from the pane; nothing moves by itself. Without a why, it is read from stdin.
 
 A review names its pane's token. Without --to, these commands go to the review pane in this
 herdr tab, else in this workspace, else the one reviewing this folder.
@@ -1118,8 +1119,18 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
                     crate::reply::Incoming::Reply { number, text, agent } => {
                         app.receive_reply(number, text, agent);
                     }
-                    crate::reply::Incoming::Comment { path, start, end, text, agent, verdict } => {
-                        let _ = verdict.send(app.receive_comment(&path, start, end, text, agent));
+                    crate::reply::Incoming::Comment {
+                        path,
+                        start,
+                        end,
+                        text,
+                        agent,
+                        verdict,
+                        until,
+                    } => {
+                        let placed =
+                            app.receive_comment_until(&path, start, end, text, agent, until);
+                        let _ = verdict.send(placed);
                     }
                     crate::reply::Incoming::Suggest { picks, text, agent } => {
                         app.receive_suggestion(picks, &text, agent);
