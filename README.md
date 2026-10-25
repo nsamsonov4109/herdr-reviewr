@@ -11,8 +11,11 @@
 
 # herdr-reviewr
 
-[![CI](https://github.com/persiyanov/herdr-reviewr/actions/workflows/ci.yml/badge.svg)](https://github.com/persiyanov/herdr-reviewr/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/persiyanov/herdr-reviewr)](https://github.com/persiyanov/herdr-reviewr/releases/latest)
+> A fork of [persiyanov/herdr-reviewr](https://github.com/persiyanov/herdr-reviewr), released ahead of
+> it with threads, folder review and suggested commits. See the [changelog](CHANGELOG.md).
+
+[![CI](https://github.com/nsamsonov4109/herdr-reviewr/actions/workflows/ci.yml/badge.svg)](https://github.com/nsamsonov4109/herdr-reviewr/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/nsamsonov4109/herdr-reviewr)](https://github.com/nsamsonov4109/herdr-reviewr/releases/latest)
 [![License](https://img.shields.io/github/license/persiyanov/herdr-reviewr)](LICENSE)
 
 <p align="center">
@@ -52,7 +55,7 @@ reviewr never edits your files, never sends on its own, and never posts to your 
 ## Install
 
 ```bash
-herdr plugin install persiyanov/herdr-reviewr
+herdr plugin install nsamsonov4109/herdr-reviewr
 ```
 
 reviewr opens on its own when herdr creates a workspace for a worktree. To open it yourself:
@@ -64,10 +67,10 @@ herdr plugin action invoke open --plugin persiyanov.reviewr
 **To update**, reinstall. Your config stays:
 
 ```bash
-herdr plugin uninstall persiyanov.reviewr && herdr plugin install persiyanov/herdr-reviewr
+herdr plugin uninstall persiyanov.reviewr && herdr plugin install nsamsonov4109/herdr-reviewr
 ```
 
-**Without herdr**, run a [release binary](https://github.com/persiyanov/herdr-reviewr/releases/latest)
+**Without herdr**, run a [release binary](https://github.com/nsamsonov4109/herdr-reviewr/releases/latest)
 on any repo. Everything but **Send** and the **last turn** scope works:
 
 ```bash
@@ -451,7 +454,7 @@ On Windows, point it at the plugin's own `bin` folder.
 See [CONTRIBUTING.md](CONTRIBUTING.md). To run your build in herdr:
 
 ```bash
-git clone https://github.com/persiyanov/herdr-reviewr
+git clone https://github.com/nsamsonov4109/herdr-reviewr
 cd herdr-reviewr
 just install   # build to bin/herdr-reviewr, re-signed on macOS
 herdr plugin uninstall persiyanov.reviewr

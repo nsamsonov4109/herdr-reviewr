@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.49.0] — 2026-10-25
+
 ### Added
 - **Threads**: a sent comment stays on its line as a numbered thread, and the agent answers it with `herdr-reviewr --reply <number>`, which the send tells it how to run. `a` replies, and the next send carries your replies with any new comments. `D` resolves a thread, hiding it from the diff while the comments list keeps it, and any new reply reopens it. A new answer marks its thread and its file until you go to it, and `A` goes to the next one. Each message opens under its author, you or the agent, with a bar in that author's color down its lines, and the agent's newest message says `new` until you've read it; a card wraps at 96 columns however wide the pane. The comments list puts each thread's state before its text, and `send` counts what the next send carries. Answers need macOS or Linux.
 - **Since send**: `i` shows only what changed after your last send, every repository against a snapshot taken as you sent, so the next review round reads just the agent's follow-up. `i` again goes back to the scope you came from.

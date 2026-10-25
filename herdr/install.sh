@@ -5,7 +5,7 @@ set -euo pipefail
 NAME="herdr-reviewr"
 # Every line this step prints starts with the plugin's name, as the action lines do.
 SAY="reviewr"
-REPO="persiyanov/herdr-reviewr"
+REPO="nsamsonov4109/herdr-reviewr"
 
 # The root from this script's place: build commands may not receive herdr's runtime env.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
