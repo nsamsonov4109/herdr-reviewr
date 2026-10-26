@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.49.1] — 2026-10-26
+
 ### Added
 - **Threads follow a rebase**: when the agent rewrites the branch, as a rebase or an amend does, a comment made on one of its commits moves to what the rewrite made of that commit: the commit with the same subject, or, where several share it, the one `git range-diff` pairs it with. There it follows its lines, or sits where they were with `code changed`, and a send names the new commit. A comment you're replying to waits until your reply is in. A comment on a commit the rewrite dropped or renamed stays where it was.
 
