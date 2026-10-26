@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.49.2] — 2026-10-26
+
 ### Fixed
 - **Comments keep their lines through a passing state**: a `git stash` and `pop`, or a file emptied and written again, left a comment a line off and `code changed`. It now finds its lines again from the last text they read in.
 - **A comment on a removed line keeps its line in every scope**: a look at another scope, whose base lacks the line, moved it for good. It counts in the base of the scope it was made in, and another scope shows it without moving it, `from branch` say.
