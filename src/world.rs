@@ -829,6 +829,15 @@ pub fn read_back(path: &Path, text: bool) -> Probed {
         hasher.finish()
     };
     let missing = Probed { fingerprint: None, text: None };
+    // A link reads as git stores it, the path it names, as its diff and the File view read it.
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        let Ok(target) = std::fs::read_link(path) else { return missing };
+        let target = target.to_string_lossy().into_owned();
+        return Probed {
+            fingerprint: Some(hash(&|h| target.hash(h))),
+            text: text.then(|| target.into()),
+        };
+    }
     let Ok(meta) = std::fs::metadata(path) else { return missing };
     if crate::diff::over_byte_budget(usize::try_from(meta.len()).unwrap_or(usize::MAX)) {
         let stamp = (meta.len(), meta.modified().ok());
@@ -866,12 +875,13 @@ pub fn spawn(
                 } else {
                     None
                 };
+                let read_back =
+                    || probe(&job.input.repo, &job.input.repos, &job.probe, &job.refresh);
                 let (probed, rewrites) = match &snapshot {
-                    Some(Ok(_)) => (
-                        probe(&job.input.repo, &job.input.repos, &job.probe, &job.refresh),
-                        worker.rewrites(&job.input, &job.rehome),
-                    ),
-                    _ => (BTreeMap::new(), Vec::new()),
+                    Some(Ok(_)) => (read_back(), worker.rewrites(&job.input, &job.rehome)),
+                    // Nothing to rebuild, as in `commits`: the worktree's comments still follow.
+                    None => (read_back(), Vec::new()),
+                    Some(Err(_)) => (BTreeMap::new(), Vec::new()),
                 };
                 let done = WorldCompletion {
                     generation: job.generation,

@@ -2196,33 +2196,22 @@ pub fn oldest_after(repo: &Path, from: &str, newest: &str) -> Option<String> {
     listed.lines().last().map(str::to_string)
 }
 
-/// The most commits a side of [`rewritten`] pairs by patch: past that, `range-diff` costs seconds.
-const REWRITE_SPAN: usize = 64;
-
-/// What a rewrite made of `pick`, which `HEAD` no longer reaches: each end under its own subject.
+/// What a rewrite made of `pick`, which no branch holds any more: each end under its own subject.
 pub fn rewritten(repo: &Path, pick: &CommitPick) -> Option<CommitPick> {
-    if is_reachable(repo, &pick.newest) {
+    if is_reachable(repo, &pick.newest) || held_by_a_branch(repo, &pick.newest) {
         return None;
     }
-    let base = git_line(repo, &["merge-base", &pick.newest, "HEAD"])?;
-    let (old, new) = (format!("{base}..{}", pick.newest), format!("{base}..HEAD"));
-    let (olds, news) = (subjects(repo, &old)?, subjects(repo, &new)?);
-    // A subject one commit holds on each side names the rewrite; one several share needs patches.
-    let unique = |sha: &str| {
-        let subject = olds.get(sha)?;
-        only_under(&olds, subject).and(only_under(&news, subject)).cloned()
-    };
-    let ends = [pick.newest.as_str(), pick.oldest.as_str()];
-    let shared = ends.iter().any(|sha| olds.contains_key(*sha) && unique(sha).is_none());
-    let out = if shared && olds.len().max(news.len()) <= REWRITE_SPAN {
-        git(repo, &["range-diff", "--no-color", "--no-abbrev", "-s", &old, &new]).ok()?
-    } else {
-        String::new()
-    };
-    let pairs = range_pairs(&out);
+    // What each side holds that the other lacks, so no shared ancestor is needed.
+    let (olds, news) = sides_by_subject(repo, &pick.newest)?;
     let follow = |sha: &str| {
-        let under = olds.get(sha)?;
-        unique(sha).or_else(|| pairs.get(sha).filter(|to| news.get(*to) == Some(under)).cloned())
+        let subject = olds.get(sha)?;
+        if let Some(to) = only_under(&olds, subject).and(only_under(&news, subject)) {
+            return Some(to.clone());
+        }
+        // Several share the subject: the one `range-diff` pairs with it as the same change.
+        let under = news.iter().filter(|(_, s)| *s == subject).map(|(to, _)| to);
+        let mut paired = under.filter(|to| same_change(repo, sha, to));
+        paired.next().filter(|_| paired.next().is_none()).cloned()
     };
     let newest = follow(&pick.newest)?;
     if pick.is_single() {
@@ -2238,33 +2227,44 @@ pub fn rewritten(repo: &Path, pick: &CommitPick) -> Option<CommitPick> {
         .then_some(CommitPick { oldest, newest })
 }
 
+/// Whether a local branch still holds `sha`: then a checkout left it, nothing rewrote it.
+fn held_by_a_branch(repo: &Path, sha: &str) -> bool {
+    let args =
+        ["for-each-ref", "--count=1", "--format=%(refname)", "--contains", sha, "refs/heads"];
+    git_line(repo, &args).is_some()
+}
+
+/// Commits by id, each with its subject.
+type BySubject = HashMap<String, String>;
+
+/// The commits only `old` reaches and those only `HEAD` reaches.
+fn sides_by_subject(repo: &Path, old: &str) -> Option<(BySubject, BySubject)> {
+    let range = format!("{old}...HEAD");
+    let format = "--format=%m%H%x00%s";
+    let log = ["log", "--no-show-signature", "--encoding=UTF-8", "--left-right", format, &range];
+    let out = git(repo, &log).ok()?;
+    let (mut olds, mut news) = (HashMap::new(), HashMap::new());
+    for line in out.lines() {
+        let Some((sha, subject)) = line.get(1..).and_then(|rest| rest.split_once('\0')) else {
+            continue;
+        };
+        let side = if line.starts_with('<') { &mut olds } else { &mut news };
+        side.insert(sha.to_string(), subject.to_string());
+    }
+    Some((olds, news))
+}
+
+/// Whether `git range-diff` pairs commit `old` with commit `new` as one change, kept or changed.
+fn same_change(repo: &Path, old: &str, new: &str) -> bool {
+    let (old, new) = (format!("{old}^!"), format!("{new}^!"));
+    let out = git(repo, &["range-diff", "--no-color", "-s", &old, &new]).unwrap_or_default();
+    out.lines().any(|line| matches!(line.split_whitespace().nth(2), Some("=" | "!")))
+}
+
 /// The one commit of `side` under `subject`; `None` when none or several are.
 fn only_under<'a>(side: &'a HashMap<String, String>, subject: &str) -> Option<&'a String> {
     let mut under = side.iter().filter(|(_, s)| *s == subject).map(|(sha, _)| sha);
     under.next().filter(|_| under.next().is_none())
-}
-
-/// Each commit of `range` by id, with its subject.
-fn subjects(repo: &Path, range: &str) -> Option<HashMap<String, String>> {
-    let format = "--format=%H%x00%s";
-    let log = ["log", "--no-show-signature", "--encoding=UTF-8", format, range];
-    let out = git(repo, &log).ok()?;
-    Some(
-        out.lines().filter_map(|l| l.split_once('\0')).map(|(h, s)| (h.into(), s.into())).collect(),
-    )
-}
-
-/// The commits `git range-diff -s` pairs, old to new: kept as they were (`=`) or changed (`!`).
-fn range_pairs(out: &str) -> HashMap<&str, String> {
-    out.lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let (_, old, status, _, new) =
-                (fields.next()?, fields.next()?, fields.next()?, fields.next()?, fields.next()?);
-            let oid = |s: &str| s.bytes().all(|b| b.is_ascii_hexdigit());
-            (matches!(status, "=" | "!") && oid(old) && oid(new)).then(|| (old, new.to_string()))
-        })
-        .collect()
 }
 
 /// One commit picker row.

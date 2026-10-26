@@ -112,6 +112,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Mode::Picker => Some(render_agent_picker),
         Mode::BasePick => Some(render_base_picker),
         Mode::CommitPick => Some(render_commit_picker),
+        Mode::Composing { .. } if app.composing_aside() => Some(render_reply_aside),
         Mode::Normal | Mode::Composing { .. } | Mode::Search | Mode::Find => None,
     };
     if let Some(render_popup) = popup {
@@ -406,7 +407,8 @@ fn read_layout(app: &App, inner: Rect, cards: &[(usize, usize)]) -> Vec<Slot> {
         out
     };
 
-    if !app.composing() {
+    // A box beside its thread, over the body, leaves the read pane as it reads.
+    if !app.composing() || app.composing_aside() {
         let body_h = if app.mode == Mode::Find { height.saturating_sub(1) } else { height };
         let mut out = Vec::new();
         for i in app.diff_scroll..rows {
@@ -1772,7 +1774,7 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
                             name: &row.name,
                             ignored: row.ignored,
                             emphasis: &[],
-                            fresh: app.has_new_answer(&app.entries[*index].path),
+                            fresh: app.answer_marked(&app.entries[*index].path),
                             viewed: app.viewed_mark(&app.entries[*index].path),
                         },
                         width,
@@ -3563,7 +3565,7 @@ fn render_comments_list(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
     // The highlighted thread reads under the rows, newest last: an answer no file shows is here.
-    let thread = thread_preview(app, width, p);
+    let thread = thread_preview(app, app.list_cursor, width, p);
     let room = inner.height.saturating_sub(1) / 2;
     let rows = u16::try_from(items.len()).unwrap_or(u16::MAX).clamp(1, room.max(1));
     let rows = if thread.is_empty() || room == 0 { inner.height } else { rows };
@@ -3579,15 +3581,37 @@ fn render_comments_list(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// The comments list's highlighted thread, each message down its author's bar.
-fn thread_preview(app: &App, width: usize, p: &Palette) -> Vec<Line<'static>> {
+/// Comment `ci`'s thread as a popup reads it, each message down its author's bar.
+fn thread_preview(app: &App, ci: usize, width: usize, p: &Palette) -> Vec<Line<'static>> {
     let text_w = width.saturating_sub(MESSAGE_BAR.width() + 2).max(1);
-    let lines = thread_body(&app.store, app.list_cursor, text_w);
+    let lines = thread_body(&app.store, ci, text_w);
     let line = |line| match message_line(line, text_w, p) {
         Some(spans) => Line::from(std::iter::once(Span::raw(" ")).chain(spans).collect::<Vec<_>>()),
         None => Line::default(),
     };
     lines.into_iter().map(line).collect()
+}
+
+/// The box answering or editing a comment the open view doesn't show: over the body, under the
+/// thread it answers, its newest lines kept.
+fn render_reply_aside(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(ci) = app.composing_target() else { return };
+    let body = panes(area, app).body;
+    let popup = body_popup(
+        area,
+        app,
+        body.width * LIST_POPUP_W_PCT / 100,
+        body.height * LIST_POPUP_H_PCT / 100,
+    );
+    frame.render_widget(Clear, popup);
+    let width = popup.width as usize;
+    let box_h = u16::try_from(composer_height(app, width)).unwrap_or(u16::MAX);
+    let box_h = box_h.min(popup.height.saturating_sub(1)).max(3).min(popup.height);
+    let thread_area = Rect { height: popup.height - box_h, ..popup };
+    let thread = thread_preview(app, ci, width, app.palette());
+    let tail = thread.len().saturating_sub(usize::from(thread_area.height));
+    frame.render_widget(Paragraph::new(thread[tail..].to_vec()), thread_area);
+    render_composer(frame, app, Rect { y: popup.y + thread_area.height, height: box_h, ..popup });
 }
 
 /// A `w` × `h` popup centered in the body, never over the footer.

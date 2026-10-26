@@ -26,6 +26,9 @@ use crate::split::{Pair, Visible};
 use crate::theme;
 use crate::world::{Changeset, CommentPicks, PickStatus, PickVerdict, Rewrite};
 
+/// How soon a second click at the same cell counts as the same gesture's.
+const CLICK_WINDOW: Duration = Duration::from_millis(400);
+
 /// Navigator shares and bounds, as percentages of the body's split axis.
 const DEFAULT_SIDE_PCT: u16 = 32;
 const DEFAULT_STACK_PCT: u16 = 25;
@@ -105,6 +108,9 @@ struct TabStash {
     cursor_line: Option<(usize, usize)>,
     comment_target: Option<u64>,
     rendered: RenderedView,
+    /// The open file's sides as read, and where other views' comments sit in them.
+    open_text: OpenText,
+    placed: HashMap<u64, (Span, bool)>,
     /// Whether this tab ever loaded; a first visit loads before the frame.
     visited: bool,
 }
@@ -364,14 +370,17 @@ impl CommitPicker {
 
     /// Whether folder row `i` lies in `pick`'s run in its repository, newest to oldest.
     fn runs_through(&self, i: usize, pick: &CommitPick) -> bool {
-        let repo = self.repo_of(i);
+        self.run_rows(self.repo_of(i), pick).is_some_and(|run| run.contains(&i))
+    }
+
+    /// The rows `pick` runs through in folder repository `repo`, newest to oldest: `None` unless
+    /// both its ends are listed there, so a selection never stands for part of a run.
+    fn run_rows(&self, repo: &str, pick: &CommitPick) -> Option<std::ops::RangeInclusive<usize>> {
         let at = |sha: &str| {
             (0..self.rows.len()).find(|&j| self.rows[j].sha == sha && self.repo_of(j) == repo)
         };
-        match (at(&pick.newest), at(&pick.oldest)) {
-            (Some(n), Some(o)) => (n..=o).contains(&i),
-            _ => pick.newest == self.rows[i].sha,
-        }
+        let (newest, oldest) = (at(&pick.newest)?, at(&pick.oldest)?);
+        (newest <= oldest).then_some(newest..=oldest)
     }
 
     /// The highlight and each other repository's newest row of its subject: one step across them.
@@ -745,7 +754,6 @@ struct AnswerKey {
     tab: Tab,
     scope: Scope,
     picks: Picks,
-    open: Option<String>,
 }
 
 /// The full state of the review session.
@@ -862,6 +870,8 @@ pub struct App {
     pub hover: Option<(u16, u16)>,
     /// The multi-click chain: the last mouse-down, while the window holds.
     last_click: Option<LastClick>,
+    /// Where a click picked in a picker, until when: the rest of that double-click goes nowhere.
+    picked_click: Option<(u16, u16, Instant)>,
     /// Whether a gesture held a reload, owed at its end.
     view_reload_held: bool,
     /// The open file's two sides as read: the text a new comment's lines count in.
@@ -871,7 +881,7 @@ pub struct App {
     placed: HashMap<u64, (Span, bool)>,
     /// Rewrites a frozen view held: their comments move once it thaws, so a draft's anchor holds.
     held_rewrites: Vec<Rewrite>,
-    /// Bumped as the view's world or its comments' places change, which the answer marks key on.
+    /// Bumped as a build lands, which the answer marks of files not open key on.
     view_epoch: u64,
     /// The files whose opening shows a new answer, with the state they were read in.
     answer_files: std::cell::RefCell<Option<(AnswerKey, BTreeSet<String>)>>,
@@ -1096,6 +1106,7 @@ impl App {
             settled_sel: None,
             hover: None,
             last_click: None,
+            picked_click: None,
             view_reload_held: false,
             open_text: OpenText::default(),
             placed: HashMap::new(),
@@ -1649,8 +1660,9 @@ impl App {
         self.expanded_folds.clear(); // the File view has no folds
         let (diff, content) = self.file_view(path);
         if diff.notice.is_none() {
-            let worktree =
-                |c: &Comment| c.file == path && c.side == Side::New && c.rev == Rev::Worktree;
+            let worktree = |c: &Comment, _: Option<Scope>| {
+                c.file == path && c.side == Side::New && c.rev == Rev::Worktree
+            };
             self.store.follow(worktree, &content);
         }
         self.open_text = OpenText { old: "".into(), new: content.as_str().into() };
@@ -2069,13 +2081,16 @@ impl App {
             if self.viewed.contains_key(&path) {
                 self.viewed_now.insert(path.clone(), probe.fingerprint);
             }
-            // The open file's comments follow the sides its own view read.
-            if self.diff_path.as_deref() == Some(path.as_str()) {
+            // The open file's comments follow the sides its own view read, when it reads the worktree.
+            let reads_worktree =
+                self.diff.view == View::File || self.rev_of(&path) == Rev::Worktree;
+            if self.diff_path.as_deref() == Some(path.as_str()) && reads_worktree {
                 continue;
             }
             if let Some(text) = probe.text {
-                let ours =
-                    |c: &Comment| c.file == path && c.side == Side::New && c.rev == Rev::Worktree;
+                let ours = |c: &Comment, _: Option<Scope>| {
+                    c.file == path && c.side == Side::New && c.rev == Rev::Worktree
+                };
                 self.store.follow(ours, &text);
             }
         }
@@ -2107,21 +2122,50 @@ impl App {
         let mut open_moved = false;
         for Rewrite { repo, from, to } in rewrites {
             let label = format!("{} to {}", from.label(), to.label());
-            let (from, to) = (Rev::Commit(from), Rev::Commit(to));
+            let (from, rev) = (Rev::Commit(from), Rev::Commit(to.clone()));
             let files: HashSet<String> = (self.store.iter())
                 .filter(|c| c.rev == from && self.repo_name(&c.file) == Some(repo.as_str()))
                 .map(|c| c.file.clone())
                 .collect();
-            let moved = self.store.rehome(|c| c.rev == from && files.contains(&c.file), &to);
+            let moved = self.store.rehome(|c| c.rev == from && files.contains(&c.file), &rev);
             if moved > 0 {
                 open_moved |= self.diff_path.as_ref().is_some_and(|p| files.contains(p));
                 logln!("{moved} comments follow {label}");
+                // Counted in the commit they moved to at once, so a send names their lines there.
+                for path in &files {
+                    self.follow_into_pick(path, &to);
+                }
             }
         }
         // The open file's comments follow their lines into the commit they moved to.
         if open_moved {
             self.reload_open_view();
         }
+    }
+
+    /// `path`'s comments made on `pick` follow their lines into the sides it reads.
+    fn follow_into_pick(&mut self, path: &str, pick: &CommitPick) {
+        let (root, inner) = if self.repos.is_folder() {
+            let Some((name, inner)) = self.repos.locate(path) else { return };
+            (self.repo.join(name), inner)
+        } else {
+            (self.repo.clone(), path)
+        };
+        let Some(parent) = git::parent_or_empty(&root, &pick.oldest) else { return };
+        let sides = git::diff_sides(&root, &parent, Some(&pick.newest), inner, None);
+        let Ok(git::DiffSides::Text { old, new }) = sides else { return };
+        let rev = Rev::Commit(pick.clone());
+        let ours = |side: Side| {
+            let rev = &rev;
+            move |c: &Comment, _: Option<Scope>| {
+                c.file == path
+                    && c.side == side
+                    && c.rev == *rev
+                    && (side == Side::New || c.diff_anchored)
+            }
+        };
+        self.store.follow(ours(Side::New), &new);
+        self.store.follow(ours(Side::Old), &old);
     }
 
     /// The comments on `path` follow their lines to where its sides now read them (Continuity).
@@ -2132,11 +2176,20 @@ impl App {
         let has_new = file.kind != ChangeKind::Deleted;
         let rev = self.rev_of(path);
         if has_new {
-            self.store.follow(|c| c.file == path && c.side == Side::New && c.rev == rev, new);
+            let ours = |c: &Comment, _: Option<Scope>| {
+                c.file == path && c.side == Side::New && c.rev == rev
+            };
+            self.store.follow(ours, new);
         }
         if has_old {
-            let ours = |c: &Comment| {
-                c.file == path && c.side == Side::Old && c.diff_anchored && c.rev == rev
+            // A removed line counts in its own scope's base, which another scope's never moves.
+            let scope = self.scope;
+            let ours = |c: &Comment, base: Option<Scope>| {
+                c.file == path
+                    && c.side == Side::Old
+                    && c.diff_anchored
+                    && c.rev == rev
+                    && base.is_none_or(|b| b == scope)
             };
             self.store.follow(ours, old);
         }
@@ -2163,13 +2216,12 @@ impl App {
 
     /// Find where the open view reads each other view's comment, its own side first, moving none.
     fn place_foreign(&mut self) {
-        self.view_epoch += 1;
         self.placed.clear();
         let Some(file) = self.diff_path.as_deref() else { return };
         let new = crate::anchor::lines(&self.open_text.new);
         let old = crate::anchor::lines(&self.open_text.old);
         let placed: Vec<(u64, (Span, bool))> = (self.store.iter().enumerate())
-            .filter(|(_, c)| c.file == file && (!self.comment_in_view(c) || self.side_gone(c)))
+            .filter(|&(i, c)| c.file == file && (!self.comment_in_view(i, c) || self.side_gone(c)))
             .filter_map(|(i, c)| Some((self.store.id(i)?, self.locate_in(i, c, &new, &old)?)))
             .collect();
         self.placed.extend(placed);
@@ -2177,9 +2229,14 @@ impl App {
 
     /// Whether the open diff has no side of `c`'s: a deleted file's new side, an added one's old.
     fn side_gone(&self, c: &Comment) -> bool {
+        self.side_gone_in(c, self.diff.view)
+    }
+
+    /// [`Self::side_gone`] in a `view` of `c`'s file, open or not.
+    fn side_gone_in(&self, c: &Comment, view: View) -> bool {
         let Some(file) = self.changeset.files.get(&c.file) else { return false };
         let kind = file.kind;
-        self.diff.view == View::Diff
+        view == View::Diff
             && match c.side {
                 Side::New => kind == ChangeKind::Deleted,
                 Side::Old => matches!(kind, ChangeKind::Added | ChangeKind::Untracked),
@@ -2190,14 +2247,17 @@ impl App {
     /// and whether its lines read otherwise there: a side that reads them as made comes first.
     fn locate_in(&self, i: usize, c: &Comment, new: &[&str], old: &[&str]) -> Option<(Span, bool)> {
         let held = self.store.held(i);
-        let made_on = self.store.counted_in(i).map(crate::anchor::lines);
+        // From the last text its lines read in: where they sat there, not where a change left them.
+        let found_in = self.store.found_in(i);
+        let made_on = found_in.map(|(text, ..)| crate::anchor::lines(text));
+        let (start, end) = found_in.map_or((c.start, c.end), |(_, start, end)| (start, end));
         let sides = match c.side {
             Side::New => [(Side::New, new), (Side::Old, old)],
             Side::Old => [(Side::Old, old), (Side::New, new)],
         };
         let found: Vec<(Span, bool)> = (sides.into_iter())
             .filter_map(|(side, text)| {
-                let p = crate::anchor::locate(held, c.start, c.end, made_on.as_deref(), text)?;
+                let p = crate::anchor::locate(held, start, end, made_on.as_deref(), text)?;
                 Some(((side, p.start, p.end), p.changed))
             })
             .collect();
@@ -2208,28 +2268,41 @@ impl App {
     /// its sides, the way opening it places them.
     fn spans_in(&self, path: &str) -> Vec<(usize, Span)> {
         if self.diff_path.as_deref() == Some(path) {
-            return self.shown_comments();
+            return self.spans_shown();
         }
+        self.spans_read(path)
+    }
+
+    /// The open view's comments that hold a row of their own, with their lines here.
+    fn spans_shown(&self) -> Vec<(usize, Span)> {
+        let rows = self.comment_rows().into_iter().filter(|(_, rows)| !rows.is_empty());
+        rows.filter_map(|(ci, _)| Some((ci, self.view_span(ci)?))).collect()
+    }
+
+    /// The comments `path` shows when opened in this tab, read from its sides, open or not.
+    fn spans_read(&self, path: &str) -> Vec<(usize, Span)> {
         let view = if self.tab == Tab::AllFiles { View::File } else { View::Diff };
-        let ours = (self.store.iter().enumerate())
-            .filter(|&(i, c)| c.file == path && self.store.thread(i).is_none_or(|t| !t.resolved));
-        let (made, others): (Vec<_>, Vec<_>) = ours.partition(|(_, c)| self.made_in(c, view));
-        let mut out: Vec<(usize, Span)> =
-            made.into_iter().map(|(i, c)| (i, (c.side, c.start, c.end))).collect();
-        if !others.is_empty() {
-            let (old, new) = match view {
-                View::Diff => self.content_sides(path).unwrap_or_default(),
-                View::File => {
-                    (String::new(), worktree_content(&self.repo, path).unwrap_or_default())
-                }
-            };
-            let (old, new) = (crate::anchor::lines(&old), crate::anchor::lines(&new));
-            let placed = others
-                .into_iter()
-                .filter_map(|(i, c)| self.locate_in(i, c, &new, &old).map(|(span, _)| (i, span)));
-            out.extend(placed);
+        let ours: Vec<(usize, &Comment)> = (self.store.iter().enumerate())
+            .filter(|&(i, c)| c.file == path && self.store.thread(i).is_none_or(|t| !t.resolved))
+            .collect();
+        if ours.is_empty() {
+            return Vec::new();
         }
-        out
+        let (old, new) = match view {
+            View::Diff => self.content_sides(path).unwrap_or_default(),
+            View::File => (String::new(), worktree_content(&self.repo, path).unwrap_or_default()),
+        };
+        let (old, new) = (crate::anchor::lines(&old), crate::anchor::lines(&new));
+        let shown = |(i, c): (usize, &Comment)| {
+            // Its own view shows it on its lines, while its side holds them.
+            if self.made_in(i, c, view) && !self.side_gone_in(c, view) {
+                let side = if c.side == Side::New { &new } else { &old };
+                return (c.start >= 1 && c.end as usize <= side.len())
+                    .then_some((i, (c.side, c.start, c.end)));
+            }
+            self.locate_in(i, c, &new, &old).map(|(span, _)| (i, span))
+        };
+        ours.into_iter().filter_map(shown).collect()
     }
 
     /// `path`'s sides from the landed build's record: a notice, or one `git diff` of the scope's ends.
@@ -2443,6 +2516,10 @@ impl App {
             self.view_reload_held = false;
             // The held reload's rebuild revalidates a just-settled span against its text.
             self.reload_open_view();
+            // A comment saved meanwhile reads its file as it is now, open or not.
+            let full = crate::world::Refresh::Full;
+            let probed = crate::world::probe(&self.repo, &self.repos, &self.probe_paths(), &full);
+            self.land_probes(probed);
         }
         if !self.held_rewrites.is_empty() && !self.view_frozen() {
             let held = std::mem::take(&mut self.held_rewrites);
@@ -3469,6 +3546,9 @@ impl App {
         std::mem::swap(&mut self.select_anchor, &mut self.stash.select_anchor);
         std::mem::swap(&mut self.rendered, &mut self.stash.rendered);
         std::mem::swap(&mut self.comment_target, &mut self.stash.comment_target);
+        // A comment made before the tab's refresh lands counts in its own file's text.
+        std::mem::swap(&mut self.open_text, &mut self.stash.open_text);
+        std::mem::swap(&mut self.placed, &mut self.stash.placed);
         std::mem::swap(&mut self.tab_visited, &mut self.stash.visited);
     }
 
@@ -3921,13 +4001,12 @@ impl App {
         target: usize,
         surface: crate::selection::Surface,
     ) -> u8 {
-        const WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
         let now = std::time::Instant::now();
         let count = match self.last_click {
             Some(last)
                 if (last.col, last.row, last.target, last.surface)
                     == (col, row, target, surface)
-                    && now.duration_since(last.at) < WINDOW =>
+                    && now.duration_since(last.at) < CLICK_WINDOW =>
             {
                 (last.count + 1).min(3)
             }
@@ -3935,6 +4014,23 @@ impl App {
         };
         self.last_click = Some(LastClick { at: now, col, row, target, count, surface });
         count
+    }
+
+    /// A click at `(col, row)` picked in a picker and closed it: the rest of its double-click
+    /// goes nowhere, never into what the picker uncovered.
+    pub fn guard_picked_click(&mut self, col: u16, row: u16) {
+        self.picked_click = Some((col, row, Instant::now() + CLICK_WINDOW));
+    }
+
+    /// Whether a left-button event at `(col, row)` is the rest of a picking double-click.
+    pub fn swallows_click(&mut self, col: u16, row: u16) -> bool {
+        match self.picked_click {
+            Some((c, r, until)) if (c, r) == (col, row) && Instant::now() < until => true,
+            _ => {
+                self.picked_click = None;
+                false
+            }
+        }
     }
 
     /// Start a gutter comment gesture on `row`.
@@ -4033,7 +4129,7 @@ impl App {
     fn list_comment_editable(&self) -> bool {
         self.mode == Mode::List
             && self.store.get(self.list_cursor).is_some_and(|c| {
-                self.rev_is_current(c) || self.view_span(self.list_cursor).is_some()
+                self.counts_here(self.list_cursor, c) || self.view_span(self.list_cursor).is_some()
             })
     }
 
@@ -4140,7 +4236,18 @@ impl App {
         let resolved = !thread.resolved;
         self.store.set_resolved(i, resolved);
         self.status = format!("#{number} {}", if resolved { "resolved" } else { "reopened" });
-        self.refresh_rendered();
+        self.rebuild_for_threads();
+    }
+
+    /// Rebuild the rows once a thread opened or closed, so a reopened card leaves its fold; a
+    /// frozen view owes it.
+    fn rebuild_for_threads(&mut self) {
+        if self.view_frozen() {
+            self.view_reload_held = true;
+        } else {
+            self.rebuild_visible();
+            self.settle_read();
+        }
     }
 
     /// The agent's name: as herdr knows the pane it wrote from, else the last send's, else none.
@@ -4248,11 +4355,15 @@ impl App {
         logln!("agent comment #{number} on {file}:{start}");
         let key = self.keymap().hint(crate::keymap::Action::NextAnswer).label();
         self.status = format!("{name} commented on {file}:{start} · {key} goes there");
-        // An open file shows it at once, a fold holding it opened.
-        if self.diff_path.as_deref() == Some(file.as_str()) && !self.view_frozen() {
-            self.place_foreign();
-            self.rebuild_visible();
-            self.settle_read();
+        // An open file shows it at once, a fold holding it opened; a frozen one once it thaws.
+        if self.diff_path.as_deref() == Some(file.as_str()) {
+            if self.view_frozen() {
+                self.view_reload_held = true;
+            } else {
+                self.place_foreign();
+                self.rebuild_visible();
+                self.settle_read();
+            }
         }
         Ok(number)
     }
@@ -4649,7 +4760,8 @@ impl App {
             self.store.reply(i, reply);
             self.status = format!("reply to #{number} waits for the next send");
             self.leave_compose();
-            self.refresh_rendered();
+            // A reply reopens a resolved thread, whose card must leave its fold.
+            self.rebuild_for_threads();
             return;
         }
         match editing {
@@ -4665,7 +4777,11 @@ impl App {
                         Side::New => self.open_text.new.clone(),
                         Side::Old => self.open_text.old.clone(),
                     };
+                    let worktree_base = c.side == Side::Old && c.rev == Rev::Worktree;
                     let i = self.store.add_on(c, &side);
+                    if worktree_base {
+                        self.store.set_base(i, self.scope);
+                    }
                     self.target_comment_card(i);
                     self.status = "comment added".to_string();
                 }
@@ -4770,6 +4886,25 @@ impl App {
     }
 
     /// The composer's `path:line`, while composing.
+    /// The comment the box answers or edits, while it does.
+    #[must_use]
+    pub fn composing_target(&self) -> Option<usize> {
+        match self.mode {
+            Mode::Composing { editing: Some(i) } => Some(i),
+            Mode::Composing { editing: None } => {
+                self.reply_to.and_then(|id| self.store.index_of(id))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the box answers or edits a comment the open view shows no card for: it opens over
+    /// the body then, under its thread, never spliced into a file it isn't in.
+    #[must_use]
+    pub fn composing_aside(&self) -> bool {
+        self.composing_target().is_some_and(|i| !self.card_rows().iter().any(|&(_, ci)| ci == i))
+    }
+
     pub fn pending_location(&self) -> Option<String> {
         if let Some(i) = self.reply_to.and_then(|id| self.store.index_of(id)) {
             return self.store.get(i).map(Comment::location);
@@ -4804,14 +4939,21 @@ impl App {
         }
     }
 
-    /// Whether `c` belongs to this view: its kind matches, and a diff comment's `rev` is current.
-    fn comment_in_view(&self, c: &Comment) -> bool {
-        self.made_in(c, self.diff.view)
+    /// Whether comment `i` belongs to this view: its kind matches, and a diff comment's `rev` is
+    /// current.
+    fn comment_in_view(&self, i: usize, c: &Comment) -> bool {
+        self.made_in(i, c, self.diff.view)
     }
 
-    /// Whether `c` was made in a `view` of this scope: the one view whose text it follows.
-    fn made_in(&self, c: &Comment, view: View) -> bool {
-        c.diff_anchored == (view == View::Diff) && self.rev_is_current(c)
+    /// Whether comment `i` was made in a `view` of this scope: the one view whose text it follows.
+    fn made_in(&self, i: usize, c: &Comment, view: View) -> bool {
+        c.diff_anchored == (view == View::Diff) && self.counts_here(i, c)
+    }
+
+    /// Whether comment `i` counts in this scope's text: its `rev` current, a removed line's base ours.
+    fn counts_here(&self, i: usize, c: &Comment) -> bool {
+        self.rev_is_current(c)
+            && (c.side == Side::New || self.store.base(i).is_none_or(|b| b == self.scope))
     }
 
     /// Whether the scope reads the diff `c` was made on.
@@ -4834,7 +4976,7 @@ impl App {
         if let Some(&(span, _)) = self.placed.get(&self.store.id(i)?) {
             return Some(span);
         }
-        self.comment_in_view(c).then_some((c.side, c.start, c.end))
+        self.comment_in_view(i, c).then_some((c.side, c.start, c.end))
     }
 
     /// Where comment `i`'s card sits in the open view, and what its title says of the view.
@@ -4844,12 +4986,14 @@ impl App {
         let (side, start, end) = self.view_span(i)?;
         // The File view reads the worktree, a diff its scope's new side.
         let shown = if self.diff.view == View::Diff { self.rev_of(&c.file) } else { Rev::Worktree };
+        let base = self.store.base(i).filter(|&b| b != self.scope && self.diff.view == View::Diff);
         let from = match &c.rev {
-            rev if *rev == shown => None,
+            // A removed line made against another scope's base names that scope.
+            rev if *rev == shown => base.map(|b| b.label().to_string()),
             Rev::Worktree => Some("the worktree".to_string()),
             Rev::Commit(pick) => Some(pick.label()),
         };
-        let native = self.comment_in_view(c);
+        let native = self.comment_in_view(i, c);
         let placed = self.store.id(i).and_then(|id| self.placed.get(&id));
         let changed = placed.map_or(native && self.store.changed(i), |&(_, changed)| changed);
         Some(CardPlace { side, start, end, native, changed, from })
@@ -5068,8 +5212,10 @@ impl App {
         self.open_file_by_path(&path);
         let cards = self.card_rows();
         let card = if dir >= 0 { cards.iter().min() } else { cards.iter().max() };
-        let Some(&(_, ci)) = card else { return false };
-        self.land_on_comment(ci);
+        // Moved on, it lands on a card, never on the stops of the file it left.
+        if let Some(&(_, ci)) = card {
+            self.land_on_comment(ci);
+        }
         true
     }
 
@@ -5142,19 +5288,36 @@ impl App {
     /// Whether opening `path` here shows a thread whose answer is unread, which its file row marks.
     #[must_use]
     pub fn has_new_answer(&self, path: &str) -> bool {
+        self.settle_answers();
+        self.answer_marked(path)
+    }
+
+    /// [`Self::has_new_answer`] as a paint reads it: the open file by its rows on screen, the
+    /// others as last settled, never running git.
+    #[must_use]
+    pub fn answer_marked(&self, path: &str) -> bool {
+        let waiting = |i: usize| self.store.thread(i).is_some_and(|t| t.unread && !t.resolved);
+        if self.diff_path.as_deref() == Some(path) {
+            return self.spans_shown().iter().any(|&(i, _)| waiting(i));
+        }
+        self.answer_files.borrow().as_ref().is_some_and(|(_, files)| files.contains(path))
+    }
+
+    /// Read again which files' opening shows a new answer, once the threads or the build changed:
+    /// between frames, as a file's diff is read, never in a paint.
+    pub fn settle_answers(&self) {
         let key = AnswerKey {
             revision: self.store.revision(),
             epoch: self.view_epoch,
             tab: self.tab,
             scope: self.scope,
             picks: self.commit_picks.clone(),
-            open: self.diff_path.clone(),
         };
-        let mut memo = self.answer_files.borrow_mut();
-        if memo.as_ref().is_none_or(|(at, _)| *at != key) {
-            *memo = Some((key, self.read_answer_files()));
+        if self.answer_files.borrow().as_ref().is_some_and(|(at, _)| *at == key) {
+            return;
         }
-        memo.as_ref().is_some_and(|(_, files)| files.contains(path))
+        let files = self.read_answer_files();
+        *self.answer_files.borrow_mut() = Some((key, files));
     }
 
     /// The files whose opening shows a thread with an unread answer, wherever it was made.
@@ -5164,7 +5327,7 @@ impl App {
             .filter(|&(i, _)| waiting(i))
             .map(|(_, c)| c.file.as_str())
             .collect();
-        let shown = |path: &&str| self.spans_in(path).iter().any(|&(i, _)| waiting(i));
+        let shown = |path: &&str| self.spans_read(path).iter().any(|&(i, _)| waiting(i));
         files.into_iter().filter(shown).map(str::to_string).collect()
     }
 
@@ -5820,7 +5983,11 @@ impl App {
         if self.store.unread() > 0 {
             out.push((A::NextAnswer, Send));
         }
-        if !self.suggestions.is_empty() && self.tab.is_file_tab() {
+        // One `G`, which a gone pick may already lead with.
+        if !self.suggestions.is_empty()
+            && self.tab.is_file_tab()
+            && !out.iter().any(|&(a, _)| a == A::CommitPick)
+        {
             out.push((A::CommitPick, Send));
         }
 
@@ -6171,7 +6338,11 @@ impl App {
             return;
         }
         let listed = if self.repos.is_folder() {
-            self.list_folder_commit_rows()
+            let (picker, failed) = self.list_folder_commit_rows();
+            if let Some(failed) = failed {
+                self.status = format!("could not list {failed}");
+            }
+            Ok(picker)
         } else {
             self.list_commit_rows()
         };
@@ -6182,25 +6353,28 @@ impl App {
                 return;
             }
         };
+        // A suggestion opens only whole: one the list lacks any of can never open, so it goes.
+        let whole = |s: &Suggestion| match s.picks.get("") {
+            Some(p) if !picker.is_folder() => picker.wholly_lists(p),
+            _ => picker.is_folder() && s.picks.iter().all(|(r, p)| picker.run_rows(r, p).is_some()),
+        };
+        let mut dropped = 0;
+        while self.suggestions.front().is_some_and(|s| !whole(s)) {
+            self.suggestions.pop_front();
+            dropped += 1;
+        }
+        if dropped > 0 {
+            let noun = if dropped == 1 { "suggestion" } else { "suggestions" };
+            self.status = format!("{dropped} {noun} no longer in the list, dropped");
+        }
         // The first suggestion waiting opens as the selection, its reason the title.
-        let suggested = self.suggestions.front().filter(|s| {
-            let listed = |(repo, p): (&String, &CommitPick)| {
-                (0..picker.rows.len())
-                    .any(|i| picker.repo_of(i) == repo && picker.runs_through(i, p))
-            };
-            match s.picks.get("") {
-                Some(p) if !picker.is_folder() => picker.wholly_lists(p),
-                _ => picker.is_folder() && s.picks.iter().any(listed),
-            }
-        });
+        let suggested = self.suggestions.front();
         if let Some(s) = suggested {
             picker.title = match self.suggestions.len() {
                 1 => format!("{} suggests: {}", s.agent, s.why),
                 n => format!("{} suggests (1 of {n}): {}", s.agent, s.why),
             };
             picker.suggested = true;
-        } else if !self.suggestions.is_empty() {
-            self.status = "the suggested commits are not in the list".to_string();
         }
         let picks = suggested.map_or(&self.commit_picks, |s| &s.picks);
         if picker.is_folder() {
@@ -6274,7 +6448,7 @@ impl App {
     }
 
     /// A folder's picker: every repository's commits over its base, newest first, by repository.
-    fn list_folder_commit_rows(&self) -> Result<CommitPicker, String> {
+    fn list_folder_commit_rows(&self) -> (CommitPicker, Option<String>) {
         let names = self.repos.names();
         // In `branch` the view's landed merge bases list the rows; a repository it missed resolves.
         let landed: HashMap<&str, Option<&str>> = if self.scope == Scope::Branch {
@@ -6302,9 +6476,14 @@ impl App {
             }
             git::list_commits(&dir, Some(&mb)).map_err(|e| e.to_string())
         });
-        let mut lists = Vec::new();
+        // A repository that can't list keeps none of the others shut; the status names it.
+        let (mut lists, mut failed) = (Vec::new(), None);
         for (name, listed) in names.iter().zip(listed) {
-            lists.push(listed.map_err(|e| format!("{name}: {e}"))?.into_iter().peekable());
+            let rows = listed.unwrap_or_else(|e| {
+                failed.get_or_insert_with(|| format!("{name}: {e}"));
+                Vec::new()
+            });
+            lists.push(rows.into_iter().peekable());
         }
         let count = lists.iter().filter(|l| l.len() > 0).count();
         // Newest first across the repositories, each one's own order kept: a pick's run needs it.
@@ -6321,7 +6500,7 @@ impl App {
         let empty = "no repo has commits over its base".to_string();
         let (repos, rows): (Vec<String>, Vec<git::CommitRow>) = rows.into_iter().unzip();
         let (head, checked) = (None, BTreeSet::new());
-        Ok(CommitPicker {
+        let picker = CommitPicker {
             rows,
             pick_row: None,
             cursor: 0,
@@ -6333,7 +6512,8 @@ impl App {
             checked,
             suggested: false,
             opened_on: false,
-        })
+        };
+        (picker, failed)
     }
 
     /// Close the commit picker; the scope stays.
@@ -6398,10 +6578,13 @@ impl App {
         if picks.is_empty() {
             return Ok(());
         }
+        let answers = self.commit_picker.as_ref().is_some_and(|cp| cp.suggested);
         self.close_commit_picker();
         self.commit_picks = picks;
-        // Any pick answers the first suggestion; the next waits for `G`.
-        self.suggestions.pop_front();
+        // Any pick from a picker that showed the first suggestion answers it; the next waits for `G`.
+        if answers {
+            self.suggestions.pop_front();
+        }
         // The old status describes the old shas.
         self.pick_status = None;
         // The pick is world input, so a build of the old one never lands.
@@ -6436,7 +6619,10 @@ impl App {
                 };
             }
             let sha = &old.list_row(i)?.sha;
-            fresh.index_of(sha)
+            // The pick, gone from the list, stands as the pick row: the highlight stays on it.
+            let as_pick_row =
+                || fresh.pick_row.as_ref().filter(|p| [&p.newest, &p.oldest].contains(&sha));
+            fresh.index_of(sha).or_else(|| as_pick_row().map(|_| 0))
         };
         let last = fresh.len().saturating_sub(1);
         // Identity, then the nearest survivor (above wins a tie), then clamp.
@@ -6456,13 +6642,22 @@ impl App {
             anchor = pick.as_ref().and_then(|p| fresh.index_of(&p.oldest)).filter(|&o| o > cursor);
             opened_on = true;
         }
+        // A suggestion's reason stays the title while the re-listed rows still hold all of it.
+        let whole = self
+            .suggestions
+            .front()
+            .and_then(|s| s.picks.get(""))
+            .is_some_and(|p| fresh.wholly_lists(p));
+        if old.suggested && whole {
+            (fresh.title, fresh.suggested) = (old.title, true);
+        } else if old.suggested {
+            // What it opened on is gone: neither its run nor its reason stands for it any more.
+            (anchor, opened_on) = (None, false);
+            self.status = "the suggested commits left the list".to_string();
+        }
         fresh.cursor = cursor;
         fresh.anchor = anchor;
         fresh.opened_on = opened_on && anchor.is_some();
-        // A suggestion's reason stays the title over the re-listed rows.
-        if old.suggested {
-            (fresh.title, fresh.suggested) = (old.title, true);
-        }
         self.commit_picker = Some(fresh);
     }
 
@@ -7583,6 +7778,46 @@ mod tests {
     /// Git commands the current thread has built so far.
     fn git_commands() -> usize {
         crate::git::GIT_COMMANDS.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn painting_the_file_list_runs_no_git_while_a_new_answer_waits() {
+        let (dir, git) = test_repo();
+        let repo = dir.path();
+        let write = |name: &str, text: &str| std::fs::write(repo.join(name), text).unwrap();
+        write("lib.rs", "fn alpha() {}\nfn bravo() -> u32 { 2 }\n");
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+        write("lib.rs", "fn alpha() {}\nfn bravo() -> u32 { 22 }\n");
+        git(&["commit", "-q", "-am", "Tune bravo"]);
+        let tuned = git(&["rev-parse", "HEAD"]);
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            write(name, "fn x() {}\n");
+        }
+        write("lib.rs", "fn alpha() {}\nfn bravo() -> u32 { 22 }\nfn charlie() {}\n");
+        let mut app = App::new(repo.to_path_buf(), Scope::Uncommitted, None);
+        app.reload().unwrap();
+        // A thread on the commit, then back on the worktree, where the agent answers it.
+        app.commit_picks = Picks::from([(String::new(), CommitPick::single(&tuned))]);
+        app.set_scope(Scope::Commits).unwrap();
+        app.set_diff("lib.rs".to_string());
+        app.focus = crate::Focus::Diff;
+        let added = |v: &Visible| v.row().is_some_and(|r| r.text() == "fn bravo() -> u32 { 22 }");
+        app.diff_cursor = app.visible.iter().position(added).unwrap();
+        app.start_comment();
+        app.input_push('?');
+        app.submit_comment();
+        app.store.mark_sent();
+        app.set_scope(Scope::Uncommitted).unwrap();
+        app.receive_reply(1, "the spec says 22".into(), None);
+        let backend = ratatui::backend::TestBackend::new(140, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            app.set_diff(name.to_string());
+            let before = git_commands();
+            terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+            assert_eq!(git_commands(), before, "a paint with {name} open ran git");
+        }
     }
 
     #[test]

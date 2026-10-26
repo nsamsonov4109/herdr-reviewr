@@ -750,7 +750,11 @@ pub fn land_world_completion(
             app.status = format!("refresh failed: {e}");
             Landing::Failed(completion.refresh)
         }
-        None => Landing::Landed,
+        // Nothing rebuilt, but the files read back still carry their comments.
+        None => {
+            app.land_probes(completion.probed);
+            Landing::Landed
+        }
     }
 }
 
@@ -998,6 +1002,8 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
             }
 
             app.catch_up_held_view();
+            // Which files show a new answer reads their diffs here, between frames, not in a paint.
+            app.settle_answers();
             let size = terminal.size()?;
             let area = Rect::new(0, 0, size.width, size.height);
             // A frame reads the config only when it changed; a hidden pane reads it once shown.
@@ -2529,6 +2535,16 @@ fn dispatch_mouse(
     target: &dyn crate::export::ExportTarget,
 ) -> Result<()> {
     app.hover = Some((m.column, m.row));
+    // The rest of a double-click that picked in a picker goes nowhere.
+    let left = matches!(
+        m.kind,
+        MouseEventKind::Down(MouseButton::Left)
+            | MouseEventKind::Up(MouseButton::Left)
+            | MouseEventKind::Drag(MouseButton::Left)
+    );
+    if left && app.swallows_click(m.column, m.row) {
+        return Ok(());
+    }
     // A click or wheel only answers the quit question; a gesture under way finishes.
     if app.confirming_quit && answers_question(m.kind) {
         app.confirming_quit = false;
@@ -2610,7 +2626,10 @@ fn dispatch_mouse(
             // A click highlights; a click on the highlighted row sends.
             MouseEventKind::Down(MouseButton::Left) if app.mode == Mode::Picker => {
                 match ui::hit_picker_row(area, app, m.column, m.row) {
-                    Some(i) if i == app.picker_cursor => app.picker_pick(),
+                    Some(i) if i == app.picker_cursor => {
+                        app.picker_pick();
+                        app.guard_picked_click(m.column, m.row);
+                    }
                     Some(i) => app.picker_goto(i),
                     None => {}
                 }
@@ -2620,6 +2639,7 @@ fn dispatch_mouse(
                 match ui::hit_base_picker_row(area, app, m.column, m.row) {
                     Some(i) if app.base_picker.as_ref().is_some_and(|bp| bp.cursor == i) => {
                         app.base_picker_pick()?;
+                        app.guard_picked_click(m.column, m.row);
                     }
                     Some(i) => app.base_picker_goto(i),
                     None => {}
@@ -2630,6 +2650,7 @@ fn dispatch_mouse(
                 match ui::hit_commit_picker_row(area, app, m.column, m.row) {
                     Some(i) if app.commit_picker.as_ref().is_some_and(|cp| cp.cursor == i) => {
                         app.commit_picker_pick()?;
+                        app.guard_picked_click(m.column, m.row);
                     }
                     Some(i) => app.commit_picker_goto(i),
                     None => {}

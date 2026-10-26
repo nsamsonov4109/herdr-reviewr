@@ -8365,13 +8365,13 @@ fn a_poll_moves_the_pick_between_the_pick_row_and_the_list() {
     assert_eq!(picker(&app).list_row(picker(&app).cursor).unwrap().sha, shas[2]);
     assert_eq!(picker(&app).list_row(picker(&app).anchor.unwrap()).unwrap().sha, shas[1]);
     assert_eq!(picker(&app).run_len(), 2);
-    // Away again, the pick row returns.
+    // Away again, the pick row returns, and the highlight stays on the pick it stands for.
     r.git(&["reset", "-q", "--hard", &shas[0]]);
     common::land_world(&mut app);
-    assert_eq!(picker(&app).pick_row, Some(run));
-    assert_eq!(picker(&app).list_row(picker(&app).cursor).unwrap().sha, shas[0]);
+    assert_eq!(picker(&app).pick_row, Some(run.clone()));
+    assert!(picker(&app).is_pick_row(picker(&app).cursor), "the reviewer never moved");
     press(&mut app, &keymap, KeyCode::Enter);
-    assert_eq!(app.commit_pick().map(|p| p.newest.as_str()), Some(shas[0].as_str()));
+    assert_eq!(app.commit_pick().cloned(), Some(run));
 }
 
 #[test]

@@ -108,15 +108,20 @@ fn printable(text: &str) -> String {
 /// Comment text without blank lines, the separator between comments, but those in a code fence.
 fn normalize_text(text: &str) -> String {
     let text = printable(&text.replace('\r', ""));
-    let mut fence: Option<&str> = None;
+    // The open fence's character and length: only a bare run of it, as long or longer, closes it.
+    let mut fence: Option<(char, usize)> = None;
     let mut kept = Vec::new();
     for line in text.lines().map(str::trim_end) {
-        let marker = ["```", "~~~"].into_iter().find(|m| line.trim_start().starts_with(m));
-        match (fence, marker) {
-            (None, Some(m)) => fence = Some(m),
-            (Some(open), Some(m)) if open == m => fence = None,
-            (None, _) if line.is_empty() => continue,
-            _ => {}
+        let body = line.trim_start();
+        let run = |c: char| body.chars().take_while(|&x| x == c).count();
+        match fence {
+            None => match ['`', '~'].into_iter().find(|&c| run(c) >= 3) {
+                Some(c) => fence = Some((c, run(c))),
+                None if line.is_empty() => continue,
+                None => {}
+            },
+            Some((c, open)) if run(c) >= open && run(c) == body.chars().count() => fence = None,
+            Some(_) => {}
         }
         kept.push(line);
     }

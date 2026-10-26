@@ -474,12 +474,21 @@ fn resolve_commits(root: &Path, specs: &[String]) -> Result<crate::model::Picks,
         });
         let hits: Vec<(&str, Option<(String, String)>)> =
             names.iter().zip(found).filter_map(|(name, f)| Some((name.as_str(), f?))).collect();
-        match hits.as_slice() {
-            [] if repos.is_folder() => return Err(format!("no repository here has {spec}")),
-            [] => return Err(format!("no commit {spec} here")),
-            [(_, None)] => return Err(format!("{spec} names no commits")),
-            [(name, Some((a, b)))] => ends.entry(name).or_default().extend([a.clone(), b.clone()]),
-            many => {
+        // A range empty in a repository names nothing there.
+        let holding: Vec<(&str, (String, String))> =
+            hits.iter().filter_map(|(name, run)| Some((*name, run.clone()?))).collect();
+        // Worktrees of one clone share its commits: the one whose HEAD holds them names them.
+        let reached: Vec<(&str, (String, String))> = (holding.iter())
+            .filter(|(name, (_, newest))| crate::git::is_reachable(&root.join(name), newest))
+            .cloned()
+            .collect();
+        let holding = if holding.len() > 1 && !reached.is_empty() { reached } else { holding };
+        match (hits.as_slice(), holding.as_slice()) {
+            ([], _) if repos.is_folder() => return Err(format!("no repository here has {spec}")),
+            ([], _) => return Err(format!("no commit {spec} here")),
+            (_, []) => return Err(format!("{spec} names no commits")),
+            (_, [(name, (a, b))]) => ends.entry(name).or_default().extend([a.clone(), b.clone()]),
+            (_, many) => {
                 let names: Vec<&str> = many.iter().map(|(name, _)| *name).collect();
                 return Err(format!("{spec} names commits in {}: give its sha", names.join(", ")));
             }
@@ -706,6 +715,29 @@ mod tests {
                 git(&["rev-parse", "HEAD"])
             })
             .collect()
+    }
+
+    #[test]
+    fn a_commit_the_worktrees_of_one_clone_share_is_the_one_whose_head_holds_it() {
+        use crate::model::{CommitPick, Picks};
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let main = root.join("main");
+        repo_with(&main, 1);
+        let feature = root.join("feature");
+        let git = |at: &std::path::Path, list: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(at).args(list).output();
+            let out = out.unwrap();
+            assert!(out.status.success(), "git {list:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&main, &["worktree", "add", "-q", "-b", "feature", feature.to_str().unwrap()]);
+        std::fs::write(feature.join("a.txt"), "feature\n").unwrap();
+        git(&feature, &["commit", "-qam", "feature work"]);
+        let sha = git(&feature, &["rev-parse", "HEAD"]);
+        // Both worktrees read the shared object store; only `feature`'s branch holds the commit.
+        let picks = super::resolve_commits(&root, std::slice::from_ref(&sha));
+        assert_eq!(picks, Ok(Picks::from([("feature".into(), CommitPick::single(&sha))])));
     }
 
     #[test]

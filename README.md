@@ -188,8 +188,9 @@ file shows the thread. `A` goes to the next one, across files, and `n` / `N` ste
 comment the same way. An answer no file in the view shows, like one on a commit the view doesn't
 hold, opens the comments list (`l`) on its thread, which reads under the list's rows.
 
-`a` replies in a thread, and the next `s` sends your reply with any new comments. A sent comment
-isn't edited: you reply instead. `D` resolves a thread, taking it out of the diff. It stays in
+`a` replies in a thread, and the next `s` sends your reply with any new comments. A reply to a
+thread the open file doesn't show opens over the body, under its thread. A sent comment isn't
+edited: you reply instead. `D` resolves a thread, taking it out of the diff. It stays in
 the comments list (`l`), greyed, where `D` reopens it. Threads live in the pane, like comments,
 and end when it closes.
 
@@ -204,13 +205,15 @@ lines from the text the comment was made on, so an amended or rebased commit kee
 line, and where that line was rewritten the card says `code changed`. A view that lost the
 lines leaves it to the comments list. Shown from another version, its
 title says so, `from 1a2b3c4` or `from the worktree`, and a send names the commit a comment was
-made on.
+made on. A comment on a removed line counts in the base of the scope it was made in: another
+scope shows it where its own base reads the line, `from branch` say, and never moves it.
 
 When the agent rewrites the branch, as a rebase or an amend does, a comment made on one of its
 commits moves to what the rewrite made of that commit: the commit with the same subject, or,
 where several share it, the one `git range-diff` pairs it with. There it follows its lines, or
-sits where they were with `code changed`, and a send names the new commit. A comment on a commit
-the rewrite dropped or renamed stays where it was.
+sits where they were with `code changed`, and a send names the new commit and its line there. A
+comment on a commit the rewrite dropped or renamed stays where it was, and so does one on a
+commit another branch still holds: checking out a branch rewrites nothing.
 
 The agent can comment too, on any line of the review, and each send tells it how:
 
@@ -231,9 +234,11 @@ herdr-reviewr --suggest 1a2b3c4,5d6e7f8 "The retry step, in both repos."
 
 Nothing moves: the footer offers `G suggested commits`, and `G` opens the commit picker with
 them selected and the agent's reason as its title, so `enter` takes them. Move the highlight
-first and the selection goes: `enter` takes the commit you moved to. Your next pick, whichever
-it is, answers the suggestion. A review in steps arrives as one suggestion per step, and they wait in the order
-sent: `G` opens the first, titled `(1 of 3)`, and each pick moves on to the next. In the
+first and the selection goes: `enter` takes the commit you moved to. A pick from the picker
+the suggestion opened, whichever commit it takes, answers it. A review in steps arrives as one
+suggestion per step, and they wait in the order sent: `G` opens the first, titled `(1 of 3)`,
+and each pick moves on to the next. A suggestion the list no longer holds whole, as after a
+rebase, gives way to the next when `G` opens, and the status says so. In the
 agent's tab, these commands find the pane without `--to`, and `herdr-reviewr --help` lists all
 three.
 

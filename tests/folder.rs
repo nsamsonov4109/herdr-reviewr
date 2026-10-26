@@ -388,6 +388,7 @@ fn the_commit_picker_lists_every_repositorys_commits_and_picks_a_step_in_each() 
 
 /// The frame's rows as text, and its footer: the last row with any.
 fn painted(app: &App) -> (Vec<String>, String) {
+    app.settle_answers();
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
     terminal.draw(|f| herdr_reviewr::ui::render(f, app)).unwrap();
     let buf = terminal.backend().buffer();

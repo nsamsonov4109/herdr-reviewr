@@ -47,6 +47,8 @@ fn render_at(app: &App, width: u16) -> String {
 }
 
 fn render_size(app: &App, width: u16, height: u16) -> Buffer {
+    // As the event loop does between frames, so the frame paints settled answer marks.
+    app.settle_answers();
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal.draw(|f| ui::render(f, app)).unwrap();
     terminal.backend().buffer().clone()

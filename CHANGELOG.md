@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **Comments keep their lines through a passing state**: a `git stash` and `pop`, or a file emptied and written again, left a comment a line off and `code changed`. It now finds its lines again from the last text they read in.
+- **A comment on a removed line keeps its line in every scope**: a look at another scope, whose base lacks the line, moved it for good. It counts in the base of the scope it was made in, and another scope shows it without moving it, `from branch` say.
+- **Worktree comments follow the agent's edits while you review a commit**, where they waited until the file was opened in a worktree scope. A draft whose line the agent reverted as you typed goes out marked `code changed`.
+- **Rebases**: a comment a rebase moved names its line in the new commit at once, not its line in the old one. A branch switch no longer counts as a rewrite, so a comment never moves to another branch's commit of the same subject. Rewrites of a repository's first commit, and rebases over a `main` that moved a long way, are followed too.
+- **The new-answer dot, `A` and `n` count only threads with a line on screen**: a file deleted or emptied under its thread no longer wears the dot, `A` opens the comments list on such a thread, and `n` never leaves the cursor in a file that shows none. Painting the file list never runs git.
+- **An agent's comment landing while you type, or with a popup open**, shows once it closes, its fold opened, where it stayed hidden. A thread reopened by `D` or a reply brings its card back out of a fold.
+- **A reply started from the comments list** to a thread the open file doesn't show opens over the body, under the thread, where its box was invisible.
+- **A comment made right after switching tabs** holds its own file's lines, where it could take the other tab's and read `code changed` at once.
+- **Sends keep the blank lines of a fence that holds another fence.**
+- **A commented symlink** reads as the path it names when a refresh reads it back, as its diff does, where a refresh marked its comment `code changed`.
+- **The commit picker**: a double-click on the highlighted row picks and goes no further, where its second click reached the view below and could open a comment box. A folder suggestion opens only whole, never as the part of it the list holds. Only a picker that showed a suggestion answers it, and one the list no longer holds gives way to the next. While the picker is open, a refresh keeps the highlight on the pick as it becomes the pick row, and lets go of a suggestion whose commits it lost. One repository that can't list keeps the folder picker open for the others. `G` shows once in the footer.
+- **`--suggest` in a folder of one clone's worktrees** names the worktree whose branch holds the commit, where every commit was ambiguous, and a range empty everywhere names no commits instead of listing repositories.
+
 ## [0.49.1] — 2026-10-26
 
 ### Added

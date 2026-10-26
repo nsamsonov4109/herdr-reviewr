@@ -254,6 +254,10 @@ struct Anchor {
     held: Vec<String>,
     /// The lines under it no longer read as `held`.
     changed: bool,
+    /// The last text its lines read as `held` in, and where: what it is found from again.
+    found: Option<(u64, u32, u32)>,
+    /// The scope whose base a removed line counts in: each worktree scope diffs against its own.
+    base: Option<Scope>,
 }
 
 /// The session's comments, each with an id never reused, so a reference never lands on another.
@@ -300,7 +304,7 @@ impl CommentStore {
     /// Append a comment, its lines read from its snippet; returns its index.
     pub fn add(&mut self, comment: Comment) -> usize {
         let held = snippet_side(&comment);
-        self.anchors.push(Anchor { version: None, held, changed: false });
+        self.anchors.push(Anchor { version: None, held, changed: false, found: None, base: None });
         self.items.push(comment);
         self.ids.push(self.next_id);
         self.threads.push(None);
@@ -318,7 +322,10 @@ impl CommentStore {
         if let Some(held) = held {
             let version = crate::anchor::version(&lines);
             self.texts.entry(version).or_insert_with(|| text.into());
-            self.anchors[i] = Anchor { version: Some(version), held, changed: false };
+            let (start, end) = (self.items[i].start, self.items[i].end);
+            let found = Some((version, start, end));
+            self.anchors[i] =
+                Anchor { version: Some(version), held, changed: false, found, base: None };
         }
         i
     }
@@ -364,16 +371,29 @@ impl CommentStore {
         self.anchors.get(index).map_or(&[], |a| a.held.as_slice())
     }
 
-    /// The text comment `index`'s line numbers count in, while the store holds it.
-    pub fn counted_in(&self, index: usize) -> Option<&str> {
-        let version = self.anchors.get(index)?.version?;
-        self.texts.get(&version).map(|text| &**text)
+    /// Count removed-line comment `index` in `scope`'s base, the one its view diffs against.
+    pub fn set_base(&mut self, index: usize, scope: Scope) {
+        if let Some(anchor) = self.anchors.get_mut(index) {
+            anchor.base = Some(scope);
+        }
     }
 
-    /// Carry the comments `wants` picks into `text`, their side as it reads now; whether any moved.
-    pub fn follow(&mut self, wants: impl Fn(&Comment) -> bool, text: &str) -> bool {
+    /// The scope whose base removed-line comment `index` counts in, when one does.
+    pub fn base(&self, index: usize) -> Option<Scope> {
+        self.anchors.get(index)?.base
+    }
+
+    /// The last text comment `index`'s lines read as made in, and where they sat there.
+    pub fn found_in(&self, index: usize) -> Option<(&str, u32, u32)> {
+        let (version, start, end) = self.anchors.get(index)?.found?;
+        self.texts.get(&version).map(|text| (&**text, start, end))
+    }
+
+    /// Carry the comments `wants` picks, by comment and base, into `text`, their side as it reads
+    /// now; whether any moved.
+    pub fn follow(&mut self, wants: impl Fn(&Comment, Option<Scope>) -> bool, text: &str) -> bool {
         // Most files hold no comment: they cost no read of their text.
-        if !self.items.iter().any(&wants) {
+        if !self.items.iter().zip(&self.anchors).any(|(c, a)| wants(c, a.base)) {
             return false;
         }
         let now = crate::anchor::lines(text);
@@ -381,17 +401,24 @@ impl CommentStore {
         let mut befores: HashMap<u64, Vec<&str>> = HashMap::new();
         let (mut moved, mut placed_any) = (false, false);
         for (c, anchor) in self.items.iter_mut().zip(&mut self.anchors) {
-            if !wants(c) || anchor.version == Some(version) {
+            if !wants(c, anchor.base) || anchor.version == Some(version) {
                 continue;
             }
-            let before = anchor.version.and_then(|v| {
+            // From the last text its lines read in, so a passing state without them leaves no mark.
+            let (from, start, end) = match anchor.found {
+                Some((v, start, end)) => (Some(v), start, end),
+                None => (anchor.version, c.start, c.end),
+            };
+            let before = from.and_then(|v| {
                 let text = self.texts.get(&v)?;
                 Some(befores.entry(v).or_insert_with(|| crate::anchor::lines(text)).clone())
             });
-            let placed =
-                crate::anchor::follow(&anchor.held, c.start, c.end, before.as_deref(), &now);
+            let placed = crate::anchor::follow(&anchor.held, start, end, before.as_deref(), &now);
             moved |= (placed.start, placed.end, placed.changed) != (c.start, c.end, anchor.changed);
             (c.start, c.end, anchor.changed) = (placed.start, placed.end, placed.changed);
+            if !placed.changed {
+                anchor.found = Some((version, placed.start, placed.end));
+            }
             anchor.version = Some(version);
             placed_any = true;
         }
@@ -405,7 +432,9 @@ impl CommentStore {
 
     /// Drop every text no comment counts its lines in any more.
     fn prune_texts(&mut self) {
-        let used: HashSet<u64> = self.anchors.iter().filter_map(|a| a.version).collect();
+        let found = self.anchors.iter().filter_map(|a| a.found.map(|(v, ..)| v));
+        let used: HashSet<u64> =
+            self.anchors.iter().filter_map(|a| a.version).chain(found).collect();
         self.texts.retain(|v, _| used.contains(v));
     }
 
