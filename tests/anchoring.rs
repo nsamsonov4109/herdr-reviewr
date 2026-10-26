@@ -61,7 +61,9 @@ fn a_stash_round_trip_leaves_a_comment_on_its_line() {
     common::land_world(&mut app);
     r.git(&["stash", "pop", "-q"]);
     common::land_world(&mut app);
-    assert_eq!(std::fs::read_to_string(r.path().join("lib.rs")).unwrap(), edited);
+    // Git's own line endings may come back (Windows' `core.autocrlf`): the lines are the same.
+    let popped = std::fs::read_to_string(r.path().join("lib.rs")).unwrap();
+    assert_eq!(popped.replace("\r\n", "\n"), edited);
     open(&mut app, "lib.rs");
     assert_eq!(place(&app), (Side::New, 3, false), "the file is byte for byte what it was");
     let location = app.store.get(0).unwrap().location();
