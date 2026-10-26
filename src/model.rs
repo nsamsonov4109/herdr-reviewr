@@ -52,7 +52,7 @@ impl Scope {
 }
 
 /// The `commits` pick: the run `oldest..=newest`, full ids, equal for a run of one.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct CommitPick {
     pub oldest: String,
     pub newest: String,
@@ -267,6 +267,8 @@ pub struct CommentStore {
     /// The texts comments last placed themselves in, by version, while one still counts in it.
     texts: HashMap<u64, Arc<str>>,
     next_id: u64,
+    /// Bumped by every change, so what is derived from the comments knows when to derive again.
+    revision: u64,
 }
 
 impl CommentStore {
@@ -290,6 +292,11 @@ impl CommentStore {
         self.items.get(index)
     }
 
+    /// How many changes the store has seen: equal counts read the same comments.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// Append a comment, its lines read from its snippet; returns its index.
     pub fn add(&mut self, comment: Comment) -> usize {
         let held = snippet_side(&comment);
@@ -298,6 +305,7 @@ impl CommentStore {
         self.ids.push(self.next_id);
         self.threads.push(None);
         self.next_id += 1;
+        self.revision += 1;
         self.items.len() - 1
     }
 
@@ -320,6 +328,7 @@ impl CommentStore {
         let i = self.add_on(comment, text);
         let opener = Author::Agent(name);
         self.threads[i] = Some(Thread { opener, unread: true, ..Thread::default() });
+        self.revision += 1;
         i
     }
 
@@ -330,6 +339,18 @@ impl CommentStore {
             c.file = to.to_string();
             moved += 1;
         }
+        self.revision += u64::from(moved > 0);
+        moved
+    }
+
+    /// Move the comments `wants` picks to `rev`, what a rewrite made of theirs; how many moved.
+    pub fn rehome(&mut self, wants: impl Fn(&Comment) -> bool, rev: &Rev) -> usize {
+        let mut moved = 0;
+        for c in self.items.iter_mut().filter(|c| wants(c) && c.rev != *rev) {
+            c.rev = rev.clone();
+            moved += 1;
+        }
+        self.revision += u64::from(moved > 0);
         moved
     }
 
@@ -377,6 +398,7 @@ impl CommentStore {
         if placed_any {
             self.texts.entry(version).or_insert_with(|| text.into());
             self.prune_texts();
+            self.revision += 1;
         }
         moved
     }
@@ -423,6 +445,7 @@ impl CommentStore {
 
     /// A send delivered everything unsent: drafts open threads, replies count as sent.
     pub fn mark_sent(&mut self) {
+        self.revision += 1;
         for thread in &mut self.threads {
             let thread = thread.get_or_insert_with(Thread::default);
             for reply in &mut thread.replies {
@@ -440,6 +463,7 @@ impl CommentStore {
                 thread.replies.push(reply);
                 // A reply is a question still open: the agent's answer must reach it.
                 thread.resolved = false;
+                self.revision += 1;
                 true
             }
             _ => false,
@@ -448,8 +472,11 @@ impl CommentStore {
 
     /// The reviewer went to the thread of the comment at `index`: its answers are read.
     pub fn mark_read(&mut self, index: usize) {
-        if let Some(Some(thread)) = self.threads.get_mut(index) {
+        if let Some(Some(thread)) = self.threads.get_mut(index)
+            && thread.unread
+        {
             thread.unread = false;
+            self.revision += 1;
         }
     }
 
@@ -464,6 +491,7 @@ impl CommentStore {
             Some(Some(thread)) => {
                 thread.resolved = resolved;
                 thread.unread &= !resolved;
+                self.revision += 1;
                 true
             }
             _ => false,
@@ -484,6 +512,7 @@ impl CommentStore {
     pub fn edit(&mut self, index: usize, text: String) -> bool {
         if let Some(c) = self.items.get_mut(index) {
             c.text = text;
+            self.revision += 1;
             true
         } else {
             false
@@ -497,6 +526,7 @@ impl CommentStore {
             self.threads.remove(index);
             self.anchors.remove(index);
             self.prune_texts();
+            self.revision += 1;
             Some(self.items.remove(index))
         } else {
             None
@@ -505,6 +535,7 @@ impl CommentStore {
 
     /// Remove and return every comment (consume-all on a successful export).
     pub fn take_all(&mut self) -> Vec<Comment> {
+        self.revision += 1;
         self.ids.clear();
         self.threads.clear();
         self.anchors.clear();

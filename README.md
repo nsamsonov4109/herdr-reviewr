@@ -183,8 +183,10 @@ author's color down its lines:
 herdr-reviewr --reply 3 --to 8e9a3 "It runs once the policy attaches."
 ```
 
-An answer you haven't read yet marks its thread `new answer` and its file `●`. `A` goes to the
-next one, across files, and `n` / `N` step through every comment the same way.
+An answer you haven't read yet marks its thread `new answer`, and its file `●` where opening the
+file shows the thread. `A` goes to the next one, across files, and `n` / `N` step through every
+comment the same way. An answer no file in the view shows, like one on a commit the view doesn't
+hold, opens the comments list (`l`) on its thread, which reads under the list's rows.
 
 `a` replies in a thread, and the next `s` sends your reply with any new comments. A sent comment
 isn't edited: you reply instead. `D` resolves a thread, taking it out of the diff. It stays in
@@ -204,6 +206,12 @@ lines leaves it to the comments list. Shown from another version, its
 title says so, `from 1a2b3c4` or `from the worktree`, and a send names the commit a comment was
 made on.
 
+When the agent rewrites the branch, as a rebase or an amend does, a comment made on one of its
+commits moves to what the rewrite made of that commit: the commit with the same subject, or,
+where several share it, the one `git range-diff` pairs it with. There it follows its lines, or
+sits where they were with `code changed`, and a send names the new commit. A comment on a commit
+the rewrite dropped or renamed stays where it was.
+
 The agent can comment too, on any line of the review, and each send tells it how:
 
 ```text
@@ -222,8 +230,9 @@ herdr-reviewr --suggest 1a2b3c4,5d6e7f8 "The retry step, in both repos."
 ```
 
 Nothing moves: the footer offers `G suggested commits`, and `G` opens the commit picker with
-them selected and the agent's reason as its title. Your next pick, whichever it is, answers the
-suggestion. A review in steps arrives as one suggestion per step, and they wait in the order
+them selected and the agent's reason as its title, so `enter` takes them. Move the highlight
+first and the selection goes: `enter` takes the commit you moved to. Your next pick, whichever
+it is, answers the suggestion. A review in steps arrives as one suggestion per step, and they wait in the order
 sent: `G` opens the first, titled `(1 of 3)`, and each pick moves on to the next. In the
 agent's tab, these commands find the pane without `--to`, and `herdr-reviewr --help` lists all
 three.
@@ -271,7 +280,8 @@ tab needs one repo: open reviewr inside it for that.
 several repos at once usually lands as one commit title in each, so `enter` opens the
 highlighted commit together with the newest commit of that title in every other repo. `v`
 selects that step instead, and then adds or drops the highlighted row; `esc` clears the
-selection. Two commits picked in one repo open as the run between them.
+selection. Two commits picked in one repo open as the run between them. The picker opens on
+what is picked now, or on a suggestion: that selection lasts until you move the highlight.
 
 ## Configuration
 

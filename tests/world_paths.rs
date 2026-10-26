@@ -36,6 +36,7 @@ impl Worker {
             reveal: false,
             refresh,
             probe: std::collections::BTreeMap::new(),
+            rehome: std::collections::BTreeMap::new(),
         };
         self.jobs.send(job).unwrap();
         let completion = self.done.recv().unwrap();

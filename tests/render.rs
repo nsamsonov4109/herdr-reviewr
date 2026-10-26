@@ -471,6 +471,35 @@ fn a_thread_card_carries_its_number_its_state_and_its_replies() {
 }
 
 #[test]
+fn the_comments_list_reads_the_highlighted_thread_under_its_rows() {
+    let r = Repo::init();
+    r.write("a.rs", "alpha\nbeta\n");
+    r.commit_all("init");
+    r.write("a.rs", "alpha\nBETA\n");
+    let mut app = app_on(&r);
+    app.focus = Focus::Diff;
+    app.diff_cursor = app.visible.iter().position(|row| row.marker() == '+').unwrap();
+    app.start_comment();
+    for ch in "why upper case?".chars() {
+        app.input_push(ch);
+    }
+    app.submit_comment();
+    app.store.mark_sent();
+    let answer = (1..=30).map(|n| format!("step {n} of the answer")).collect::<Vec<_>>().join("\n");
+    app.receive_reply(1, answer, None);
+    app.open_list();
+    let out = render(&app);
+    let rows: Vec<&str> = out.lines().collect();
+    let row = rows.iter().position(|l| l.contains("#1 a.rs:2")).expect("the thread's row");
+    let after = |text: &str| rows[row..].iter().position(|l| l.contains(text)).map(|at| row + at);
+    // Under the row, the thread down its authors' bars, its newest lines kept when it runs long.
+    let (agent, last) = (after("┃ agent"), after("┃ step 30 of the answer"));
+    assert!(agent.is_some() || last.is_some(), "the thread reads under the row:\n{out}");
+    assert!(last.is_some(), "the answer's newest line shows:\n{out}");
+    assert!(after("step 1 of the answer").is_none(), "a long thread keeps its tail:\n{out}");
+}
+
+#[test]
 fn a_card_wraps_at_a_readable_width_in_a_wide_pane() {
     let r = Repo::init();
     r.write("a.rs", "alpha\nbeta\n");

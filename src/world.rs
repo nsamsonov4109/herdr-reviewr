@@ -1,6 +1,6 @@
 //! The world snapshot: what one refresh derives from git alone, built on the caller or the worker.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
@@ -737,6 +737,18 @@ pub struct WorldRequest {
     pub background: bool,
 }
 
+/// The commits comments were made on, by repository name (`""` for a lone repository).
+pub type CommentPicks = BTreeMap<String, BTreeSet<CommitPick>>;
+
+/// A rewrite of a branch: what it made of `from`, where comments made on `from` move.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rewrite {
+    /// The repository by name, `""` for a lone one.
+    pub repo: String,
+    pub from: CommitPick,
+    pub to: CommitPick,
+}
+
 /// One refresh request; the completion echoes its tag.
 #[derive(Debug)]
 pub struct WorldJob {
@@ -747,6 +759,8 @@ pub struct WorldJob {
     pub refresh: Refresh,
     /// Files to read back once built, where the refresh may have changed them; `true` wants the text.
     pub probe: BTreeMap<String, bool>,
+    /// The commits comments were made on, which a rewrite of the branch moves them from.
+    pub rehome: CommentPicks,
 }
 
 /// A finished job; no snapshot on the `PR` tab.
@@ -762,6 +776,25 @@ pub struct WorldCompletion {
     pub took: std::time::Duration,
     /// The probed files the refresh may have changed, as they read after it.
     pub probed: BTreeMap<String, Probed>,
+    /// What a rewrite of the branch made of the job's `rehome` commits, each rewritten one.
+    pub rewrites: Vec<Rewrite>,
+}
+
+/// What a rewrite made of each commit in `picks`, read in the repositories under `root`.
+#[must_use]
+pub fn rewrites(root: &Path, picks: &CommentPicks) -> Vec<Rewrite> {
+    let pairs = picks.iter().flat_map(|(repo, commits)| commits.iter().map(move |c| (repo, c)));
+    pairs
+        .filter_map(|(repo, from)| {
+            let to = git::rewritten(&repo_root(root, repo), from)?;
+            Some(Rewrite { repo: repo.clone(), from: from.clone(), to })
+        })
+        .collect()
+}
+
+/// The repository `name` under `root`, `""` naming `root` itself.
+fn repo_root(root: &Path, name: &str) -> PathBuf {
+    if name.is_empty() { root.to_path_buf() } else { root.join(name) }
 }
 
 /// One file as a build read it back: what its bytes hash to, and its text when asked for.
@@ -833,11 +866,12 @@ pub fn spawn(
                 } else {
                     None
                 };
-                let probed = match &snapshot {
-                    Some(Ok(_)) => {
-                        probe(&job.input.repo, &job.input.repos, &job.probe, &job.refresh)
-                    }
-                    _ => BTreeMap::new(),
+                let (probed, rewrites) = match &snapshot {
+                    Some(Ok(_)) => (
+                        probe(&job.input.repo, &job.input.repos, &job.probe, &job.refresh),
+                        worker.rewrites(&job.input, &job.rehome),
+                    ),
+                    _ => (BTreeMap::new(), Vec::new()),
                 };
                 let done = WorldCompletion {
                     generation: job.generation,
@@ -847,6 +881,7 @@ pub fn spawn(
                     refresh: job.refresh,
                     took: started.elapsed(),
                     probed,
+                    rewrites,
                 };
                 if tx.send(done).is_err() {
                     break;
@@ -863,9 +898,42 @@ struct Worker {
     staged: Option<u64>,
     /// A folder's repositories by name: each one's own worker and its last good build.
     repos: BTreeMap<String, (Worker, Option<WorldSnapshot>)>,
+    /// What a rewrite made of each commented commit, by repository, with the `HEAD` it was read at.
+    rewritten: HashMap<(String, CommitPick), (Option<String>, Option<CommitPick>)>,
 }
 
 impl Worker {
+    /// [`rewrites`], each commit read again only once its repository's `HEAD` moved.
+    fn rewrites(&mut self, input: &WorldInput, picks: &CommentPicks) -> Vec<Rewrite> {
+        self.rewritten.retain(|(repo, pick), _| picks.get(repo).is_some_and(|p| p.contains(pick)));
+        let mut out = Vec::new();
+        for (repo, commits) in picks {
+            let head = self.head_of(input, repo);
+            for from in commits {
+                let key = (repo.clone(), from.clone());
+                let to = match self.rewritten.get(&key) {
+                    Some((read_at, to)) if *read_at == head => to.clone(),
+                    _ => {
+                        let to = git::rewritten(&repo_root(&input.repo, repo), from);
+                        self.rewritten.insert(key, (head.clone(), to.clone()));
+                        to
+                    }
+                };
+                out.extend(to.map(|to| Rewrite { repo: repo.clone(), from: from.clone(), to }));
+            }
+        }
+        out
+    }
+
+    /// The `HEAD` the last build of repository `repo` read, `""` naming a lone repository.
+    fn head_of(&self, input: &WorldInput, repo: &str) -> Option<String> {
+        if input.repos.is_folder() {
+            self.repos.get(repo)?.1.as_ref()?.head.clone()
+        } else {
+            self.last.as_ref()?.1.head.clone()
+        }
+    }
+
     /// Run one refresh: only its paths when the last build is of the same input, else in full.
     /// `None` when nothing needs re-reading.
     fn refresh(
@@ -1104,5 +1172,55 @@ mod tests {
         assert_eq!(full, Refresh::Full);
         assert!(each(&[]).is_empty() && each(&[("api", Refresh::default())]).is_empty());
         assert!(!each(&[("api", some(&[], true))]).is_empty(), "a stage re-reads");
+    }
+
+    #[test]
+    fn the_worker_reads_a_rewrite_again_only_once_head_moves() {
+        use super::{CommentPicks, Rewrite, Worker, WorldInput};
+        use crate::model::CommitPick;
+        let (dir, git) = crate::test_support::test_repo();
+        let write = |text: &str| std::fs::write(dir.path().join("a.rs"), text).unwrap();
+        write("fn a() {}\n");
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+        write("fn a() {}\nfn b() {}\n");
+        git(&["commit", "-q", "-am", "add b"]);
+        let made = git(&["rev-parse", "HEAD"]);
+        write("fn a() {}\nfn b() { todo!() }\n");
+        git(&["commit", "-q", "-a", "--amend", "--no-edit"]);
+        let amended = git(&["rev-parse", "HEAD"]);
+        let input = WorldInput {
+            repo: dir.path().to_path_buf(),
+            repos: crate::repos::Repos::default(),
+            tab: crate::app::Tab::Changes,
+            scope: crate::model::Scope::Uncommitted,
+            base: None,
+            default_base: Vec::new(),
+            base_epoch: 0,
+            turn_baselines: std::collections::BTreeMap::new(),
+            send_baselines: std::collections::BTreeMap::new(),
+            commit_picks: std::collections::BTreeMap::new(),
+            toggled_dirs: std::collections::HashSet::new(),
+        };
+        let mut worker = Worker::default();
+        worker.refresh(&input, Refresh::Full).unwrap().unwrap();
+        let picks = CommentPicks::from([(String::new(), [CommitPick::single(&made)].into())]);
+        let rewrite = Rewrite {
+            repo: String::new(),
+            from: CommitPick::single(&made),
+            to: CommitPick::single(&amended),
+        };
+        assert_eq!(worker.rewrites(&input, &picks), std::slice::from_ref(&rewrite));
+        let spawned = || crate::git::GIT_COMMANDS.with(std::cell::Cell::get);
+        let before = spawned();
+        assert_eq!(worker.rewrites(&input, &picks), [rewrite], "kept while HEAD stays");
+        assert_eq!(spawned(), before, "no git while HEAD stays");
+        // A new HEAD reads it again: the amended commit amended once more is what it is now.
+        write("fn a() {}\nfn b() { unimplemented!() }\n");
+        git(&["commit", "-q", "-a", "--amend", "--no-edit"]);
+        let again = git(&["rev-parse", "HEAD"]);
+        worker.refresh(&input, Refresh::Full).unwrap().unwrap();
+        let read = worker.rewrites(&input, &picks);
+        assert_eq!(read.iter().map(|r| r.to.newest.as_str()).collect::<Vec<_>>(), [again.as_str()]);
     }
 }

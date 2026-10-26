@@ -95,6 +95,12 @@ fn repo_context() -> String {
     json!({"focused_pane_cwd": env!("CARGO_MANIFEST_DIR")}).to_string()
 }
 
+/// A clock started once the fake herdr is built, whose first build takes seconds.
+fn clock() -> Instant {
+    fake_herdr();
+    Instant::now()
+}
+
 /// Any mode with a caller-shaped action context, invoked from pane `w1:p1`.
 fn run_with_context(mode: &str, dir: &Path, context: &str) -> Output {
     with_context(mode, dir, context).output().unwrap()
@@ -1210,7 +1216,7 @@ fn an_open_whose_pane_never_reads_as_reviewr_succeeds_after_the_bound_and_says_s
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("opened-empty-reads"), "1000000").unwrap();
 
-    let started = Instant::now();
+    let started = clock();
     let output = run_open(dir.path());
     let elapsed = started.elapsed();
 
@@ -1230,7 +1236,7 @@ fn an_open_whose_pane_dies_at_launch_refuses_at_once() {
     fs::write(fixture(dir.path(), "procfail", "w1:p9", ".json"), herdr_error("pane_not_found"))
         .unwrap();
 
-    let started = Instant::now();
+    let started = clock();
     let output = run_open(dir.path());
 
     assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
@@ -1313,7 +1319,7 @@ fn an_explicit_action_refuses_once_the_lock_stays_held_past_the_bound() {
     let dir = tempfile::tempdir().unwrap();
     let _lock = hold_lock(dir.path(), "workspace-1");
 
-    let started = Instant::now();
+    let started = clock();
     let children = ["toggle", "open", "close"].map(|mode| (mode, start(mode, dir.path())));
     for (mode, child) in children {
         let output = child.wait_with_output().unwrap();
@@ -1338,7 +1344,7 @@ fn auto_open_gives_way_to_a_held_lock() {
     let _lock = hold_lock(dir.path(), "workspace-9");
     let event = worktree_event("worktree_created", "workspace-9", env!("CARGO_MANIFEST_DIR"), None);
 
-    let started = Instant::now();
+    let started = clock();
     let output = run_auto_open(dir.path(), &event, None);
 
     assert!(output.status.success(), "{}", stderr(&output));
@@ -1353,7 +1359,7 @@ fn workspace_ids_differing_only_in_case_hold_separate_locks() {
     let _lock = hold_lock(dir.path(), "wA");
     let event = worktree_event("worktree_created", "wa", env!("CARGO_MANIFEST_DIR"), None);
 
-    let started = Instant::now();
+    let started = clock();
     let output = run_auto_open(dir.path(), &event, None);
 
     assert!(output.status.success(), "{}", stderr(&output));
@@ -1386,7 +1392,7 @@ fn a_held_lock_holds_back_only_its_own_workspace() {
     let _lock = hold_lock(dir.path(), "workspace-2");
     let event = worktree_event("worktree_created", "workspace-9", env!("CARGO_MANIFEST_DIR"), None);
 
-    let started = Instant::now();
+    let started = clock();
     let toggle = run_with_context("toggle", dir.path(), &repo_context());
     let born = run_auto_open(dir.path(), &event, None);
 

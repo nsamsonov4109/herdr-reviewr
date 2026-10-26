@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use anyhow::{Context, Result, bail};
 
-use crate::model::{ChangeKind, ChangedFile};
+use crate::model::{ChangeKind, ChangedFile, CommitPick};
 
 /// Every git process reviewr runs, read-only on the real index (**No writes**).
 fn git_command(repo: &Path) -> std::process::Command {
@@ -2194,6 +2194,77 @@ pub fn oldest_after(repo: &Path, from: &str, newest: &str) -> Option<String> {
     let exclude = format!("^{from}");
     let listed = git(repo, &["rev-list", "--first-parent", newest, &exclude]).ok()?;
     listed.lines().last().map(str::to_string)
+}
+
+/// The most commits a side of [`rewritten`] pairs by patch: past that, `range-diff` costs seconds.
+const REWRITE_SPAN: usize = 64;
+
+/// What a rewrite made of `pick`, which `HEAD` no longer reaches: each end under its own subject.
+pub fn rewritten(repo: &Path, pick: &CommitPick) -> Option<CommitPick> {
+    if is_reachable(repo, &pick.newest) {
+        return None;
+    }
+    let base = git_line(repo, &["merge-base", &pick.newest, "HEAD"])?;
+    let (old, new) = (format!("{base}..{}", pick.newest), format!("{base}..HEAD"));
+    let (olds, news) = (subjects(repo, &old)?, subjects(repo, &new)?);
+    // A subject one commit holds on each side names the rewrite; one several share needs patches.
+    let unique = |sha: &str| {
+        let subject = olds.get(sha)?;
+        only_under(&olds, subject).and(only_under(&news, subject)).cloned()
+    };
+    let ends = [pick.newest.as_str(), pick.oldest.as_str()];
+    let shared = ends.iter().any(|sha| olds.contains_key(*sha) && unique(sha).is_none());
+    let out = if shared && olds.len().max(news.len()) <= REWRITE_SPAN {
+        git(repo, &["range-diff", "--no-color", "--no-abbrev", "-s", &old, &new]).ok()?
+    } else {
+        String::new()
+    };
+    let pairs = range_pairs(&out);
+    let follow = |sha: &str| {
+        let under = olds.get(sha)?;
+        unique(sha).or_else(|| pairs.get(sha).filter(|to| news.get(*to) == Some(under)).cloned())
+    };
+    let newest = follow(&pick.newest)?;
+    if pick.is_single() {
+        return Some(CommitPick::single(&newest));
+    }
+    // A run's oldest end the rewrite kept stays, and the run must still read oldest to newest.
+    let oldest = match follow(&pick.oldest) {
+        Some(oldest) => oldest,
+        None if is_reachable(repo, &pick.oldest) => pick.oldest.clone(),
+        None => return None,
+    };
+    git_ok(repo, &["merge-base", "--is-ancestor", &oldest, &newest])
+        .then_some(CommitPick { oldest, newest })
+}
+
+/// The one commit of `side` under `subject`; `None` when none or several are.
+fn only_under<'a>(side: &'a HashMap<String, String>, subject: &str) -> Option<&'a String> {
+    let mut under = side.iter().filter(|(_, s)| *s == subject).map(|(sha, _)| sha);
+    under.next().filter(|_| under.next().is_none())
+}
+
+/// Each commit of `range` by id, with its subject.
+fn subjects(repo: &Path, range: &str) -> Option<HashMap<String, String>> {
+    let format = "--format=%H%x00%s";
+    let log = ["log", "--no-show-signature", "--encoding=UTF-8", format, range];
+    let out = git(repo, &log).ok()?;
+    Some(
+        out.lines().filter_map(|l| l.split_once('\0')).map(|(h, s)| (h.into(), s.into())).collect(),
+    )
+}
+
+/// The commits `git range-diff -s` pairs, old to new: kept as they were (`=`) or changed (`!`).
+fn range_pairs(out: &str) -> HashMap<&str, String> {
+    out.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let (_, old, status, _, new) =
+                (fields.next()?, fields.next()?, fields.next()?, fields.next()?, fields.next()?);
+            let oid = |s: &str| s.bytes().all(|b| b.is_ascii_hexdigit());
+            (matches!(status, "=" | "!") && oid(old) && oid(new)).then(|| (old, new.to_string()))
+        })
+        .collect()
 }
 
 /// One commit picker row.

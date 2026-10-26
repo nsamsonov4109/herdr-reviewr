@@ -1901,3 +1901,114 @@ fn concurrent_snapshots_of_one_worktree_all_land_the_same_tree() {
         .collect();
     assert!(trees.windows(2).all(|w| w[0] == w[1]), "snapshots disagree: {trees:?}");
 }
+
+/// A branch of three commits on `base`, each adding to `a.rs`; their ids, oldest first.
+fn three_commits(r: &Repo) -> Vec<String> {
+    r.write("a.rs", "fn base() {}\n");
+    r.commit_all("base");
+    let lines = ["fn one() {\n  setup();\n  run();\n}\n", "fn two() {}\n", "fn three() {}\n"];
+    let mut text = "fn base() {}\n".to_string();
+    let mut shas = Vec::new();
+    for (line, subject) in lines.iter().zip(["one", "two", "three"]) {
+        text.push_str(line);
+        r.write("a.rs", &text);
+        r.commit_all(subject);
+        shas.push(r.git(&["rev-parse", "HEAD"]).trim().to_string());
+    }
+    shas
+}
+
+/// Rewrite the branch from its first commit, as an interactive rebase that edits it does.
+fn edit_first(r: &Repo, shas: &[String], edit: &str) -> Vec<String> {
+    r.git(&["reset", "-q", "--hard", &format!("{}^", shas[0])]);
+    r.write("a.rs", edit);
+    r.commit_all("one");
+    let mut made = vec![r.git(&["rev-parse", "HEAD"]).trim().to_string()];
+    for sha in &shas[1..] {
+        r.git(&["cherry-pick", sha]);
+        made.push(r.git(&["rev-parse", "HEAD"]).trim().to_string());
+    }
+    made
+}
+
+#[test]
+fn a_commit_the_branch_still_holds_was_not_rewritten() {
+    use herdr_reviewr::git::rewritten;
+    use herdr_reviewr::model::CommitPick;
+    let r = Repo::init();
+    let shas = three_commits(&r);
+    assert_eq!(rewritten(r.path(), &CommitPick::single(&shas[1])), None);
+}
+
+#[test]
+fn a_rebase_pairs_each_commit_with_what_it_became() {
+    use herdr_reviewr::git::rewritten;
+    use herdr_reviewr::model::CommitPick;
+    let r = Repo::init();
+    let shas = three_commits(&r);
+    // The first commit loses a line; the two after it replay on top.
+    let made = edit_first(&r, &shas, "fn base() {}\nfn one() {\n  run();\n}\n");
+    let pick = |sha: &String| CommitPick::single(sha);
+    assert_eq!(rewritten(r.path(), &pick(&shas[0])), Some(pick(&made[0])), "changed, still paired");
+    assert_eq!(rewritten(r.path(), &pick(&shas[2])), Some(pick(&made[2])), "replayed as it was");
+    let run = CommitPick { oldest: shas[0].clone(), newest: shas[1].clone() };
+    let run_made = CommitPick { oldest: made[0].clone(), newest: made[1].clone() };
+    assert_eq!(rewritten(r.path(), &run), Some(run_made), "a run pairs both ends");
+}
+
+#[test]
+fn a_dropped_commit_has_nothing_to_follow() {
+    use herdr_reviewr::git::rewritten;
+    use herdr_reviewr::model::CommitPick;
+    let r = Repo::init();
+    let shas = three_commits(&r);
+    // The rebase drops `two`: the commits after it replay without it.
+    r.git(&["reset", "-q", "--hard", &shas[0]]);
+    r.write("a.rs", "fn base() {}\nfn one() {\n  setup();\n  run();\n}\nfn three() {}\n");
+    r.commit_all("three");
+    assert_eq!(rewritten(r.path(), &CommitPick::single(&shas[1])), None);
+    let run = CommitPick { oldest: shas[1].clone(), newest: shas[2].clone() };
+    assert_eq!(rewritten(r.path(), &run), None, "a run with a dropped end has no pair");
+}
+
+#[test]
+fn a_commit_rewritten_past_its_patch_follows_its_subject() {
+    use herdr_reviewr::git::rewritten;
+    use herdr_reviewr::model::CommitPick;
+    let r = Repo::init();
+    let shas = three_commits(&r);
+    // The amend rewrites `three` whole: no patch is like it, but the subject stays.
+    r.write("a.rs", "fn base() {}\nfn one() {\n  setup();\n  run();\n}\nfn two() {}\nmod three;\n");
+    r.git(&["commit", "-q", "-a", "--amend", "--no-edit"]);
+    let made = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    assert_eq!(rewritten(r.path(), &CommitPick::single(&shas[2])), Some(CommitPick::single(&made)));
+    // A new subject is another commit.
+    r.git(&["commit", "-q", "--amend", "-m", "three, renamed"]);
+    assert_eq!(rewritten(r.path(), &CommitPick::single(&made)), None);
+}
+
+#[test]
+fn commits_sharing_a_subject_pair_by_their_patches() {
+    use herdr_reviewr::git::rewritten;
+    use herdr_reviewr::model::CommitPick;
+    let r = Repo::init();
+    let head = || r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.write("a.rs", "fn a() {}\n");
+    r.commit_all("base");
+    r.write("a.rs", "fn a() {}\nfn b() {\n  one();\n  two();\n}\n");
+    r.commit_all("fix");
+    let first = head();
+    r.write("b.rs", "fn c() {\n  three();\n  four();\n}\n");
+    r.commit_all("fix");
+    let second = head();
+    // The rebase edits the first `fix`, and the second replays on it.
+    r.git(&["reset", "-q", "--hard", &format!("{first}^")]);
+    r.write("a.rs", "fn a() {}\nfn b() {\n  one();\n  two();\n  done();\n}\n");
+    r.commit_all("fix");
+    let first_made = head();
+    r.git(&["cherry-pick", &second]);
+    let second_made = head();
+    let pick = |sha: &str| CommitPick::single(sha);
+    assert_eq!(rewritten(r.path(), &pick(&first)), Some(pick(&first_made)));
+    assert_eq!(rewritten(r.path(), &pick(&second)), Some(pick(&second_made)));
+}

@@ -199,6 +199,7 @@ impl Worker {
             reveal: false,
             refresh,
             probe: std::collections::BTreeMap::new(),
+            rehome: std::collections::BTreeMap::new(),
         };
         self.jobs.send(job).unwrap();
         self.done.recv().unwrap().snapshot.map(|s| s.expect("the build succeeds"))
@@ -454,6 +455,24 @@ fn a_suggestion_across_repositories_opens_as_the_selection() {
     app.commit_picker_pick().unwrap();
     assert_eq!(app.commit_picks, picks);
     assert_eq!(listed(&app), ["api/a.txt", "web/b.txt"]);
+}
+
+#[test]
+fn moving_off_the_suggestion_the_picker_opened_on_picks_the_highlighted_commit() {
+    let (f, api, web) = stepped();
+    let mut app = app_on(&f.root(), None, Scope::Uncommitted);
+    let sha = |repo: &Path, rev: &str| git(repo, &["rev-parse", rev]);
+    let suggested = Picks::from([("web".to_string(), CommitPick::single(&sha(&web, "HEAD")))]);
+    app.receive_suggestion(suggested, "web first", Some("claude".into()));
+    app.open_commit_picker();
+    assert_eq!(picker(&app).checked, BTreeSet::from([1]), "it opens on web's step one");
+    // The reviewer moves to api's step two: `enter` takes the highlight, not the suggestion.
+    app.commit_picker_move(-1);
+    assert!(picker(&app).checked.is_empty(), "the selection it opened on is dropped");
+    app.commit_picker_pick().unwrap();
+    let picked = Picks::from([("api".to_string(), CommitPick::single(&sha(&api, "HEAD")))]);
+    assert_eq!(app.commit_picks, picked);
+    assert!(app.suggestions.is_empty(), "and the pick answers the suggestion");
 }
 
 #[test]

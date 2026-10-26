@@ -734,6 +734,7 @@ pub fn land_world_completion(
         {
             app.reconcile_world(snapshot);
             app.land_probes(completion.probed);
+            app.land_rewrites(completion.rewrites);
             if completion.reveal {
                 // The landing may have moved the cursor.
                 app.settle_tab_entry();
@@ -1276,6 +1277,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
                     reveal: request.reveal,
                     refresh: request.refresh,
                     probe: app.probe_paths(),
+                    rehome: app.comment_picks(),
                 };
                 logln!("refresh {:?} background={}", job.refresh, request.background);
                 pacer.on_dispatched(request.background);
@@ -2034,6 +2036,7 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
             (Some(K::Delete), _) => app.delete_comment(),
             (Some(K::Reply), _) => app.start_reply(),
             (Some(K::Resolve), _) => app.toggle_resolved(),
+            (Some(K::NextAnswer), _) => app.list_next_answer(),
             _ => {}
         }
         return Ok(());

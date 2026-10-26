@@ -8,7 +8,7 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
+    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -893,8 +893,12 @@ const CODE_CHANGED_NOTE: &str = "· code changed ";
 
 /// Comment `ci`'s card body: each message, the comment first, under its author and a gap apart.
 fn card_body(store: &CommentStore, ci: usize, width: usize) -> Vec<CardLine> {
+    thread_body(store, ci, card_box_width(width).saturating_sub(4).max(1)) // inside "┃ " … " │"
+}
+
+/// Comment `ci`'s messages, the comment first, each under its author, wrapped at `text_w`.
+fn thread_body(store: &CommentStore, ci: usize, text_w: usize) -> Vec<CardLine> {
     let Some(c) = store.get(ci) else { return Vec::new() };
-    let text_w = card_box_width(width).saturating_sub(4).max(1); // inside "┃ " … " │"
     let thread = store.thread(ci);
     let opener = thread.map_or(&Author::Reviewer, |t| &t.opener);
     let replies = thread.iter().flat_map(|t| &t.replies);
@@ -1979,42 +1983,18 @@ fn comment_card_lines(app: &App, ci: usize, width: usize, p: &Palette) -> Vec<Li
     ])];
 
     // The selection model's own lines, so paint and copy agree; each message runs down its author's bar.
-    let voice = |agent: bool| if agent { Ink::Accent } else { Ink::Comment };
-    let bar = |agent: bool| {
-        Span::styled(MESSAGE_BAR, Style::default().fg(p.mark(voice(agent), Fill::Base)))
-    };
     for line in card_body(store, ci, width) {
-        match line {
-            CardLine::Author { name, agent, note } => {
-                let (said, said_ink) = match note {
-                    Note::New => (NEW_NOTE, Ink::Accent),
-                    Note::NotSent => (NOT_SENT, Ink::Warning),
-                    Note::None => ("", Ink::TextMuted),
-                };
-                let name = truncate_width(&name, text_w.saturating_sub(said.width()));
-                let gap = " ".repeat(text_w.saturating_sub(name.width() + said.width()));
-                lines.push(Line::from(vec![
-                    pad(),
-                    bar(agent),
-                    Span::styled(name, ink(voice(agent)).add_modifier(Modifier::BOLD)),
-                    Span::styled(said, ink(said_ink)),
-                    Span::styled(format!("{gap} │"), border),
-                ]));
-            }
-            CardLine::Text { text, agent } => {
-                let gap = " ".repeat(text_w.saturating_sub(text.width()));
-                lines.push(Line::from(vec![
-                    pad(),
-                    bar(agent),
-                    Span::styled(text, ink(Ink::Text)),
-                    Span::styled(format!("{gap} │"), border),
-                ]));
-            }
-            CardLine::Gap => {
-                let blank = " ".repeat(text_w);
-                lines.push(Line::from(vec![pad(), Span::styled(format!("│ {blank} │"), border)]));
-            }
-        }
+        let Some(spans) = message_line(line, text_w, p) else {
+            let blank = " ".repeat(text_w);
+            lines.push(Line::from(vec![pad(), Span::styled(format!("│ {blank} │"), border)]));
+            continue;
+        };
+        let used = spans.iter().map(Span::width).sum::<usize>().saturating_sub(MESSAGE_BAR.width());
+        let gap = " ".repeat(text_w.saturating_sub(used));
+        let mut row = vec![pad()];
+        row.extend(spans);
+        row.push(Span::styled(format!("{gap} │"), border));
+        lines.push(Line::from(row));
     }
 
     lines.push(Line::from(vec![
@@ -2022,6 +2002,34 @@ fn comment_card_lines(app: &App, ci: usize, width: usize, p: &Palette) -> Vec<Li
         Span::styled(format!("╰{}╯", "─".repeat(box_w.saturating_sub(2))), border),
     ]));
     lines
+}
+
+/// A thread line as painted, down its author's bar; `None` for the gap between two messages.
+fn message_line(line: CardLine, text_w: usize, p: &Palette) -> Option<Vec<Span<'static>>> {
+    let ink = |ink: Ink| Style::default().fg(p.ink(ink, Fill::Base));
+    let voice = |agent: bool| if agent { Ink::Accent } else { Ink::Comment };
+    let bar = |agent: bool| {
+        Span::styled(MESSAGE_BAR, Style::default().fg(p.mark(voice(agent), Fill::Base)))
+    };
+    match line {
+        CardLine::Author { name, agent, note } => {
+            let (said, said_ink) = match note {
+                Note::New => (NEW_NOTE, Ink::Accent),
+                Note::NotSent => (NOT_SENT, Ink::Warning),
+                Note::None => ("", Ink::TextMuted),
+            };
+            let name = truncate_width(&name, text_w.saturating_sub(said.width()));
+            Some(vec![
+                bar(agent),
+                Span::styled(name, ink(voice(agent)).add_modifier(Modifier::BOLD)),
+                Span::styled(said, ink(said_ink)),
+            ])
+        }
+        CardLine::Text { text, agent } => {
+            Some(vec![bar(agent), Span::styled(text, ink(Ink::Text))])
+        }
+        CardLine::Gap => None,
+    }
 }
 
 /// Truncate `s` to `max` columns with a trailing `…`; zero fits nothing.
@@ -3554,7 +3562,32 @@ fn render_comments_list(frame: &mut Frame, app: &App, area: Rect) {
             selectable_row(p, spans, width, on)
         })
         .collect();
-    frame.render_widget(List::new(items), inner);
+    // The highlighted thread reads under the rows, newest last: an answer no file shows is here.
+    let thread = thread_preview(app, width, p);
+    let room = inner.height.saturating_sub(1) / 2;
+    let rows = u16::try_from(items.len()).unwrap_or(u16::MAX).clamp(1, room.max(1));
+    let rows = if thread.is_empty() || room == 0 { inner.height } else { rows };
+    let mut state = ListState::default().with_selected(Some(app.list_cursor));
+    frame.render_stateful_widget(List::new(items), Rect { height: rows, ..inner }, &mut state);
+    if rows < inner.height {
+        let rule = Rect { y: inner.y + rows, height: 1, ..inner };
+        let border = Style::default().fg(p.mark(Ink::Border, Fill::Base));
+        frame.render_widget(Paragraph::new("─".repeat(width)).style(border), rule);
+        let below = Rect { y: rule.y + 1, height: inner.height - rows - 1, ..inner };
+        let tail = thread.len().saturating_sub(usize::from(below.height));
+        frame.render_widget(Paragraph::new(thread[tail..].to_vec()), below);
+    }
+}
+
+/// The comments list's highlighted thread, each message down its author's bar.
+fn thread_preview(app: &App, width: usize, p: &Palette) -> Vec<Line<'static>> {
+    let text_w = width.saturating_sub(MESSAGE_BAR.width() + 2).max(1);
+    let lines = thread_body(&app.store, app.list_cursor, text_w);
+    let line = |line| match message_line(line, text_w, p) {
+        Some(spans) => Line::from(std::iter::once(Span::raw(" ")).chain(spans).collect::<Vec<_>>()),
+        None => Line::default(),
+    };
+    lines.into_iter().map(line).collect()
 }
 
 /// A `w` × `h` popup centered in the body, never over the footer.

@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Threads follow a rebase**: when the agent rewrites the branch, as a rebase or an amend does, a comment made on one of its commits moves to what the rewrite made of that commit: the commit with the same subject, or, where several share it, the one `git range-diff` pairs it with. There it follows its lines, or sits where they were with `code changed`, and a send names the new commit. A comment you're replying to waits until your reply is in. A comment on a commit the rewrite dropped or renamed stays where it was.
+
+### Fixed
+- **The new-answer dot** marks a file only where opening it shows the thread. Before, it marked any file holding an unread thread, even in a commit that couldn't show it, so the file opened with no thread in it, and `A` said there were no new answers. Now `A` opens the comments list on an answer no file in the view shows, and `A` in the list goes to the next one.
+- **The comments list reads the highlighted thread** under its rows, its newest lines kept when it runs long, and scrolls to keep the highlight in view.
+- **The commit picker picks what you highlight**: it opens on a suggestion or on what is picked now, and `enter` used to take that selection wherever you had moved the highlight, so a commit you chose opened another. Moving the highlight now drops a selection the picker opened on, and `enter` takes the commit you moved to. A selection you make with `v` stays.
+
 ## [0.49.0] — 2026-10-25
 
 ### Added

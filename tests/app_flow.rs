@@ -5032,6 +5032,7 @@ fn completion_for(app: &App, generation: u64) -> herdr_reviewr::world::WorldComp
         refresh: full,
         took: std::time::Duration::ZERO,
         probed,
+        rewrites: Vec::new(),
     }
 }
 
@@ -5300,6 +5301,7 @@ fn the_worker_coalesces_queued_jobs_keeping_their_flags() {
         reveal,
         refresh: full.clone(),
         probe: std::collections::BTreeMap::new(),
+        rehome: std::collections::BTreeMap::new(),
     };
     job_tx.send(job(1, input, true)).unwrap();
     job_tx.send(job(2, newer, false)).unwrap();
@@ -8373,6 +8375,27 @@ fn a_poll_moves_the_pick_between_the_pick_row_and_the_list() {
 }
 
 #[test]
+fn a_run_a_poll_lists_again_lasts_until_the_first_move() {
+    let (r, shas) = commits_repo();
+    let mut app = app_on(&r);
+    let keymap = Keymap::default();
+    let run = herdr_reviewr::model::CommitPick { oldest: shas[1].clone(), newest: shas[2].clone() };
+    app.commit_picks = herdr_reviewr::model::Picks::from([(String::new(), run)]);
+    // The run is off the branch as `G` opens, then listed whole again under the open picker.
+    r.git(&["reset", "-q", "--hard", &shas[0]]);
+    common::land_world(&mut app);
+    press(&mut app, &keymap, KeyCode::Char('G'));
+    r.git(&["reset", "-q", "--hard", &shas[3]]);
+    common::land_world(&mut app);
+    assert_eq!(picker(&app).run_len(), 2, "spanned, the way `G` opens on it");
+    // The reviewer moves up to `three`: `enter` takes it alone.
+    press(&mut app, &keymap, KeyCode::Char('k'));
+    press(&mut app, &keymap, KeyCode::Enter);
+    let three = herdr_reviewr::model::CommitPick::single(&shas[3]);
+    assert_eq!(app.commit_pick().cloned(), Some(three));
+}
+
+#[test]
 fn a_commit_comment_shows_under_every_pick_that_reads_its_lines() {
     let (r, shas) = commits_repo();
     let mut app = app_on(&r);
@@ -8465,6 +8488,21 @@ fn a_suggestion_waits_for_g_and_any_pick_answers_it() {
     assert!(app.suggestions.is_empty());
     app.open_commit_picker();
     assert_eq!(picker(&app).title, "commits · last 50");
+}
+
+#[test]
+fn moving_off_the_run_the_picker_opened_on_picks_the_highlighted_commit() {
+    use herdr_reviewr::model::{CommitPick, Picks};
+    let (r, shas) = commits_repo();
+    let mut app = app_on(&r);
+    let run = CommitPick { oldest: shas[1].clone(), newest: shas[2].clone() };
+    app.receive_suggestion(Picks::from([(String::new(), run.clone())]), "two adds", None);
+    app.open_commit_picker();
+    assert_eq!(picker(&app).picked(), Some(run), "it opens on the suggested run");
+    // Up to `three`: the highlight alone, not a run stretched from the suggestion's end.
+    app.commit_picker_move(-1);
+    app.commit_picker_pick().unwrap();
+    assert_eq!(app.commit_pick().cloned(), Some(CommitPick::single(&shas[3])));
 }
 
 #[test]
@@ -8604,6 +8642,129 @@ fn an_amended_commit_shows_a_comment_where_its_line_went_not_on_a_twin() {
     let place = app.card_place(0).expect("the amended commit shows it");
     assert_eq!((place.side, place.start, place.changed), (Side::New, 8, true), "{place:?}");
     assert_eq!(place.from.as_deref(), Some(&made[..7]));
+}
+
+/// Pick commit `sha` alone and open `file` on it.
+fn open_on_commit(app: &mut App, sha: &str, file: &str) {
+    app.open_commit_picker();
+    let at = picker(app).index_of(sha).expect("the commit is listed");
+    app.commit_picker_goto(at);
+    app.commit_picker_pick().unwrap();
+    app.select_file(file_row(app, file)).unwrap();
+}
+
+/// `pos.cpp` read with `clear` among its lines, as the refactor commit writes it.
+fn reader(clear: &str) -> String {
+    format!(
+        "void read() {{\n  recalc();\n{clear}  std::vector<int> requests;\n  fill(requests);\n\
+         send(requests);\n}}\n"
+    )
+}
+
+/// A branch of a refactor that adds a clear, then a close commit; the pane reviews the refactor,
+/// its thread on the clear answered. Returns the base the agent's rebase starts from.
+fn refactor_thread() -> (Repo, App, String) {
+    let r = Repo::init();
+    r.write("pos.cpp", "void read() {\n  recalc();\n  std::vector<int> requests;\n}\n");
+    r.commit_all("base");
+    let base = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.write("pos.cpp", &reader("  positions.clear();\n"));
+    r.commit_all("refactor: split the reader");
+    let refactor = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.write("close.cpp", "void close() {}\n");
+    r.commit_all("close");
+    let mut app = app_on(&r);
+    open_on_commit(&mut app, &refactor, "pos.cpp");
+    comment_on_line(&mut app, "  positions.clear();", "why we added this?");
+    assert!(app.export(&FakeTarget::ok()));
+    app.receive_reply(1, "it belongs to the close commit".into(), None);
+    (r, app, base)
+}
+
+/// The agent's rebase: the refactor drops the clear, which close takes after its drain. Returns
+/// the rebased refactor.
+fn rebase_refactor(r: &Repo, base: &str) -> String {
+    r.git(&["reset", "-q", "--hard", base]);
+    r.write("pos.cpp", &reader(""));
+    r.commit_all("refactor: split the reader");
+    let rebased = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.write("close.cpp", "void close() {\n  drain();\n  positions.clear();  // read again\n}\n");
+    r.commit_all("close");
+    rebased
+}
+
+#[test]
+fn a_thread_follows_its_commit_through_the_agents_rebase() {
+    let (r, mut app, base) = refactor_thread();
+    let rebased = rebase_refactor(&r, &base);
+    common::land_world(&mut app);
+    // The thread lives on the rebased refactor now, and a send names that commit.
+    let location = app.store.get(0).unwrap().location();
+    assert_eq!(location, format!("pos.cpp:3 (in commit {})", &rebased[..7]));
+    // Its line is gone from there: the thread sits where it was, its code changed.
+    open_on_commit(&mut app, &rebased, "pos.cpp");
+    let place = app.card_place(0).expect("the rebased refactor shows the thread");
+    assert!(place.native && place.changed && place.from.is_none(), "{place:?}");
+    assert!(app.has_new_answer("pos.cpp"), "its answer shows there, so its file is marked");
+}
+
+#[test]
+fn a_rebase_waits_for_the_reply_being_written() {
+    let (r, mut app, base) = refactor_thread();
+    app.focus = Focus::Diff;
+    app.start_reply();
+    let rebased = rebase_refactor(&r, &base);
+    common::land_world(&mut app);
+    // The thread under the open reply holds still while it is written.
+    let made_on = |app: &App| app.store.get(0).unwrap().location();
+    assert!(!made_on(&app).contains(&rebased[..7]), "{}", made_on(&app));
+    typed(&mut app, "then move it");
+    app.submit_comment();
+    app.catch_up_held_view();
+    assert!(made_on(&app).contains(&rebased[..7]), "it follows once the reply is in");
+    assert_eq!(app.store.thread(0).unwrap().replies.len(), 2, "the reply landed on the thread");
+}
+
+#[test]
+fn a_file_is_marked_only_where_opening_it_shows_the_new_answer() {
+    let r = Repo::init();
+    r.write("a.rs", "fn a() {}\nfn c() {}\n");
+    r.write("b.rs", "fn b() {}\n");
+    r.commit_all("base");
+    r.write("a.rs", "fn a() {}\nfn helper() { unsafe_call(); }\nfn c() {}\n");
+    r.commit_all("add");
+    let add = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.write("a.rs", "fn a() {}\nfn c() {}\n");
+    r.write("b.rs", "fn b() { start(); }\n");
+    r.commit_all("drop");
+    let drop = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.write("a.rs", "fn a() {}\nfn c() {}\nfn d() {}\n");
+    r.write("b.rs", "fn b() { done(); }\n");
+    r.commit_all("later");
+    let later = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    let mut app = app_on(&r);
+    open_on_commit(&mut app, &add, "a.rs");
+    comment_on_line(&mut app, "fn helper() { unsafe_call(); }", "is this safe?");
+    assert!(app.export(&FakeTarget::ok()));
+    app.receive_reply(1, "it is gone two commits on".into(), None);
+    assert!(app.has_new_answer("a.rs"), "its own commit shows it");
+    // `drop` holds the line on its removed side: opening a.rs there shows the thread.
+    open_on_commit(&mut app, &drop, "b.rs");
+    assert!(app.has_new_answer("a.rs"), "shown where another commit removed its line");
+    // `later` changes a.rs too, but neither side holds the line: no mark promises the answer.
+    open_on_commit(&mut app, &later, "b.rs");
+    assert!(!app.has_new_answer("a.rs"), "opening a.rs here shows no thread");
+    // `A` finds no file to go to: the comments list shows the thread, read.
+    app.jump_answer();
+    assert_eq!(app.mode, Mode::List);
+    assert_eq!((app.list_cursor, app.store.unread()), (0, 0));
+    assert_eq!(app.status, "#1 has no line in this view · no more new answers");
+    // In the list, `A` steps through the threads still unread.
+    app.receive_reply(1, "and nothing calls it".into(), None);
+    app.list_next_answer();
+    assert_eq!((app.list_cursor, app.store.unread()), (0, 0));
+    app.list_next_answer();
+    assert_eq!(app.status, "no new answers");
 }
 
 #[test]

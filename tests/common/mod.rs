@@ -240,8 +240,10 @@ pub fn land_world(app: &mut App) {
     let snapshot = herdr_reviewr::world::build(&input).unwrap();
     let full = herdr_reviewr::world::Refresh::Full;
     let probed = herdr_reviewr::world::probe(&input.repo, &input.repos, &app.probe_paths(), &full);
+    let rewrites = herdr_reviewr::world::rewrites(&input.repo, &app.comment_picks());
     app.reconcile_world(snapshot);
     app.land_probes(probed);
+    app.land_rewrites(rewrites);
     app.world_request = None;
 }
 
