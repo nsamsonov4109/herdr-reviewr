@@ -147,11 +147,18 @@ fn a_merge_conflict_lists_the_file_with_its_markers() {
     r.git(&["checkout", "-q", "main"]);
     r.write("a.txt", "mine\n");
     r.commit_all("mine");
+    // The identity `Repo::git` gives, so the merge reaches its conflict on a machine with none.
     let out = std::process::Command::new("git")
         .args(["-C", &r.path().to_string_lossy(), "merge", "-q", "other"])
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@herdr.test")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@herdr.test")
         .output()
         .unwrap();
     assert!(!out.status.success(), "the merge conflicts");
+    let state = r.git(&["status", "--porcelain"]);
+    assert!(state.starts_with("UU"), "a conflict, not a refused merge: {state}");
     let mut app = app_on(&r);
     assert_eq!(listed(&app), ["a.txt"]);
     let rows = open(&mut app, "a.txt");
